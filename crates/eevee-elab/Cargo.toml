@@ -1,0 +1,16 @@
+[package]
+name = "eevee-elab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Elaborator: turns the eevee AST into a runnable simulation (nets + IR-compiled processes)."
+
+[dependencies]
+eevee-core = { path = "../eevee-core" }
+eevee-sched = { path = "../eevee-sched" }
+eevee-ir = { path = "../eevee-ir" }
+eevee-ast = { path = "../eevee-ast" }
+
+[dev-dependencies]
+eevee-fe = { path = "../eevee-fe" }

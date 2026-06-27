@@ -1,0 +1,13 @@
+[package]
+name = "eevee-fe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Front-end: drives the Verible parser (subprocess + JSON CST) and lowers the CST to the eevee AST."
+
+[dependencies]
+eevee-core = { path = "../eevee-core" }
+eevee-ast = { path = "../eevee-ast" }
+serde = "1"
+serde_json = { version = "1", features = ["unbounded_depth"] }

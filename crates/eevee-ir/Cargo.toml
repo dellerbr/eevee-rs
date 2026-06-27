@@ -1,0 +1,15 @@
+[package]
+name = "eevee-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Register-based bytecode IR + interpreter for eevee. Elaborated SV procedural blocks lower to this IR; an interpreter runs it today and a JIT backend can consume the same IR later."
+
+[dependencies]
+eevee-core = { path = "../eevee-core" }
+eevee-sched = { path = "../eevee-sched" }
+
+[[example]]
+name = "counter_ir_bench"
+path = "examples/counter_ir_bench.rs"

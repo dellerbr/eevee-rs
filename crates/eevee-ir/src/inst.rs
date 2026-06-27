@@ -1,0 +1,408 @@
+//! The register-based IR: instructions, programs, and a small builder.
+//!
+//! # Why this shape
+//!
+//! * **Register-based** (operands are register indices, results name a `dst`):
+//!   fewer dispatches per SV expression than a stack machine, and it maps
+//!   cleanly onto a JIT's value model later.
+//! * **`Inst` is `Copy` and fixed-size.** Variable-length payloads (a
+//!   `wait`'s net read-set, later a `$display` arg list) live in side tables
+//!   (`netlists`, `consts`) referenced by index, so the code stream stays a
+//!   dense, cache-friendly array — and a JIT can lower it instruction-by-
+//!   instruction without chasing pointers.
+//! * **Names are already resolved.** Registers are slot indices and nets are
+//!   [`NetId`]s, both fixed at elaboration time — there is no per-access name
+//!   resolution in the hot loop (the central Python perf fix).
+//!
+//! Timing instructions (`Delay`, `WaitEdge`, `WaitCond`) are the process
+//! suspension points: the interpreter returns the matching
+//! [`eevee_sched::Wait`] with the PC saved just past them.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use eevee_core::LogicVec;
+use eevee_sched::{EdgeKind, NetId};
+
+use crate::value::Value;
+
+/// Register (slot) index within a process frame.
+pub type Reg = u32;
+/// Index into [`Program::consts`].
+pub type ConstId = u32;
+/// Index into [`Program::netlists`].
+pub type NetListId = u32;
+/// A code address (index into [`Program::code`]).
+pub type CodeAddr = u32;
+/// Index into [`Program::arglists`].
+pub type ArgListId = u32;
+/// Index into a process's function table (a callable function/task).
+pub type FuncId = u32;
+/// Index into the design's class table.
+pub type ClassId = u32;
+
+/// A single IR instruction. `Copy` and small by construction.
+#[derive(Clone, Copy, Debug)]
+pub enum Inst {
+    /// `dst = consts[k]`.
+    LoadConst { dst: Reg, k: ConstId },
+    /// `dst = src`.
+    Mov { dst: Reg, src: Reg },
+
+    /// `dst = <value of net>` (read the net's current value).
+    NetRead { dst: Reg, net: NetId },
+
+    // --- 4-state ALU (operands and result are logic) ---
+    /// `dst = ~a`.
+    Not { dst: Reg, a: Reg },
+    /// `dst = a + b`.
+    Add { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a - b`.
+    Sub { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a * b` (low `width` bits).
+    Mul { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a & b`.
+    And { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a | b`.
+    Or { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a ^ b`.
+    Xor { dst: Reg, a: Reg, b: Reg },
+    /// `dst = (a == b)` — 1-bit logical equality (x if either operand has x/z).
+    Eq { dst: Reg, a: Reg, b: Reg },
+    /// `dst = (a != b)` — 1-bit logical inequality.
+    Neq { dst: Reg, a: Reg, b: Reg },
+    /// `dst = (a < b)` — 1-bit unsigned less-than.
+    Lt { dst: Reg, a: Reg, b: Reg },
+    /// `dst = (a <= b)` — 1-bit unsigned less-or-equal.
+    Le { dst: Reg, a: Reg, b: Reg },
+    /// `dst = (a > b)` — 1-bit unsigned greater-than.
+    Gt { dst: Reg, a: Reg, b: Reg },
+    /// `dst = (a >= b)` — 1-bit unsigned greater-or-equal.
+    Ge { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a << b` (logical shift left by `b`'s value).
+    Shl { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a >> b` (logical shift right by `b`'s value).
+    Shr { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a && b` — 1-bit logical AND (both operands reduced to truthy).
+    LogAnd { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a || b` — 1-bit logical OR (either operand truthy).
+    LogOr { dst: Reg, a: Reg, b: Reg },
+    /// `dst = !a` — 1-bit logical negation.
+    LogNot { dst: Reg, a: Reg },
+    /// `dst = -a` — two's-complement negation.
+    Neg { dst: Reg, a: Reg },
+    /// `dst = &a` — reduction AND (1 bit).
+    ReduceAnd { dst: Reg, a: Reg },
+    /// `dst = |a` — reduction OR (1 bit).
+    ReduceOr { dst: Reg, a: Reg },
+    /// `dst = ^a` — reduction XOR (1 bit).
+    ReduceXor { dst: Reg, a: Reg },
+
+    // --- net updates ---
+    /// Blocking assign: write the net **now** (Active region).
+    BlockingWrite { net: NetId, src: Reg },
+    /// Non-blocking assign: schedule the net update for the NBA region.
+    NbaWrite { net: NetId, src: Reg },
+
+    // --- timing controls = process suspension points ---
+    /// `#fs` — suspend for `fs` femtoseconds.
+    Delay { fs: u64 },
+    /// `@(edge net)` — suspend until the edge fires.
+    WaitEdge { net: NetId, edge: EdgeKind },
+    /// `wait(cond)` body: suspend until any net in `netlists[nets]` changes.
+    /// The producing code re-evaluates the condition after the wakeup (a
+    /// backward branch), so this is event-driven, never polled.
+    WaitCond { nets: NetListId },
+
+    // --- control flow ---
+    /// Unconditional jump.
+    Jump { target: CodeAddr },
+    /// Jump if `cond` is **not** truthy (SV `is_true`).
+    BranchFalse { cond: Reg, target: CodeAddr },
+    /// Jump if `cond` is truthy.
+    BranchTrue { cond: Reg, target: CodeAddr },
+
+    /// `$display(fmt, args...)`: format `consts[fmt]` (a string) with the
+    /// register values in `arglists[args]` and emit a line to the kernel.
+    Display { fmt: ConstId, args: ArgListId },
+
+    /// Call function `func` (an index into the process's function table) with
+    /// the register values in `arglists[args]`, placing the returned value
+    /// into `ret`. The callee's formals are its registers `0..n_args`.
+    Call {
+        func: FuncId,
+        args: ArgListId,
+        ret: Reg,
+    },
+    /// Virtual method call: resolve the `FuncId` from `obj`'s runtime class
+    /// vtable at `vslot`, then call it (arg 0 is `obj`/`this`).
+    CallVirtual {
+        obj: Reg,
+        vslot: u32,
+        args: ArgListId,
+        ret: Reg,
+    },
+    /// Return a value from the current function/task frame to the caller.
+    Return { value: Reg },
+    /// Return with no value (void function / task).
+    ReturnVoid,
+
+    /// Allocate a class instance of `class` (fields default-initialized) and
+    /// store the handle in `dst`.
+    New { dst: Reg, class: ClassId },
+    /// `dst = obj.fields[slot]` (object field read).
+    GetField { dst: Reg, obj: Reg, slot: u32 },
+    /// `obj.fields[slot] = src` (object field write).
+    SetField { obj: Reg, slot: u32, src: Reg },
+
+    /// `dst = ` the value of static field `id` (shared class storage).
+    StaticGet { dst: Reg, id: u32 },
+    /// `static[id] = src` (write a static class field).
+    StaticSet { id: u32, src: Reg },
+
+    /// `dst = ` a fresh empty queue / dynamic array.
+    NewQueue { dst: Reg },
+    /// `dst = ` a fresh empty associative array.
+    NewAssoc { dst: Reg },
+    /// `dst = base[idx]` — element read of a queue/array (int index) or an
+    /// associative array (int/string key).
+    IndexGet { dst: Reg, base: Reg, idx: Reg },
+    /// `base[idx] = src` — element write (auto-grows a queue/array).
+    IndexSet { base: Reg, idx: Reg, src: Reg },
+    /// A built-in queue/array/assoc method call (`push_back`, `size`,
+    /// `exists`, ...). `dst` receives the result (or `Null`/0 for void ones).
+    CollMethod {
+        dst: Reg,
+        base: Reg,
+        op: CollOp,
+        args: ArgListId,
+    },
+
+    /// `dst = {a, b, c}` — string concatenation of `arglists[args]` (each
+    /// operand stringified). The report path builds messages this way.
+    ConcatStr { dst: Reg, args: ArgListId },
+    /// `dst = ` the current simulation time as a 64-bit value (`$time`/
+    /// `$realtime`).
+    SimTime { dst: Reg },
+    /// `dst = ` a formatted string (`$sformatf`/`$swrite`/`itoa`): format
+    /// `consts[fmt]` with `arglists[args]`, producing a `Str`.
+    Format {
+        dst: Reg,
+        fmt: ConstId,
+        args: ArgListId,
+    },
+    /// `dst = ` the enum member name for `src`'s value, via the value->name
+    /// table `enum_tables[table]`; falls back to the decimal value.
+    EnumName { dst: Reg, src: Reg, table: u32 },
+
+    /// End the process (`Wait::Finished`).
+    Finish,
+}
+
+/// A built-in queue / dynamic-array / associative-array method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollOp {
+    PushBack,
+    PushFront,
+    PopBack,
+    PopFront,
+    Size,
+    Insert,
+    Delete,
+    Exists,
+    Num,
+    First,
+    Last,
+    Next,
+    Prev,
+}
+
+/// A compiled procedural block: a code stream plus its side tables. Shared
+/// (`Rc`) across all instances of the same `always`/`initial` block; per-
+/// instance mutable state (PC, registers) lives in the interpreter.
+#[derive(Clone, Debug, Default)]
+pub struct Program {
+    /// The instruction stream.
+    pub code: Vec<Inst>,
+    /// Constant pool (logic/real/string literals).
+    pub consts: Vec<Value>,
+    /// Net read-sets for `WaitCond` (and future multi-signal sensitivity).
+    pub netlists: Vec<Box<[NetId]>>,
+    /// Argument register lists for `Display` (and future calls).
+    pub arglists: Vec<Box<[Reg]>>,
+    /// Number of registers (frame size).
+    pub n_regs: u32,
+    /// Human-readable label (debug/trace/VCD).
+    pub label: String,
+}
+
+/// A class definition: its name, the default value of each field (used to
+/// initialize a fresh instance on [`Inst::New`]), and its virtual-method table
+/// (vslot -> `FuncId`, resolved by [`Inst::CallVirtual`]).
+#[derive(Debug)]
+pub struct ClassDef {
+    pub name: String,
+    pub field_defaults: Box<[Value]>,
+    pub vtable: Box<[FuncId]>,
+    /// Collection-typed fields `(slot, is_assoc)` — initialized to a *fresh*
+    /// queue/assoc on every [`Inst::New`] so instances never share storage.
+    pub coll_fields: Box<[(u32, bool)]>,
+}
+
+/// The design's shared linkage tables: every callable function/task and every
+/// class. Built once by the elaborator and shared (`Rc`) by all processes;
+/// [`Inst::Call`] indexes `funcs` and [`Inst::New`] indexes `classes`.
+#[derive(Default)]
+pub struct Linkage {
+    pub funcs: Vec<Rc<Program>>,
+    pub classes: Vec<ClassDef>,
+    /// Storage for `static` class fields (shared across all instances and
+    /// processes); indexed by the static-field id baked into the IR.
+    pub statics: Vec<RefCell<Value>>,
+    /// Enum value->name tables, indexed by the id baked into [`Inst::EnumName`].
+    pub enum_tables: Vec<std::collections::HashMap<i64, Rc<str>>>,
+}
+
+impl Linkage {
+    /// An empty linkage (for processes that call nothing and allocate nothing).
+    pub fn empty() -> Rc<Linkage> {
+        Rc::new(Linkage::default())
+    }
+}
+
+/// An unbound label handle returned by [`ProgramBuilder::new_label`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Label(u32);
+
+/// A tiny assembler for hand-writing or code-generating [`Program`]s.
+///
+/// The elaborator's procedural-block code generator will drive this same API;
+/// the P2 tests and benchmark drive it directly.
+pub struct ProgramBuilder {
+    code: Vec<Inst>,
+    consts: Vec<Value>,
+    netlists: Vec<Box<[NetId]>>,
+    arglists: Vec<Box<[Reg]>>,
+    n_regs: u32,
+    /// label id -> bound code address (`u32::MAX` while unbound).
+    labels: Vec<u32>,
+    /// (code index of a jump, label id it targets) to fix up at `build`.
+    patches: Vec<(usize, u32)>,
+    name: String,
+}
+
+impl ProgramBuilder {
+    /// Start a new program with a debug label.
+    pub fn new(name: impl Into<String>) -> ProgramBuilder {
+        ProgramBuilder {
+            code: Vec::new(),
+            consts: Vec::new(),
+            netlists: Vec::new(),
+            arglists: Vec::new(),
+            n_regs: 0,
+            labels: Vec::new(),
+            patches: Vec::new(),
+            name: name.into(),
+        }
+    }
+
+    /// Allocate a fresh register.
+    pub fn new_reg(&mut self) -> Reg {
+        let r = self.n_regs;
+        self.n_regs += 1;
+        r
+    }
+
+    /// Intern a constant value, returning its id.
+    pub fn konst(&mut self, v: Value) -> ConstId {
+        let id = self.consts.len() as u32;
+        self.consts.push(v);
+        id
+    }
+
+    /// Intern a logic constant (convenience).
+    pub fn konst_logic(&mut self, v: LogicVec) -> ConstId {
+        self.konst(Value::Logic(v))
+    }
+
+    /// Intern a net read-set (for `WaitCond`).
+    pub fn netlist(&mut self, nets: &[NetId]) -> NetListId {
+        let id = self.netlists.len() as u32;
+        self.netlists.push(nets.to_vec().into_boxed_slice());
+        id
+    }
+
+    /// Intern an argument register list (for `Display`).
+    pub fn arglist(&mut self, regs: &[Reg]) -> ArgListId {
+        let id = self.arglists.len() as u32;
+        self.arglists.push(regs.to_vec().into_boxed_slice());
+        id
+    }
+
+    /// Create an unbound label.
+    pub fn new_label(&mut self) -> Label {
+        let id = self.labels.len() as u32;
+        self.labels.push(u32::MAX);
+        Label(id)
+    }
+
+    /// Bind a label to the current code position.
+    pub fn bind(&mut self, l: Label) {
+        self.labels[l.0 as usize] = self.code.len() as u32;
+    }
+
+    /// Emit a straight-line instruction (no label operand).
+    pub fn emit(&mut self, inst: Inst) {
+        debug_assert!(
+            !matches!(
+                inst,
+                Inst::Jump { .. } | Inst::BranchFalse { .. } | Inst::BranchTrue { .. }
+            ),
+            "use jump/branch_false/branch_true for control flow so labels are patched"
+        );
+        self.code.push(inst);
+    }
+
+    /// Emit an unconditional jump to `l`.
+    pub fn jump(&mut self, l: Label) {
+        self.patches.push((self.code.len(), l.0));
+        self.code.push(Inst::Jump { target: 0 });
+    }
+
+    /// Emit a conditional jump taken when `cond` is falsey.
+    pub fn branch_false(&mut self, cond: Reg, l: Label) {
+        self.patches.push((self.code.len(), l.0));
+        self.code.push(Inst::BranchFalse { cond, target: 0 });
+    }
+
+    /// Emit a conditional jump taken when `cond` is truthy.
+    pub fn branch_true(&mut self, cond: Reg, l: Label) {
+        self.patches.push((self.code.len(), l.0));
+        self.code.push(Inst::BranchTrue { cond, target: 0 });
+    }
+
+    /// Resolve labels and produce the immutable [`Program`].
+    pub fn build(mut self) -> Program {
+        for (ci, lid) in &self.patches {
+            let target = self.labels[*lid as usize];
+            assert!(
+                target != u32::MAX,
+                "unbound label {lid} referenced at code[{ci}]"
+            );
+            match &mut self.code[*ci] {
+                Inst::Jump { target: t }
+                | Inst::BranchFalse { target: t, .. }
+                | Inst::BranchTrue { target: t, .. } => *t = target,
+                _ => unreachable!("patch points only at jump/branch instructions"),
+            }
+        }
+        Program {
+            code: self.code,
+            consts: self.consts,
+            netlists: self.netlists,
+            arglists: self.arglists,
+            n_regs: self.n_regs,
+            label: self.name,
+        }
+    }
+}

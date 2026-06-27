@@ -1,0 +1,13 @@
+[package]
+name = "eevee-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Core data types for the eevee SystemVerilog simulator: 4-state logic, simulation time, stratified event regions."
+
+[lints.clippy]
+# We intentionally use bit-twiddling that clippy sometimes flags.
+too_many_arguments = "allow"
+
+[dependencies]

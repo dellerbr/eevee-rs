@@ -1,0 +1,10 @@
+[package]
+name = "eevee-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The eevee SystemVerilog AST: the typed intermediate between the Verible front-end and the elaborator."
+
+[dependencies]
+eevee-core = { path = "../eevee-core" }

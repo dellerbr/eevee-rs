@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/eevee-core",
+    "crates/eevee-sched",
+    "crates/eevee-ir",
+    "crates/eevee-ast",
+    "crates/eevee-fe",
+    "crates/eevee-elab",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.74"
+repository = "local"
+
+# Release profile tuned for simulation throughput. Performance is a
+# first-class requirement (OpenTitan workloads), so the default release
+# build is aggressively optimized. `cargo test` uses the dev/test profile
+# and is unaffected.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# A dedicated profile for benchmark binaries: same as release but keeps
+# debug symbols so perf/flamegraph profiling is possible.
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true
