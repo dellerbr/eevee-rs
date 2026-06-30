@@ -133,6 +133,13 @@ impl Mono {
         }
         let arg_names: Vec<String> = tr.args.clone().iter().map(|a| self.resolve(a)).collect();
         if arg_names.is_empty() {
+            // If the name refers to a known parameterized template but no args
+            // were supplied, specialize it with its declared defaults.  This
+            // handles `T obj;` where `T` was bound to `"uvm_queue"` (a
+            // parameterized class), so we produce `"uvm_queue__int"` etc.
+            if self.templates.contains_key(tr.name.as_str()) {
+                return self.specialize(&tr.name, &[]);
+            }
             return tr.name.clone();
         }
         self.specialize(&tr.name, &arg_names)
@@ -244,7 +251,12 @@ impl Mono {
         }
         for p in &mut f.params {
             if let Some(cn) = &p.class_name {
-                p.class_name = Some(self.resolve(&TypeRef::simple(cn.clone())));
+                let resolved = self.resolve(&TypeRef {
+                    name: cn.clone(),
+                    args: p.type_args.clone(),
+                });
+                p.class_name = Some(resolved);
+                p.type_args = Vec::new();
             }
         }
         let mut body = std::mem::replace(&mut f.body, Stmt::Null);
@@ -259,7 +271,12 @@ impl Mono {
                     self.subst_stmt(st);
                 }
             }
-            Stmt::VarDecl(v) => self.subst_vardecl_type(v),
+            Stmt::VarDecl(v) => {
+                self.subst_vardecl_type(v);
+                if let Some(init) = &mut v.init {
+                    self.subst_expr(init);
+                }
+            }
             Stmt::Timed { body, .. } => self.subst_stmt(body),
             Stmt::Blocking { rhs, .. } | Stmt::Nonblocking { rhs, .. } => self.subst_expr(rhs),
             Stmt::If {
@@ -287,9 +304,13 @@ impl Mono {
     fn subst_expr(&mut self, e: &mut Expr) {
         match e {
             // A bare reference to a value parameter -> its constant value.
+            // A bare reference to a type parameter (e.g. `$typename(T)`) ->
+            // substitute as a string of the concrete type name.
             Expr::Ref(name) => {
                 if let Some(val) = self.cur.value_bindings.get(name) {
                     *e = value_to_expr(val);
+                } else if let Some(type_name) = self.cur.bindings.get(name).cloned() {
+                    *e = Expr::Str(type_name);
                 }
             }
             Expr::StaticCall {

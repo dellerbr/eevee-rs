@@ -17,7 +17,7 @@
 mod mono;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use eevee_ast::*;
@@ -53,6 +53,8 @@ struct Global {
     global_class: HashMap<String, u32>,
     /// Package/module-scope type aliases: alias name -> class id.
     global_type_aliases: HashMap<String, u32>,
+    /// Unambiguous class-scoped typedefs (same mapping across all classes).
+    class_typedefs: HashMap<String, u32>,
     /// Enum type name -> value-name table id (into `linkage.enum_tables`).
     enum_types: HashMap<String, u32>,
     linkage: Rc<Linkage>,
@@ -222,6 +224,7 @@ fn builtin_classes() -> Vec<ClassDecl> {
             dir: PortDir::Input,
             width: 32,
             class_name: None,
+            type_args: Vec::new(),
         }
     }
     let ret0 = Stmt::Return(Some(Expr::Literal(LogicVec::zero(32))));
@@ -265,7 +268,34 @@ fn builtin_classes() -> Vec<ClassDecl> {
         base_args: Vec::new(),
         consts: Vec::new(),
     };
-    vec![process]
+    // IEEE-1800 built-in `mailbox #(T)`: unbounded/bounded queue of handles.
+    // Parameterized, but since we don't have the source, inject a generic stub
+    // that compiles. The T parameter is ignored here — any `mailbox #(Foo)` call
+    // resolves to this class after mono fails to specialize it (no template).
+    let ret0_32 = Stmt::Return(Some(Expr::Literal(LogicVec::zero(32))));
+    let mailbox = ClassDecl {
+        name: "mailbox".to_string(),
+        base: None,
+        fields: Vec::new(),
+        methods: vec![
+            // `m.num()` → int (number of items)
+            method("num", false, None, vec![], ret0_32.clone()),
+            // Blocking put/get (stubs: no blocking support yet)
+            method("put", true, None, vec![str_param("item")], Stmt::Null),
+            method("get", true, None, vec![str_param("item")], Stmt::Null),
+            method("peek", true, None, vec![str_param("item")], Stmt::Null),
+            // Non-blocking variants: return 0 (fail gracefully)
+            method("try_put", false, None, vec![str_param("item")], ret0_32.clone()),
+            method("try_get", false, None, vec![str_param("item")], ret0_32.clone()),
+            method("try_peek", false, None, vec![str_param("item")], ret0_32.clone()),
+        ],
+        constructor: None,
+        type_aliases: Vec::new(),
+        params: Vec::new(),
+        base_args: Vec::new(),
+        consts: Vec::new(),
+    };
+    vec![process, mailbox]
 }
 
 /// Merge out-of-body (`extern`) method definitions into their class
@@ -550,6 +580,31 @@ fn build_global(
     }
     let class_infos: Vec<ClassInfo> = built.into_iter().map(|o| o.unwrap()).collect();
 
+    // Collect unambiguous cross-class typedef aliases (e.g. `rsrc_q_t` in
+    // `uvm_resource_types`). A name is included only if every class that defines
+    // it maps to the same class id (i.e. it's globally unambiguous).
+    let mut class_typedefs: HashMap<String, u32> = HashMap::new();
+    {
+        let mut ambiguous: HashSet<String> = HashSet::new();
+        for ci in &class_infos {
+            for (alias, &cid) in &ci.type_aliases {
+                if ambiguous.contains(alias) {
+                    continue;
+                }
+                match class_typedefs.get(alias) {
+                    Some(&existing) if existing == cid => {}
+                    Some(_) => {
+                        class_typedefs.remove(alias);
+                        ambiguous.insert(alias.clone());
+                    }
+                    None => {
+                        class_typedefs.insert(alias.clone(), cid);
+                    }
+                }
+            }
+        }
+    }
+
     // Compile every callable. Package callables have no module nets in scope.
     // A body that hits an unsupported construct panics inside the codegen; we
     // catch it and substitute a stub so the rest of the library still loads.
@@ -560,6 +615,7 @@ fn build_global(
         class: &global_class,
         type_aliases: &global_type_aliases,
         enums: &enum_types,
+        class_typedefs: &class_typedefs,
     };
     let mut funcs: Vec<Rc<Program>> = Vec::with_capacity(jobs.len());
     let mut stubbed = 0usize;
@@ -656,6 +712,7 @@ fn build_global(
         global_coll,
         global_class,
         global_type_aliases,
+        class_typedefs,
         enum_types,
         linkage,
         stats,
@@ -678,6 +735,7 @@ fn build_class_info(
         mut field_coll,
         mut static_fields,
         mut static_field_class,
+        mut static_field_coll,
         mut type_aliases,
         mut method_ret_class,
         mut field_defaults,
@@ -695,6 +753,7 @@ fn build_class_info(
                 b.field_coll.clone(),
                 b.static_fields.clone(),
                 b.static_field_class.clone(),
+                b.static_field_coll.clone(),
                 b.type_aliases.clone(),
                 b.method_ret_class.clone(),
                 b.field_defaults.clone(),
@@ -709,6 +768,7 @@ fn build_class_info(
             HashMap::new(), // field_coll
             HashMap::new(), // static_fields
             HashMap::new(), // static_field_class
+            HashMap::new(), // static_field_coll
             HashMap::new(), // type_aliases
             HashMap::new(), // method_ret_class
             Vec::new(),     // field_defaults
@@ -731,7 +791,23 @@ fn build_class_info(
     // Class-scoped typedef aliases first, so field/local types declared via a
     // `typedef <Class> alias;` (notably the ubiquitous `this_type`) resolve.
     for a in &c.type_aliases {
-        if let Some(&tid) = class_ids.get(&a.target.name) {
+        // For parameterised targets like `uvm_queue#(uvm_resource_base)` the
+        // monomorphizer produces a mangled name `uvm_queue__uvm_resource_base`.
+        // Build it here so the lookup succeeds.
+        let lookup_name: String = if a.target.args.is_empty() {
+            a.target.name.clone()
+        } else {
+            let mut parts = vec![a.target.name.clone()];
+            for arg in &a.target.args {
+                // Sanitize just like mono::sanitize(): keep alnum/_; map rest to '_'.
+                let s: String = arg.name.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                    .collect();
+                parts.push(if s.is_empty() { "_".to_string() } else { s });
+            }
+            parts.join("__")
+        };
+        if let Some(&tid) = class_ids.get(&lookup_name) {
             type_aliases.insert(a.alias.clone(), tid);
         }
     }
@@ -759,6 +835,9 @@ fn build_class_info(
             static_fields.insert(fld.name.clone(), id);
             if let Some(fc) = elem_class {
                 static_field_class.insert(fld.name.clone(), fc);
+            }
+            if let Some(kind) = fld.coll {
+                static_field_coll.insert(fld.name.clone(), (kind, elem_class));
             }
             continue;
         }
@@ -799,6 +878,7 @@ fn build_class_info(
         field_coll,
         static_fields,
         static_field_class,
+        static_field_coll,
         type_param_default,
         type_aliases,
         method_ret_class,
@@ -891,6 +971,7 @@ fn elaborate_module_processes(m: &Module, g: &Global, sim: &mut Sim, backend: &d
         class: &g.global_class,
         type_aliases: &g.global_type_aliases,
         enums: &g.enum_types,
+        class_typedefs: &g.class_typedefs,
     };
     for it in &m.items {
         match it {
@@ -947,6 +1028,8 @@ struct ClassInfo {
     static_fields: HashMap<String, u32>,
     /// Static fields whose type is a class: name -> class id.
     static_field_class: HashMap<String, u32>,
+    /// Static fields that are collections: name -> (kind, element class id).
+    static_field_coll: HashMap<String, (CollKind, Option<u32>)>,
     /// Type parameters with a class default: param name -> default class id
     /// (used to resolve `type_param`-typed fields and `extends type_param`).
     type_param_default: HashMap<String, u32>,
@@ -1008,6 +1091,10 @@ struct GlobalVars<'a> {
     type_aliases: &'a HashMap<String, u32>,
     /// Enum type name -> value-name table id.
     enums: &'a HashMap<String, u32>,
+    /// Unambiguous class-scoped typedef aliases (e.g. `rsrc_q_t` inside
+    /// `uvm_resource_types`): alias name -> class id. Only contains names
+    /// that map to the *same* class across all classes that define them.
+    class_typedefs: &'a HashMap<String, u32>,
 }
 
 impl<'a> CodeGen<'a> {
@@ -1525,21 +1612,35 @@ impl<'a> CodeGen<'a> {
             Expr::Field { obj, field } => {
                 let obj_reg = self.gen_expr(obj, pb);
                 let cid = self.receiver_class(obj);
-                let slot = self.classes[cid as usize]
-                    .field_slot
-                    .get(field)
-                    .copied()
-                    .unwrap_or_else(|| panic!("no field '{field}' on the receiver class"))
-                    .0;
-                let dst = pb.new_reg();
-                pb.emit(Inst::GetField {
-                    dst,
-                    obj: obj_reg,
-                    slot,
-                });
-                dst
+                // Instance field (most common).
+                if let Some(&(slot, _)) = self.classes[cid as usize].field_slot.get(field) {
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::GetField {
+                        dst,
+                        obj: obj_reg,
+                        slot,
+                    });
+                    return dst;
+                }
+                // Static field accessed via a class handle (`obj.static_field`).
+                if let Some(&id) = self.classes[cid as usize].static_fields.get(field) {
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::StaticGet { dst, id });
+                    return dst;
+                }
+                panic!("no field '{field}' on the receiver class")
             }
             Expr::Index { base, index } => {
+                // String indexing: str[i] -> byte value at position i.
+                if let Expr::Ref(name) = base.as_ref() {
+                    if self.is_string_local(name) {
+                        let src = self.gen_expr(base, pb);
+                        let idx = self.gen_expr(index, pb);
+                        let dst = pb.new_reg();
+                        pb.emit(Inst::StringIndex { dst, src, idx });
+                        return dst;
+                    }
+                }
                 let base_reg = self.gen_expr(base, pb);
                 let idx = self.gen_expr(index, pb);
                 let dst = pb.new_reg();
@@ -1570,6 +1671,12 @@ impl<'a> CodeGen<'a> {
                             ret,
                         });
                         return ret;
+                    }
+                    // Package-scope global variable (e.g. `uvm_pkg::uvm_deferred_init`).
+                    if let Some(&id) = self.globals.vars.get(method.as_str()) {
+                        let dst = pb.new_reg();
+                        pb.emit(Inst::StaticGet { dst, id });
+                        return dst;
                     }
                     // IEEE-1800 builtin classes (`process`, ...) have no SV source.
                     if let Some(r) = self.gen_builtin_static(class_name, method, pb) {
@@ -1648,6 +1755,17 @@ impl<'a> CodeGen<'a> {
                 pb.emit(Inst::SimTime { dst });
                 dst
             }
+            // `$typename(T)` — after mono the type param T is already a Str
+            // constant; just return the first arg as a string value.
+            "$typename" => match args.first() {
+                Some(e) => self.gen_expr(e, pb),
+                None => {
+                    let dst = pb.new_reg();
+                    let k = pb.konst(Value::Str(Rc::from("")));
+                    pb.emit(Inst::LoadConst { dst, k });
+                    dst
+                }
+            },
             // `$cast(dst, src)` in expression position: do the assignment and
             // yield success (1). Type-checking is not enforced.
             "$cast" if args.len() == 2 => {
@@ -1733,13 +1851,19 @@ impl<'a> CodeGen<'a> {
                 }
             }
             // Chained access `recv.field.method(...)`: resolve the receiver's
-            // class, then look up the field's class.
+            // class, then look up the field's class (instance or static).
             Expr::Field { obj, field } => {
                 let oc = self.receiver_class(obj);
                 self.classes[oc as usize]
                     .field_class
                     .get(field)
                     .copied()
+                    .or_else(|| {
+                        self.classes[oc as usize]
+                            .static_field_class
+                            .get(field)
+                            .copied()
+                    })
                     .unwrap_or_else(|| {
                         panic!(
                             "field '{field}' is not a class handle on '{}'",
@@ -1809,10 +1933,35 @@ impl<'a> CodeGen<'a> {
                     let cid = self.class_ctx?;
                     self.classes[cid as usize].field_coll.get(name).copied()
                 })
+                .or_else(|| {
+                    let cid = self.class_ctx?;
+                    self.classes[cid as usize]
+                        .static_field_coll
+                        .get(name)
+                        .copied()
+                })
                 .or_else(|| self.globals.coll.get(name).copied()),
             Expr::Field { obj, field } => {
                 let oc = self.try_class_of(obj)?;
-                self.classes[oc as usize].field_coll.get(field).copied()
+                self.classes[oc as usize]
+                    .field_coll
+                    .get(field)
+                    .copied()
+                    .or_else(|| {
+                        self.classes[oc as usize]
+                            .static_field_coll
+                            .get(field)
+                            .copied()
+                    })
+            }
+            // Package-qualified global collection: `pkg::varname` with 0 args.
+            Expr::StaticCall {
+                class_name,
+                method: var_name,
+                args,
+                ..
+            } if args.is_empty() && self.resolve_class(class_name).is_none() => {
+                self.globals.coll.get(var_name.as_str()).copied()
             }
             _ => None,
         }
@@ -1927,6 +2076,66 @@ impl<'a> CodeGen<'a> {
                 }
             }
         }
+        // String built-in methods: .len(), .substr(), .toupper(), .tolower(), .atoi()
+        if let Some(src_reg) = self.try_string_receiver(obj, pb) {
+            match (method, args.len()) {
+                ("len", 0) => {
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::StringLen { dst, src: src_reg });
+                    return Some(dst);
+                }
+                ("substr", 2) => {
+                    let lo = self.gen_expr(&args[0], pb);
+                    let hi = self.gen_expr(&args[1], pb);
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::StringSub { dst, src: src_reg, lo, hi });
+                    return Some(dst);
+                }
+                ("toupper", 0) => {
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::StringToUpper { dst, src: src_reg });
+                    return Some(dst);
+                }
+                ("tolower", 0) => {
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::StringToLower { dst, src: src_reg });
+                    return Some(dst);
+                }
+                ("atoi" | "atoreal", 0) => {
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::StringAtoi { dst, src: src_reg });
+                    return Some(dst);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// If `obj` is a string-typed expression, emit code to load it and return
+    /// the register holding its value. Returns `None` if `obj` is not a string.
+    fn try_string_receiver(&mut self, obj: &Expr, pb: &mut ProgramBuilder) -> Option<Reg> {
+        if let Expr::Ref(name) = obj {
+            // Local string variable.
+            if self.is_string_local(name) {
+                return Some(self.gen_expr(obj, pb));
+            }
+            // Class field of string type (not a class-handle field and not a coll).
+            if let Some((slot, _)) = self.class_field(name) {
+                let cid = self.class_ctx?;
+                let ci = &self.classes[cid as usize];
+                if !ci.field_class.contains_key(name) && !ci.field_coll.contains_key(name) {
+                    let this = self.this_reg;
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::GetField { dst, obj: this, slot });
+                    return Some(dst);
+                }
+            }
+            // String-typed parameter (non-class, non-enum local).
+            if self.locals.contains_key(name) {
+                return Some(self.gen_expr(obj, pb));
+            }
+        }
         None
     }
 
@@ -1945,6 +2154,10 @@ impl<'a> CodeGen<'a> {
         }
         // Package/module-scope typedef (`typedef uvm_pool#(string,int) foo;`).
         if let Some(&cid) = self.globals.type_aliases.get(name) {
+            return Some(cid);
+        }
+        // Cross-class typedef (e.g. `rsrc_q_t` inside `uvm_resource_types`).
+        if let Some(&cid) = self.globals.class_typedefs.get(name) {
             return Some(cid);
         }
         let cur = self.class_ctx?;

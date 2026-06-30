@@ -476,6 +476,7 @@ fn lower_port_item(n: &Value) -> Param {
     let dtype = find(inner, "kDataType");
     let width = dtype.map(packed_width).unwrap_or(32);
     let class_name = dtype.and_then(class_type_name);
+    let type_args = dtype.map(type_args_of).unwrap_or_default();
     let name = find(inner, "kUnqualifiedId")
         .and_then(|u| find(u, "SymbolIdentifier"))
         .map(text)
@@ -486,6 +487,7 @@ fn lower_port_item(n: &Value) -> Param {
         dir: PortDir::Input,
         width,
         class_name,
+        type_args,
     }
 }
 
@@ -683,6 +685,13 @@ fn lower_stmt(n: &Value) -> Stmt {
             rhs: lower_rhs(n),
         },
         "kFunctionCall" => Stmt::Expr(lower_expr(n)),
+        "kVoidcast" => {
+            // void'(expr) — execute the inner call and discard its return value.
+            // The expression lives inside a kParenGroup child, so search deep.
+            find_deep(n, "kExpression")
+                .map(|e| Stmt::Expr(lower_expr(e)))
+                .unwrap_or(Stmt::Null)
+        }
         "kNonblockingAssignmentStatement" => Stmt::Nonblocking {
             lhs: lower_lvalue(n),
             rhs: lower_rhs(n),

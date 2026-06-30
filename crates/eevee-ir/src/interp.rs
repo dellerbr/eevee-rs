@@ -532,6 +532,56 @@ fn run_frame(
                     .unwrap_or_else(|| Rc::from(v.to_string().as_str()));
                 regs[dst as usize] = Value::Str(name);
             }
+            Inst::StringLen { dst, src } => {
+                let s = match &regs[src as usize] {
+                    Value::Str(s) => s.len() as u64,
+                    _ => 0,
+                };
+                regs[dst as usize] = Value::Logic(LogicVec::from_u64(s, 32));
+            }
+            Inst::StringSub { dst, src, lo, hi } => {
+                let s = match &regs[src as usize] {
+                    Value::Str(s) => s.clone(),
+                    _ => Rc::from(""),
+                };
+                let lo = regs[lo as usize].as_logic().to_u64() as usize;
+                let hi = regs[hi as usize].as_logic().to_u64() as usize;
+                let chars: Vec<char> = s.chars().collect();
+                let lo = lo.min(chars.len());
+                let hi = (hi + 1).min(chars.len());
+                let sub: String = chars[lo..hi.max(lo)].iter().collect();
+                regs[dst as usize] = Value::Str(Rc::from(sub.as_str()));
+            }
+            Inst::StringIndex { dst, src, idx } => {
+                let s = match &regs[src as usize] {
+                    Value::Str(s) => s.clone(),
+                    _ => Rc::from(""),
+                };
+                let i = regs[idx as usize].as_logic().to_u64() as usize;
+                let ch = s.as_bytes().get(i).copied().unwrap_or(0);
+                regs[dst as usize] = Value::Logic(LogicVec::from_u64(ch as u64, 8));
+            }
+            Inst::StringToUpper { dst, src } => {
+                let s = match &regs[src as usize] {
+                    Value::Str(s) => s.to_uppercase(),
+                    _ => String::new(),
+                };
+                regs[dst as usize] = Value::Str(Rc::from(s.as_str()));
+            }
+            Inst::StringToLower { dst, src } => {
+                let s = match &regs[src as usize] {
+                    Value::Str(s) => s.to_lowercase(),
+                    _ => String::new(),
+                };
+                regs[dst as usize] = Value::Str(Rc::from(s.as_str()));
+            }
+            Inst::StringAtoi { dst, src } => {
+                let v = match &regs[src as usize] {
+                    Value::Str(s) => s.trim().parse::<i64>().unwrap_or(0) as u64,
+                    _ => 0,
+                };
+                regs[dst as usize] = Value::Logic(LogicVec::from_u64(v, 32));
+            }
             Inst::Finish => return Step::Wait(Wait::Finished),
         }
     }

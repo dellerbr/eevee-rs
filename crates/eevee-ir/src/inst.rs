@@ -195,6 +195,19 @@ pub enum Inst {
     /// table `enum_tables[table]`; falls back to the decimal value.
     EnumName { dst: Reg, src: Reg, table: u32 },
 
+    /// `dst = src.len()` — number of characters in the string `src`.
+    StringLen { dst: Reg, src: Reg },
+    /// `dst = src.substr(lo, hi)` — characters from index `lo` to `hi` (inclusive).
+    StringSub { dst: Reg, src: Reg, lo: Reg, hi: Reg },
+    /// `dst = src[idx]` — byte value (8-bit) of the character at index `idx`.
+    StringIndex { dst: Reg, src: Reg, idx: Reg },
+    /// `dst = src.toupper()` — uppercase copy of the string.
+    StringToUpper { dst: Reg, src: Reg },
+    /// `dst = src.tolower()` — lowercase copy of the string.
+    StringToLower { dst: Reg, src: Reg },
+    /// `dst = src.atoi()` — integer value parsed from the string.
+    StringAtoi { dst: Reg, src: Reg },
+
     /// End the process (`Wait::Finished`).
     Finish,
 }

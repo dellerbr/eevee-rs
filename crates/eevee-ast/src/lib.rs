@@ -203,6 +203,9 @@ pub struct Param {
     pub width: u32,
     /// `Some(class)` if the parameter is a class handle.
     pub class_name: Option<String>,
+    /// Type arguments of a parameterized parameter type (e.g. `#(uvm_callback)`
+    /// in `uvm_queue #(uvm_callback) q`). Consumed by mono; empty after that.
+    pub type_args: Vec<TypeRef>,
 }
 
 /// Which flavor of `always` block.
