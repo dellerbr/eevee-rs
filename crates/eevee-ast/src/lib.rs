@@ -334,6 +334,12 @@ pub enum Expr {
         method: String,
         args: Vec<Expr>,
     },
+    /// Static field read `Class::field` (scope resolution, no argument list).
+    /// The class name may be a type parameter and needs monomorphization.
+    StaticRef {
+        class_name: String,
+        field: String,
+    },
     /// Index / element access `base[index]` (queue/array element or assoc key).
     Index { base: Box<Expr>, index: Box<Expr> },
     /// `new(args...)` — allocate an object (class inferred from context).

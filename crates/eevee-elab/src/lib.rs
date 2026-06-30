@@ -261,6 +261,14 @@ fn builtin_classes() -> Vec<ClassDecl> {
                 vec![str_param("state")],
                 Stmt::Null,
             ),
+            // `process.srandom(seed)` — reseed the process's random generator.
+            method(
+                "srandom",
+                true,
+                None,
+                vec![str_param("seed")],
+                Stmt::Null,
+            ),
         ],
         constructor: None,
         type_aliases: Vec::new(),
@@ -1275,7 +1283,36 @@ impl<'a> CodeGen<'a> {
             }
             Stmt::Blocking { lhs, rhs } => {
                 if let Expr::New { args } = rhs {
-                    self.gen_new(&lhs.name, args, pb);
+                    if let Some(index) = &lhs.index {
+                        // `collection[key] = new(...)` — create a new element
+                        // and store it at the given index.
+                        let base_expr = Expr::Ref(lhs.name.clone());
+                        if let Some(cid) = self.coll_elem_class(&base_expr) {
+                            let obj = pb.new_reg();
+                            pb.emit(Inst::New { dst: obj, class: cid });
+                            let ctor = self.classes[cid as usize].ctor;
+                            if let Some(ctor_fid) = ctor {
+                                let mut arg_regs = vec![obj];
+                                for a in args {
+                                    arg_regs.push(self.gen_expr(a, pb));
+                                }
+                                let arglist = pb.arglist(&arg_regs);
+                                let ret = pb.new_reg();
+                                pb.emit(Inst::Call {
+                                    func: ctor_fid,
+                                    args: arglist,
+                                    ret,
+                                });
+                            }
+                            let base = self.gen_expr(&base_expr, pb);
+                            let idx = self.gen_expr(index, pb);
+                            pb.emit(Inst::IndexSet { base, idx, src: obj });
+                        } else {
+                            panic!("`new` assigned to indexed non-class-handle '{}'", lhs.name)
+                        }
+                    } else {
+                        self.gen_new(&lhs.name, args, pb);
+                    }
                 } else {
                     let r = self.gen_expr(rhs, pb);
                     self.gen_assign_lvalue(lhs, r, false, pb);
@@ -1566,6 +1603,29 @@ impl<'a> CodeGen<'a> {
                 }
 
                 let obj_reg = self.gen_expr(obj, pb);
+
+                // If the receiver is a local/param that isn't a class handle
+                // (e.g. a dynamic-array parameter like `ref bit value[]`),
+                // try a collection dispatch before falling through.
+                let is_bare_ref = matches!(obj.as_ref(), Expr::Ref(_));
+                if is_bare_ref && self.try_class_of(obj).is_none() {
+                    if let Some(op) = coll_op(method) {
+                        let arg_regs: Vec<Reg> =
+                            args.iter().map(|a| self.gen_expr(a, pb)).collect();
+                        let coll_args = pb.arglist(&arg_regs);
+                        let dst = pb.new_reg();
+                        pb.emit(Inst::CollMethod {
+                            dst,
+                            base: obj_reg,
+                            op,
+                            args: coll_args,
+                        });
+                        return dst;
+                    }
+                    panic!("'{name}' is not a class handle",
+                        name = if let Expr::Ref(n) = obj.as_ref() { n.as_str() } else { "<expr>" });
+                }
+
                 let cid = self.receiver_class(obj);
                 let mut arg_regs = vec![obj_reg];
                 for a in args {
@@ -1709,6 +1769,41 @@ impl<'a> CodeGen<'a> {
                     ret,
                 });
                 ret
+            }
+            Expr::StaticRef { class_name, field } => {
+                // First try: package-scope global var (for `pkg::var` references).
+                if let Some(&id) = self.globals.vars.get(field.as_str()) {
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::StaticGet { dst, id });
+                    return dst;
+                }
+                // Second try: enum/named constant in the const table.
+                if let Some(cv) = self.consts.get(field.as_str()) {
+                    let dst = pb.new_reg();
+                    let k = pb.konst_logic(cv.clone());
+                    pb.emit(Inst::LoadConst { dst, k });
+                    return dst;
+                }
+                // Third: static field of the named class.
+                if let Some(cid) = self.resolve_class(class_name) {
+                    if let Some(&id) = self.classes[cid as usize].static_fields.get(field.as_str()) {
+                        let dst = pb.new_reg();
+                        pb.emit(Inst::StaticGet { dst, id });
+                        return dst;
+                    }
+                }
+                // Fallback: treat as a bare Ref (resolves package enum constants
+                // like `uvm_pkg::UVM_LOW` whose class lookup would fail).
+                let dst = pb.new_reg();
+                if let Some(cv) = self.consts.get(class_name.as_str()) {
+                    // The "class" segment was actually an enum value name.
+                    let k = pb.konst_logic(cv.clone());
+                    pb.emit(Inst::LoadConst { dst, k });
+                } else {
+                    // Last resort — treat the field name as a bare signal/const.
+                    return self.gen_expr(&Expr::Ref(field.clone()), pb);
+                }
+                dst
             }
             Expr::New { .. } => {
                 panic!("`new` is only supported as `handle = new(...)` for now")
@@ -2316,6 +2411,7 @@ fn const_eval(e: &Expr) -> LogicVec {
             LogicVec::zero(32)
         }
         Expr::StaticCall { .. } => LogicVec::zero(32),
+        Expr::StaticRef { .. } => LogicVec::zero(32),
         Expr::Index { .. } => LogicVec::zero(32),
         Expr::Null => LogicVec::zero(32),
         Expr::Concat(_) | Expr::SysCall { .. } => LogicVec::zero(32),

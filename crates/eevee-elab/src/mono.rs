@@ -328,6 +328,13 @@ impl Mono {
                     self.subst_expr(a);
                 }
             }
+            Expr::StaticRef { class_name, .. } => {
+                let resolved = self.resolve(&TypeRef {
+                    name: class_name.clone(),
+                    args: vec![],
+                });
+                *class_name = resolved;
+            }
             Expr::Unary { operand, .. } => self.subst_expr(operand),
             Expr::Binary { lhs, rhs, .. } => {
                 self.subst_expr(lhs);

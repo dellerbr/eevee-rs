@@ -1040,9 +1040,15 @@ fn lower_call_or_ref(n: &Value) -> Expr {
                         method: segs[1].clone(),
                         args: lower_arg_list(p),
                     },
-                    // Static member: best-effort to the member name (resolves
-                    // package-scope enum constants like `uvm_pkg::UVM_LOW`).
-                    None => Expr::Ref(segs[1].clone()),
+                    // Static field read `Class::field` — keep the class name so
+                    // codegen can find the correct static slot.
+                    // Falls back to Expr::Ref for package-scope enum constants
+                    // like `uvm_pkg::UVM_LOW` (the class lookup will fail, and
+                    // the const table will catch it instead).
+                    None => Expr::StaticRef {
+                        class_name: segs[0].clone(),
+                        field: segs[1].clone(),
+                    },
                 };
             }
             // 3+ segments (e.g. `T::type_id::create`) need the factory; fall
