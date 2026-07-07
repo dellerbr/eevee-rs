@@ -23,7 +23,16 @@ use std::collections::{BinaryHeap, VecDeque};
 use eevee_core::{LogicVec, Region, SimTime, Timescale};
 
 use crate::net::{detect_edge, Net, Waiter};
-use crate::process::{EdgeKind, NetId, ProcId, Process, Wait};
+use crate::process::{EdgeKind, ForkJoin, NetId, ProcId, Process, Wait};
+
+/// A parent process blocked on `join`/`join_any` for a set of forked children.
+struct JoinWatch {
+    parent: ProcId,
+    /// Children not yet finished. `join_any` wakes the parent on the first
+    /// removal; `join` waits until this is empty.
+    remaining: Vec<ProcId>,
+    any: bool,
+}
 
 /// A wakeup scheduled at a future time, ordered for the time wheel.
 struct TimedEvent {
@@ -90,6 +99,9 @@ pub struct Kernel {
     // echoed to stdout.
     out: Vec<String>,
     echo: bool,
+
+    // `fork ... join`/`join_any` parents currently blocked on their children.
+    join_watches: Vec<JoinWatch>,
 }
 
 impl Kernel {
@@ -107,6 +119,7 @@ impl Kernel {
             stats: Stats::default(),
             out: Vec::new(),
             echo: true,
+            join_watches: Vec::new(),
         }
     }
 
@@ -273,6 +286,29 @@ impl Kernel {
                     });
                 }
             }
+            Wait::Fork { .. } => unreachable!(
+                "Wait::Fork must be intercepted by Sim::drain_active (spawning \
+                 needs the process table, which Kernel does not own) before \
+                 reaching arm()"
+            ),
+        }
+    }
+
+    /// A process finished (`Wait::Finished`) — wake any `join`/`join_any`
+    /// parent waiting on it. Cheap no-op when nothing is watching `pid`.
+    fn notify_finished(&mut self, pid: ProcId) {
+        let mut i = 0;
+        while i < self.join_watches.len() {
+            let had = self.join_watches[i].remaining.len();
+            self.join_watches[i].remaining.retain(|&c| c != pid);
+            let w = &self.join_watches[i];
+            let satisfied = w.remaining.len() < had && (w.any || w.remaining.is_empty());
+            if satisfied {
+                let watch = self.join_watches.swap_remove(i);
+                self.active.push_back(watch.parent);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -389,10 +425,43 @@ impl Sim {
             let Sim { kernel, procs } = self;
             kernel.stats.resumes += 1;
             let wait = procs[pid.0].resume(kernel);
-            kernel.arm(pid, wait);
-            if kernel.stop {
+            match wait {
+                // Spawning needs `procs` (which Kernel doesn't own), so this
+                // variant is handled here instead of via `Kernel::arm`.
+                Wait::Fork { children, join } => self.spawn_fork(pid, children, join),
+                Wait::Finished => {
+                    // No-op park, then wake any join/join_any parent on `pid`.
+                    self.kernel.arm(pid, Wait::Finished);
+                    self.kernel.notify_finished(pid);
+                }
+                other => self.kernel.arm(pid, other),
+            }
+            if self.kernel.stop {
                 return;
             }
+        }
+    }
+
+    /// Handle a `Wait::Fork`: add each child to the process table (queued for
+    /// its first resume, same as [`Sim::add_process`]), then either re-queue
+    /// `parent` immediately (`join_none`) or park it on a [`JoinWatch`] until
+    /// the children satisfy `join`/`join_any`.
+    fn spawn_fork(&mut self, parent: ProcId, children: Vec<Box<dyn Process>>, join: ForkJoin) {
+        let mut ids = Vec::with_capacity(children.len());
+        for c in children {
+            let id = ProcId(self.procs.len());
+            self.procs.push(c);
+            self.kernel.active.push_back(id);
+            ids.push(id);
+        }
+        if matches!(join, ForkJoin::None) || ids.is_empty() {
+            self.kernel.active.push_back(parent);
+        } else {
+            self.kernel.join_watches.push(JoinWatch {
+                parent,
+                remaining: ids,
+                any: matches!(join, ForkJoin::Any),
+            });
         }
     }
 }

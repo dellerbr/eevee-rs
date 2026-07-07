@@ -32,7 +32,7 @@ fn collect_descriptions(n: &Value, out: &mut Vec<Item>) {
         "kPackageDeclaration" => out.push(Item::Package(lower_package(n))),
         // Compilation-unit-scope class / function (real testbenches use these).
         "kClassDeclaration" => out.push(Item::Class(lower_class(n))),
-        "kFunctionDeclaration" => out.push(Item::Func(lower_function(n))),
+        "kFunctionDeclaration" | "kTaskDeclaration" => out.push(Item::Func(lower_function(n))),
         // Descend through wrappers (kDescriptionList, etc.).
         _ => {
             for c in kids(n) {
@@ -53,7 +53,9 @@ fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
         }
         "kAlwaysStatement" => out.push(ModuleItem::Always(lower_always(item))),
         "kInitialStatement" => out.push(ModuleItem::Initial(lower_initial(item))),
-        "kFunctionDeclaration" => out.push(ModuleItem::Func(lower_function(item))),
+        "kFunctionDeclaration" | "kTaskDeclaration" => {
+            out.push(ModuleItem::Func(lower_function(item)))
+        }
         "kClassDeclaration" => out.push(ModuleItem::Class(lower_class(item))),
         // `localparam`/`parameter NAME = value;` -> a named constant.
         "kParamDeclaration" => {
@@ -229,9 +231,15 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
                 .unwrap_or_default()
                 .to_string();
             let coll = classify_coll(rv);
-            let init = find(rv, "kTrailingAssign")
-                .and_then(|ta| find(ta, "kExpression"))
-                .map(lower_expr);
+            // `Type v = new(...);` (combined decl+init): the trailing assign's
+            // rhs is a bare `kClassNew`, not wrapped in `kExpression` (same
+            // quirk `lower_rhs` already works around for plain `v = new(...);`
+            // assignment statements).
+            let init = find(rv, "kTrailingAssign").and_then(|ta| {
+                find(ta, "kExpression")
+                    .or_else(|| find(ta, "kClassNew"))
+                    .map(lower_expr)
+            });
             out.push(VarDecl {
                 name,
                 width,
@@ -400,10 +408,18 @@ fn lower_initial(n: &Value) -> Stmt {
 }
 
 fn lower_function(n: &Value) -> FuncDecl {
-    let header = find(n, "kFunctionHeader");
+    let header = find(n, "kFunctionHeader").or_else(|| find(n, "kTaskHeader"));
+    // A `task` never returns a value; a `function void` explicitly doesn't
+    // either. Either way an implicit `ReturnVoid` should be emitted (rather
+    // than `Return{value: <bogus zero-init register>}`).
+    let is_task = find(n, "kTaskHeader").is_some();
     let ret_dtype = header.and_then(|h| find(h, "kDataType"));
     let ret_width = ret_dtype.map(packed_width).unwrap_or(32);
     let ret_class = ret_dtype.and_then(class_type_name);
+    let is_void_return = ret_dtype
+        .and_then(|d| find(d, "kDataTypePrimitive"))
+        .map(|p| kids(p).any(|c| tag(c) == "void"))
+        .unwrap_or(false);
     // Out-of-body `Class::method` definition: the header name is a kQualifiedId.
     let (name, class_scope) = match header.and_then(|h| find(h, "kQualifiedId")) {
         Some(qid) => {
@@ -440,7 +456,10 @@ fn lower_function(n: &Value) -> FuncDecl {
         .map(lower_port_list)
         .unwrap_or_default();
     let mut stmts = Vec::new();
-    if let Some(list) = find(n, "kBlockItemStatementList") {
+    // Function bodies use `kBlockItemStatementList`; task bodies (in-body and
+    // out-of-body alike) use `kStatementList`.
+    let body_list = find(n, "kBlockItemStatementList").or_else(|| find(n, "kStatementList"));
+    if let Some(list) = body_list {
         for s in kids(list) {
             stmts.push(lower_stmt(s));
         }
@@ -454,7 +473,7 @@ fn lower_function(n: &Value) -> FuncDecl {
         ret_width,
         ret_class,
         class_scope,
-        is_void: false,
+        is_void: is_task || is_void_return,
         is_virtual,
         params,
         body: Stmt::Block(stmts),
@@ -517,7 +536,7 @@ fn lower_class(n: &Value) -> ClassDecl {
         for item in kids(items) {
             match tag(item) {
                 "kDataDeclaration" => fields.extend(lower_data_decl(item)),
-                "kFunctionDeclaration" => methods.push(lower_function(item)),
+                "kFunctionDeclaration" | "kTaskDeclaration" => methods.push(lower_function(item)),
                 "kClassConstructor" => constructor = Some(lower_constructor(item)),
                 // `pure virtual` / `extern` prototypes: capture as (virtual)
                 // abstract methods so virtual dispatch + the method table see
@@ -601,7 +620,7 @@ fn lower_formal_params(header: &Value) -> Vec<ParamDecl> {
 /// body is empty (filled by an out-of-body definition, if any). The `virtual`
 /// qualifier is carried on the forward-declaration's qualifier list.
 fn lower_prototype(n: &Value) -> Option<FuncDecl> {
-    let proto = find(n, "kFunctionPrototype")?;
+    let proto = find(n, "kFunctionPrototype").or_else(|| find(n, "kTaskPrototype"))?;
     let mut fd = lower_function(proto);
     let is_virtual = find(n, "kQualifierList")
         .map(|q| kids(q).any(|c| tag(c) == "virtual"))
@@ -730,6 +749,28 @@ fn lower_stmt(n: &Value) -> Stmt {
         "kStatement" | "kStatementItem" => {
             // wrappers — descend to the inner statement
             kids(n).next().map(lower_stmt).unwrap_or(Stmt::Null)
+        }
+        "kParBlock" => {
+            // `fork branches join/join_any/join_none` (LRM 9.3.2). Children:
+            // [fork, kBlockItemStatementList (one kStatement/kSeqBlock per
+            // branch), join keyword leaf]. The join keyword is a leaf whose
+            // *tag* carries the keyword (empty text), like `fork` above.
+            let mut branches = Vec::new();
+            let mut join = ForkJoin::All;
+            for c in kids(n) {
+                match tag(c) {
+                    "kBlockItemStatementList" => {
+                        for s in kids(c) {
+                            branches.push(lower_stmt(s));
+                        }
+                    }
+                    "join_none" => join = ForkJoin::None,
+                    "join_any" => join = ForkJoin::Any,
+                    "join" => join = ForkJoin::All,
+                    _ => {}
+                }
+            }
+            Stmt::Fork { branches, join }
         }
         _ => Stmt::Null,
     }

@@ -35,6 +35,19 @@ pub enum EdgeKind {
     AnyChange,
 }
 
+/// The completion discipline of a `fork` block (LRM 9.3.2), shared by the IR
+/// layer (which lowers `fork`/`join`/`join_any`/`join_none` to this) and the
+/// kernel (which implements the join-wait bookkeeping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkJoin {
+    /// `join` — the parent resumes only after every branch finishes.
+    All,
+    /// `join_any` — the parent resumes after the first branch finishes.
+    Any,
+    /// `join_none` — the parent resumes immediately; branches run detached.
+    None,
+}
+
 /// What a process is waiting for after a [`Process::resume`] call.
 ///
 /// Returning a `Wait` parks the process; the kernel re-runs `resume` when the
@@ -53,6 +66,17 @@ pub enum Wait {
     /// (where the process re-evaluates the condition). The process is woken
     /// only on real writes to these nets — never by delta polling.
     Cond(Vec<NetId>),
+    /// `fork branches join*`: spawn each of `children` as an independent
+    /// concurrent process. The scheduler (not this process) owns the process
+    /// table, so spawning happens one level up — [`crate::Sim`] intercepts
+    /// this variant instead of parking it via the usual net-based waits. Per
+    /// `join`, the parent process is re-queued once every child has returned
+    /// `Wait::Finished` (`All`), once the first child has (`Any`), or
+    /// immediately (`None`, branches run detached).
+    Fork {
+        children: Vec<Box<dyn Process>>,
+        join: ForkJoin,
+    },
 }
 
 /// A resumable SV process.

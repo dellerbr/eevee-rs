@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use eevee_core::LogicVec;
-use eevee_sched::{EdgeKind, NetId};
+use eevee_sched::{EdgeKind, ForkJoin, NetId};
 
 use crate::value::Value;
 
@@ -40,6 +40,8 @@ pub type ArgListId = u32;
 pub type FuncId = u32;
 /// Index into the design's class table.
 pub type ClassId = u32;
+/// Index into [`Program::fork_groups`].
+pub type ForkGroupId = u32;
 
 /// A single IR instruction. `Copy` and small by construction.
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +215,16 @@ pub enum Inst {
     /// `dst = src.atoi()` — integer value parsed from the string.
     StringAtoi { dst: Reg, src: Reg },
 
+    /// `fork ... join/join_any/join_none` (LRM 9.3.2): spawn each program in
+    /// `fork_groups[group]` (indices into `Program::forks`) as an independent
+    /// concurrent process. Each spawned process's register 0 is seeded with
+    /// the *current* frame's register 0 (`this`, by the same reg0-is-this
+    /// convention `gen_callable` uses) when `forks_want_this[i]` is set, so a
+    /// forked method call sees the same object the parent method did. Per
+    /// `join`, execution of the current frame parks here until the children
+    /// satisfy `join`'s completion rule (see [`eevee_sched::Wait::Fork`]).
+    Fork { group: ForkGroupId, join: ForkJoin },
+
     /// End the process (`Wait::Finished`).
     Finish,
 }
@@ -248,6 +260,15 @@ pub struct Program {
     pub netlists: Vec<Box<[NetId]>>,
     /// Argument register lists for `Display` (and future calls).
     pub arglists: Vec<Box<[Reg]>>,
+    /// Programs compiled for `fork` branches, referenced by `fork_groups`.
+    pub forks: Vec<Rc<Program>>,
+    /// Whether `forks[i]` expects register 0 seeded with the enclosing
+    /// frame's `this` at spawn time (it was compiled inside the same class
+    /// context and reserved reg0 for `this`, exactly like a method).
+    pub forks_want_this: Vec<bool>,
+    /// Groups of branch indices (into `forks`), one group per `fork`
+    /// statement, referenced by `Inst::Fork::group`.
+    pub fork_groups: Vec<Box<[u32]>>,
     /// Number of registers (frame size).
     pub n_regs: u32,
     /// Human-readable label (debug/trace/VCD).
@@ -301,6 +322,9 @@ pub struct ProgramBuilder {
     consts: Vec<Value>,
     netlists: Vec<Box<[NetId]>>,
     arglists: Vec<Box<[Reg]>>,
+    forks: Vec<Rc<Program>>,
+    forks_want_this: Vec<bool>,
+    fork_groups: Vec<Box<[u32]>>,
     n_regs: u32,
     /// label id -> bound code address (`u32::MAX` while unbound).
     labels: Vec<u32>,
@@ -317,6 +341,9 @@ impl ProgramBuilder {
             consts: Vec::new(),
             netlists: Vec::new(),
             arglists: Vec::new(),
+            forks: Vec::new(),
+            forks_want_this: Vec::new(),
+            fork_groups: Vec::new(),
             n_regs: 0,
             labels: Vec::new(),
             patches: Vec::new(),
@@ -354,6 +381,26 @@ impl ProgramBuilder {
     pub fn arglist(&mut self, regs: &[Reg]) -> ArgListId {
         let id = self.arglists.len() as u32;
         self.arglists.push(regs.to_vec().into_boxed_slice());
+        id
+    }
+
+    /// Register a compiled `fork` branch program, returning its index into
+    /// `forks` (used to build a [`Self::fork_group`]). `wants_this` records
+    /// whether the branch was compiled inside the same class context as its
+    /// enclosing callable (so it needs register 0 seeded with `this` at
+    /// spawn time).
+    pub fn add_fork_branch(&mut self, prog: Rc<Program>, wants_this: bool) -> u32 {
+        let id = self.forks.len() as u32;
+        self.forks.push(prog);
+        self.forks_want_this.push(wants_this);
+        id
+    }
+
+    /// Group a `fork` statement's branch indices (from [`Self::add_fork_branch`])
+    /// for use as `Inst::Fork::group`.
+    pub fn fork_group(&mut self, branches: &[u32]) -> ForkGroupId {
+        let id = self.fork_groups.len() as u32;
+        self.fork_groups.push(branches.to_vec().into_boxed_slice());
         id
     }
 
@@ -419,6 +466,9 @@ impl ProgramBuilder {
             consts: self.consts,
             netlists: self.netlists,
             arglists: self.arglists,
+            forks: self.forks,
+            forks_want_this: self.forks_want_this,
+            fork_groups: self.fork_groups,
             n_regs: self.n_regs,
             label: self.name,
         }

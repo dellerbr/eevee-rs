@@ -23,7 +23,7 @@ use std::rc::Rc;
 use eevee_ast::*;
 use eevee_core::{LogicVec, Timescale};
 use eevee_ir::{ClassDef, CollOp, ExecBackend, Inst, Linkage, Program, ProgramBuilder, Reg, Value};
-use eevee_sched::{EdgeKind, NetId, Sim};
+use eevee_sched::{EdgeKind, ForkJoin, NetId, Sim};
 
 /// Statistics from a global elaboration pass (how much UVM we ingested).
 #[derive(Debug, Default, Clone)]
@@ -1221,6 +1221,45 @@ impl<'a> CodeGen<'a> {
         pb.build()
     }
 
+    /// Compile one `fork` branch as its own standalone program (an
+    /// independent concurrent process, not a callee frame — it ends with
+    /// `Inst::Finish`, not `Return`). It gets a *fresh* register file and
+    /// local-variable scope: SystemVerilog runs each branch as a genuinely
+    /// concurrent process, so it cannot share the parent's registers (which
+    /// may be suspended mid-branch itself). The branch still sees the same
+    /// class fields/statics/globals as the parent, and — if compiled in a
+    /// class context — the same `this` (reg 0, seeded at spawn time by the
+    /// interpreter; see `Inst::Fork`). Bare references to the *parent's own
+    /// local variables* declared before the `fork` are the one gap this
+    /// leaves (a fresh frame has no way to alias them); the common UVM
+    /// pattern of forking a method/task call or a self-contained block is
+    /// unaffected. Returns the compiled program and whether it wants `this`.
+    fn gen_fork_branch(&mut self, body: &Stmt) -> (Rc<Program>, bool) {
+        let label = match self.class_ctx {
+            Some(cid) => format!("{}::<fork>", self.classes[cid as usize].name),
+            None => "<fork>".to_string(),
+        };
+        let mut pb = ProgramBuilder::new(label);
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_classes = std::mem::take(&mut self.local_classes);
+        let saved_colls = std::mem::take(&mut self.local_colls);
+        let saved_enums = std::mem::take(&mut self.local_enums);
+        let saved_this_reg = self.this_reg;
+        let wants_this = self.class_ctx.is_some();
+        if wants_this {
+            self.this_reg = pb.new_reg(); // reg 0 = this, seeded by the scheduler at spawn
+        }
+        self.gen_stmt(body, &mut pb);
+        pb.emit(Inst::Finish);
+        let prog = pb.build();
+        self.locals = saved_locals;
+        self.local_classes = saved_classes;
+        self.local_colls = saved_colls;
+        self.local_enums = saved_enums;
+        self.this_reg = saved_this_reg;
+        (Rc::new(prog), wants_this)
+    }
+
     fn gen_stmt(&mut self, s: &Stmt, pb: &mut ProgramBuilder) {
         match s {
             Stmt::Block(stmts) => {
@@ -1379,6 +1418,22 @@ impl<'a> CodeGen<'a> {
             },
             Stmt::Expr(e) => {
                 self.gen_expr(e, pb);
+            }
+            Stmt::Fork { branches, join } => {
+                let ids: Vec<u32> = branches
+                    .iter()
+                    .map(|b| {
+                        let (prog, wants_this) = self.gen_fork_branch(b);
+                        pb.add_fork_branch(prog, wants_this)
+                    })
+                    .collect();
+                let group = pb.fork_group(&ids);
+                let join = match join {
+                    eevee_ast::ForkJoin::All => ForkJoin::All,
+                    eevee_ast::ForkJoin::Any => ForkJoin::Any,
+                    eevee_ast::ForkJoin::None => ForkJoin::None,
+                };
+                pb.emit(Inst::Fork { group, join });
             }
             Stmt::Null => {}
         }

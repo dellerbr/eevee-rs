@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use eevee_core::LogicVec;
-use eevee_sched::{Kernel, Process, Wait};
+use eevee_sched::{ForkJoin, Kernel, Process, Wait};
 
 use crate::inst::{CollOp, Inst, Linkage, Program, Reg};
 use crate::value::{AssocKey, ObjData, Value};
@@ -52,6 +52,13 @@ enum Step {
     /// Pop the current frame, delivering `Some(value)` to the caller's
     /// `ret_dst` (or nothing for a void return).
     Return(Option<Value>),
+    /// `fork`: spawn `children` (branch program + whether it wants `this`
+    /// seeded into its register 0) as independent processes, per `join`.
+    Fork {
+        children: Vec<(Rc<Program>, bool)>,
+        this_val: Value,
+        join: ForkJoin,
+    },
 }
 
 /// A process that executes IR via the interpreter, with a call stack.
@@ -149,6 +156,23 @@ impl IrProcess {
                         // Returned past the bottom frame — the process is done.
                         None => return Wait::Finished,
                     }
+                }
+                Step::Fork {
+                    children,
+                    this_val,
+                    join,
+                } => {
+                    let children: Vec<Box<dyn Process>> = children
+                        .into_iter()
+                        .map(|(prog, wants_this)| {
+                            let mut p = IrProcess::new(prog, self.linkage.clone());
+                            if wants_this {
+                                p.regs[0] = this_val.clone();
+                            }
+                            Box::new(p) as Box<dyn Process>
+                        })
+                        .collect();
+                    return Wait::Fork { children, join };
                 }
             }
         }
@@ -583,6 +607,27 @@ fn run_frame(
                 regs[dst as usize] = Value::Logic(LogicVec::from_u64(v, 32));
             }
             Inst::Finish => return Step::Wait(Wait::Finished),
+            Inst::Fork { group, join } => {
+                // `this` (reg 0, by the reg0-is-this convention `gen_callable`
+                // establishes for every method) is captured now and seeded
+                // into any branch that was compiled in the same class
+                // context, so a forked method call sees the same object.
+                let this_val = regs.first().cloned().unwrap_or(Value::Null);
+                let children: Vec<(Rc<Program>, bool)> = prog.fork_groups[group as usize]
+                    .iter()
+                    .map(|&i| {
+                        (
+                            prog.forks[i as usize].clone(),
+                            prog.forks_want_this[i as usize],
+                        )
+                    })
+                    .collect();
+                return Step::Fork {
+                    children,
+                    this_val,
+                    join,
+                };
+            }
         }
     }
 }

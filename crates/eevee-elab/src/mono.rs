@@ -298,6 +298,11 @@ impl Mono {
                 }
             }
             Stmt::Return(None) | Stmt::Null => {}
+            Stmt::Fork { branches, .. } => {
+                for b in branches {
+                    self.subst_stmt(b);
+                }
+            }
         }
     }
 

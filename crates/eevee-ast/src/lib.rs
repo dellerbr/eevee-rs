@@ -257,8 +257,22 @@ pub enum Stmt {
     Expr(Expr),
     /// `return [expr];`
     Return(Option<Expr>),
+    /// `fork branches join/join_any/join_none` — each branch runs as its own
+    /// concurrent process.
+    Fork { branches: Vec<Stmt>, join: ForkJoin },
     /// Empty statement (`;`).
     Null,
+}
+
+/// The completion discipline of a `fork` block (LRM 9.3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkJoin {
+    /// `join` — the parent resumes only after every branch finishes.
+    All,
+    /// `join_any` — the parent resumes after the first branch finishes.
+    Any,
+    /// `join_none` — the parent resumes immediately; branches run detached.
+    None,
 }
 
 /// A timing control.
