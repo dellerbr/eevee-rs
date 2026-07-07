@@ -198,7 +198,12 @@ pub enum Inst {
     /// `dst = src.len()` — number of characters in the string `src`.
     StringLen { dst: Reg, src: Reg },
     /// `dst = src.substr(lo, hi)` — characters from index `lo` to `hi` (inclusive).
-    StringSub { dst: Reg, src: Reg, lo: Reg, hi: Reg },
+    StringSub {
+        dst: Reg,
+        src: Reg,
+        lo: Reg,
+        hi: Reg,
+    },
     /// `dst = src[idx]` — byte value (8-bit) of the character at index `idx`.
     StringIndex { dst: Reg, src: Reg, idx: Reg },
     /// `dst = src.toupper()` — uppercase copy of the string.

@@ -262,13 +262,7 @@ fn builtin_classes() -> Vec<ClassDecl> {
                 Stmt::Null,
             ),
             // `process.srandom(seed)` — reseed the process's random generator.
-            method(
-                "srandom",
-                true,
-                None,
-                vec![str_param("seed")],
-                Stmt::Null,
-            ),
+            method("srandom", true, None, vec![str_param("seed")], Stmt::Null),
         ],
         constructor: None,
         type_aliases: Vec::new(),
@@ -293,9 +287,27 @@ fn builtin_classes() -> Vec<ClassDecl> {
             method("get", true, None, vec![str_param("item")], Stmt::Null),
             method("peek", true, None, vec![str_param("item")], Stmt::Null),
             // Non-blocking variants: return 0 (fail gracefully)
-            method("try_put", false, None, vec![str_param("item")], ret0_32.clone()),
-            method("try_get", false, None, vec![str_param("item")], ret0_32.clone()),
-            method("try_peek", false, None, vec![str_param("item")], ret0_32.clone()),
+            method(
+                "try_put",
+                false,
+                None,
+                vec![str_param("item")],
+                ret0_32.clone(),
+            ),
+            method(
+                "try_get",
+                false,
+                None,
+                vec![str_param("item")],
+                ret0_32.clone(),
+            ),
+            method(
+                "try_peek",
+                false,
+                None,
+                vec![str_param("item")],
+                ret0_32.clone(),
+            ),
         ],
         constructor: None,
         type_aliases: Vec::new(),
@@ -808,8 +820,16 @@ fn build_class_info(
             let mut parts = vec![a.target.name.clone()];
             for arg in &a.target.args {
                 // Sanitize just like mono::sanitize(): keep alnum/_; map rest to '_'.
-                let s: String = arg.name.chars()
-                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                let s: String = arg
+                    .name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
                     .collect();
                 parts.push(if s.is_empty() { "_".to_string() } else { s });
             }
@@ -1289,7 +1309,10 @@ impl<'a> CodeGen<'a> {
                         let base_expr = Expr::Ref(lhs.name.clone());
                         if let Some(cid) = self.coll_elem_class(&base_expr) {
                             let obj = pb.new_reg();
-                            pb.emit(Inst::New { dst: obj, class: cid });
+                            pb.emit(Inst::New {
+                                dst: obj,
+                                class: cid,
+                            });
                             let ctor = self.classes[cid as usize].ctor;
                             if let Some(ctor_fid) = ctor {
                                 let mut arg_regs = vec![obj];
@@ -1306,7 +1329,11 @@ impl<'a> CodeGen<'a> {
                             }
                             let base = self.gen_expr(&base_expr, pb);
                             let idx = self.gen_expr(index, pb);
-                            pb.emit(Inst::IndexSet { base, idx, src: obj });
+                            pb.emit(Inst::IndexSet {
+                                base,
+                                idx,
+                                src: obj,
+                            });
                         } else {
                             panic!("`new` assigned to indexed non-class-handle '{}'", lhs.name)
                         }
@@ -1622,8 +1649,14 @@ impl<'a> CodeGen<'a> {
                         });
                         return dst;
                     }
-                    panic!("'{name}' is not a class handle",
-                        name = if let Expr::Ref(n) = obj.as_ref() { n.as_str() } else { "<expr>" });
+                    panic!(
+                        "'{name}' is not a class handle",
+                        name = if let Expr::Ref(n) = obj.as_ref() {
+                            n.as_str()
+                        } else {
+                            "<expr>"
+                        }
+                    );
                 }
 
                 let cid = self.receiver_class(obj);
@@ -1786,7 +1819,8 @@ impl<'a> CodeGen<'a> {
                 }
                 // Third: static field of the named class.
                 if let Some(cid) = self.resolve_class(class_name) {
-                    if let Some(&id) = self.classes[cid as usize].static_fields.get(field.as_str()) {
+                    if let Some(&id) = self.classes[cid as usize].static_fields.get(field.as_str())
+                    {
                         let dst = pb.new_reg();
                         pb.emit(Inst::StaticGet { dst, id });
                         return dst;
@@ -2183,7 +2217,12 @@ impl<'a> CodeGen<'a> {
                     let lo = self.gen_expr(&args[0], pb);
                     let hi = self.gen_expr(&args[1], pb);
                     let dst = pb.new_reg();
-                    pb.emit(Inst::StringSub { dst, src: src_reg, lo, hi });
+                    pb.emit(Inst::StringSub {
+                        dst,
+                        src: src_reg,
+                        lo,
+                        hi,
+                    });
                     return Some(dst);
                 }
                 ("toupper", 0) => {
@@ -2222,7 +2261,11 @@ impl<'a> CodeGen<'a> {
                 if !ci.field_class.contains_key(name) && !ci.field_coll.contains_key(name) {
                     let this = self.this_reg;
                     let dst = pb.new_reg();
-                    pb.emit(Inst::GetField { dst, obj: this, slot });
+                    pb.emit(Inst::GetField {
+                        dst,
+                        obj: this,
+                        slot,
+                    });
                     return Some(dst);
                 }
             }

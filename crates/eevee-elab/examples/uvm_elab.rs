@@ -7,7 +7,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() {
-    let uvm_src = PathBuf::from(r"C:\Users\dellerbr\Simmy\uvm-core\src");
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("eevee-elab lives at <repo>/crates/eevee-elab")
+        .to_path_buf();
+    let uvm_src = repo_root.join("uvm-core").join("src");
     let pkg = uvm_src.join("uvm_pkg.sv");
 
     let t0 = Instant::now();
