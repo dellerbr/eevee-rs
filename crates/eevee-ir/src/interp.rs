@@ -36,6 +36,8 @@ struct Frame {
     regs: Vec<Value>,
     /// Register in the *caller's* frame to receive this call's return value.
     ret_dst: Reg,
+    /// Copy-out mappings owned by this frame: `(formal, caller actual)`.
+    copy_out: Vec<(usize, Reg)>,
 }
 
 /// What running one frame to its next transition produced.
@@ -47,6 +49,7 @@ enum Step {
     Call {
         func: u32,
         vals: Vec<Value>,
+        actuals: Vec<Reg>,
         ret_dst: Reg,
     },
     /// Pop the current frame, delivering `Some(value)` to the caller's
@@ -74,6 +77,8 @@ pub struct IrProcess {
     regs: Vec<Value>,
     /// Where the current frame's return value goes in its caller's registers.
     ret_dst: Reg,
+    /// Output/inout/ref formals copied back when the current frame returns.
+    copy_out: Vec<(usize, Reg)>,
     /// Suspended caller frames — empty unless inside a call.
     callers: Vec<Frame>,
     /// The design's shared linkage (functions + classes), indexed by
@@ -91,6 +96,7 @@ impl IrProcess {
             pc: 0,
             regs,
             ret_dst: 0,
+            copy_out: Vec::new(),
             callers: Vec::new(),
             linkage,
         }
@@ -106,6 +112,7 @@ impl IrProcess {
                 Step::Call {
                     func,
                     vals,
+                    actuals,
                     ret_dst,
                 } => {
                     let callee = self.linkage.funcs[func as usize].clone();
@@ -119,9 +126,20 @@ impl IrProcess {
                         );
                     }
                     let mut regs = vec![Value::Null; callee.n_regs as usize];
+                    let mut copy_out = Vec::new();
                     for (i, v) in vals.into_iter().enumerate() {
                         if i < regs.len() {
-                            regs[i] = v;
+                            let mode = callee
+                                .arg_modes
+                                .get(i)
+                                .copied()
+                                .unwrap_or(crate::inst::ArgMode::Input);
+                            if mode != crate::inst::ArgMode::Output {
+                                regs[i] = v;
+                            }
+                            if mode.copies_out() {
+                                copy_out.push((i, actuals[i]));
+                            }
                         }
                     }
                     // Save the current frame and switch to the callee.
@@ -130,6 +148,7 @@ impl IrProcess {
                         pc: std::mem::replace(&mut self.pc, 0),
                         regs: std::mem::replace(&mut self.regs, regs),
                         ret_dst: std::mem::replace(&mut self.ret_dst, ret_dst),
+                        copy_out: std::mem::replace(&mut self.copy_out, copy_out),
                     };
                     self.callers.push(prev);
                 }
@@ -145,6 +164,9 @@ impl IrProcess {
                     }
                     match self.callers.pop() {
                         Some(mut caller) => {
+                            for &(formal, actual) in &self.copy_out {
+                                caller.regs[actual as usize] = self.regs[formal].clone();
+                            }
                             if let Some(v) = val {
                                 caller.regs[self.ret_dst as usize] = v;
                             }
@@ -152,6 +174,7 @@ impl IrProcess {
                             self.pc = caller.pc;
                             self.regs = caller.regs;
                             self.ret_dst = caller.ret_dst;
+                            self.copy_out = caller.copy_out;
                         }
                         // Returned past the bottom frame — the process is done.
                         None => return Wait::Finished,
@@ -245,6 +268,29 @@ fn vsum(v: &Value) -> String {
         Value::Queue(rc) => format!("queue[{}]", rc.borrow().len()),
         Value::Assoc(rc) => format!("assoc[{}]", rc.borrow().len()),
     }
+}
+
+/// Construct a fresh instance of `class`: collection-typed fields get fresh
+/// empty storage (no aliasing across instances), and struct-typed fields (an
+/// unpacked `typedef struct {...}` field, modeled as a no-method class — see
+/// `ClassId`/`is_struct` on the elaborator side) get a fresh, fully
+/// default-constructed sub-object of their own — recursively, so a struct
+/// nested inside a struct is handled too — rather than staying a null handle
+/// awaiting an explicit `new()` the way a real class-typed field does.
+fn new_instance(class: crate::inst::ClassId, linkage: &Linkage) -> Value {
+    let def = &linkage.classes[class as usize];
+    let mut fields = def.field_defaults.to_vec();
+    for &(slot, is_assoc) in def.coll_fields.iter() {
+        fields[slot as usize] = if is_assoc {
+            Value::new_assoc()
+        } else {
+            Value::new_queue()
+        };
+    }
+    for &(slot, struct_cid) in def.struct_fields.iter() {
+        fields[slot as usize] = new_instance(struct_cid, linkage);
+    }
+    Value::Obj(Rc::new(RefCell::new(ObjData { class, fields })))
 }
 
 /// Run one frame from `*pc` until it transitions (suspends, calls, or returns),
@@ -410,6 +456,7 @@ fn run_frame(
                 return Step::Call {
                     func,
                     vals,
+                    actuals: arglist.to_vec(),
                     ret_dst: ret,
                 };
             }
@@ -435,23 +482,14 @@ fn run_frame(
                 return Step::Call {
                     func,
                     vals,
+                    actuals: arglist.to_vec(),
                     ret_dst: ret,
                 };
             }
             Inst::Return { value } => return Step::Return(Some(regs[value as usize].clone())),
             Inst::ReturnVoid => return Step::Return(None),
             Inst::New { dst, class } => {
-                let def = &linkage.classes[class as usize];
-                let mut fields = def.field_defaults.to_vec();
-                // Collection fields get fresh storage per instance (no aliasing).
-                for &(slot, is_assoc) in def.coll_fields.iter() {
-                    fields[slot as usize] = if is_assoc {
-                        Value::new_assoc()
-                    } else {
-                        Value::new_queue()
-                    };
-                }
-                regs[dst as usize] = Value::Obj(Rc::new(RefCell::new(ObjData { class, fields })));
+                regs[dst as usize] = new_instance(class, linkage);
             }
             Inst::GetField { dst, obj, slot } => {
                 let v = match &regs[obj as usize] {
@@ -525,7 +563,8 @@ fn run_frame(
                 args,
             } => {
                 let arglist = &prog.arglists[args as usize];
-                let result = eval_coll_method(&regs[base as usize], op, arglist, regs);
+                let base_value = regs[base as usize].clone();
+                let result = eval_coll_method(&base_value, op, arglist, regs);
                 regs[dst as usize] = result;
             }
             Inst::ConcatStr { dst, args } => {
@@ -746,12 +785,24 @@ fn value_to_key(v: &Value) -> AssocKey {
     match v {
         Value::Str(s) => AssocKey::Str(s.clone()),
         Value::Logic(lv) => AssocKey::Int(lv.to_i64()),
-        _ => AssocKey::Int(0),
+        Value::Obj(obj) => AssocKey::Obj(obj.clone()),
+        Value::Null => AssocKey::Null,
+        Value::Real(value) => AssocKey::Int(*value as i64),
+        Value::Queue(_) | Value::Assoc(_) => AssocKey::Null,
+    }
+}
+
+fn key_to_value(key: &AssocKey) -> Value {
+    match key {
+        AssocKey::Int(value) => Value::Logic(LogicVec::from_i64(*value, 64)),
+        AssocKey::Str(value) => Value::Str(value.clone()),
+        AssocKey::Obj(value) => Value::Obj(value.clone()),
+        AssocKey::Null => Value::Null,
     }
 }
 
 /// Evaluate a built-in queue/array/assoc method (`push_back`, `size`, ...).
-fn eval_coll_method(base: &Value, op: CollOp, args: &[Reg], regs: &[Value]) -> Value {
+fn eval_coll_method(base: &Value, op: CollOp, args: &[Reg], regs: &mut [Value]) -> Value {
     let int_val = |n: u64| Value::Logic(LogicVec::from_u64(n, 32));
     match base {
         Value::Queue(rc) => {
@@ -797,6 +848,44 @@ fn eval_coll_method(base: &Value, op: CollOp, args: &[Reg], regs: &[Value]) -> V
                     }
                     Value::Null
                 }
+                CollOp::First => match args.first() {
+                    Some(&arg) if !q.is_empty() => {
+                        regs[arg as usize] = int_val(0);
+                        int_val(1)
+                    }
+                    _ => int_val(0),
+                },
+                CollOp::Last => match args.first() {
+                    Some(&arg) if !q.is_empty() => {
+                        regs[arg as usize] = int_val((q.len() - 1) as u64);
+                        int_val(1)
+                    }
+                    _ => int_val(0),
+                },
+                CollOp::Next => match args.first() {
+                    Some(&arg) => {
+                        let next = regs[arg as usize].as_logic().to_u64() as usize + 1;
+                        if next < q.len() {
+                            regs[arg as usize] = int_val(next as u64);
+                            int_val(1)
+                        } else {
+                            int_val(0)
+                        }
+                    }
+                    None => int_val(0),
+                },
+                CollOp::Prev => match args.first() {
+                    Some(&arg) => {
+                        let current = regs[arg as usize].as_logic().to_u64() as usize;
+                        if current > 0 && current <= q.len() {
+                            regs[arg as usize] = int_val((current - 1) as u64);
+                            int_val(1)
+                        } else {
+                            int_val(0)
+                        }
+                    }
+                    None => int_val(0),
+                },
                 _ => Value::Null,
             }
         }
@@ -820,10 +909,56 @@ fn eval_coll_method(base: &Value, op: CollOp, args: &[Reg], regs: &[Value]) -> V
                     }
                     Value::Null
                 }
-                // first/last/next/prev write the key back to a ref arg, which the
-                // current calling convention can't express; report only success.
-                CollOp::First | CollOp::Last => int_val((!m.is_empty()) as u64),
-                CollOp::Next | CollOp::Prev => int_val(0),
+                CollOp::First => {
+                    let key = m.keys().next().cloned();
+                    if let (Some(&arg), Some(key)) = (args.first(), key) {
+                        regs[arg as usize] = key_to_value(&key);
+                        int_val(1)
+                    } else {
+                        int_val(0)
+                    }
+                }
+                CollOp::Last => {
+                    let key = m.keys().next_back().cloned();
+                    if let (Some(&arg), Some(key)) = (args.first(), key) {
+                        regs[arg as usize] = key_to_value(&key);
+                        int_val(1)
+                    } else {
+                        int_val(0)
+                    }
+                }
+                CollOp::Next => match args.first() {
+                    Some(&arg) => {
+                        let current = value_to_key(&regs[arg as usize]);
+                        let key = m
+                            .range((
+                                std::ops::Bound::Excluded(current),
+                                std::ops::Bound::Unbounded,
+                            ))
+                            .next()
+                            .map(|(key, _)| key.clone());
+                        if let Some(key) = key {
+                            regs[arg as usize] = key_to_value(&key);
+                            int_val(1)
+                        } else {
+                            int_val(0)
+                        }
+                    }
+                    None => int_val(0),
+                },
+                CollOp::Prev => match args.first() {
+                    Some(&arg) => {
+                        let current = value_to_key(&regs[arg as usize]);
+                        let key = m.range(..current).next_back().map(|(key, _)| key.clone());
+                        if let Some(key) = key {
+                            regs[arg as usize] = key_to_value(&key);
+                            int_val(1)
+                        } else {
+                            int_val(0)
+                        }
+                    }
+                    None => int_val(0),
+                },
                 _ => Value::Null,
             }
         }

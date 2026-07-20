@@ -128,6 +128,8 @@ pub struct VarDecl {
     pub is_string: bool,
     /// `Some(kind)` if this is a queue / dynamic array / associative array.
     pub coll: Option<CollKind>,
+    /// Class type used as an associative-array key, if any (`value[Key]`).
+    pub key_class_name: Option<String>,
     /// True for a `static` class field (one shared storage, not per-instance).
     pub is_static: bool,
     pub init: Option<Expr>,
@@ -160,6 +162,12 @@ pub struct ClassDecl {
     /// Class-scoped named constants (`localparam`/`parameter`), gathered into
     /// the global constant table.
     pub consts: Vec<(String, LogicVec)>,
+    /// True for a synthetic class generated from `typedef struct {...} Name;`
+    /// (an unpacked struct modeled as a no-method, no-constructor class: its
+    /// instances get auto-constructed sub-objects for struct-typed fields at
+    /// `new`, rather than needing an explicit `= new()` from user code — see
+    /// `ClassDef::struct_fields` in eevee-ir).
+    pub is_struct: bool,
 }
 
 /// A class-scoped typedef `typedef <target> <alias>;`.
@@ -206,6 +214,10 @@ pub struct Param {
     /// Type arguments of a parameterized parameter type (e.g. `#(uvm_callback)`
     /// in `uvm_queue #(uvm_callback) q`). Consumed by mono; empty after that.
     pub type_args: Vec<TypeRef>,
+    /// Queue/dynamic/associative-array flavor for an unpacked formal.
+    pub coll: Option<CollKind>,
+    /// Class type used as an associative-array key, if any.
+    pub key_class_name: Option<String>,
 }
 
 /// Which flavor of `always` block.
@@ -250,6 +262,12 @@ pub enum Stmt {
         cond: Expr,
         then_branch: Box<Stmt>,
         else_branch: Option<Box<Stmt>>,
+    },
+    /// `foreach (collection[index]) body`.
+    Foreach {
+        collection: Expr,
+        index: String,
+        body: Box<Stmt>,
     },
     /// A system task call statement, e.g. `$display("...", a, b);`.
     SysCall { name: String, args: Vec<Expr> },
@@ -306,6 +324,9 @@ pub enum Edge {
 #[derive(Debug, Clone)]
 pub struct Lvalue {
     pub name: String,
+    /// Receiver for an object-field target (`obj.field`); absent for a local,
+    /// net, current-class field, or scoped static target.
+    pub receiver: Option<Box<Expr>>,
     /// `Some(index)` for an element assignment `name[index] = ...`.
     pub index: Option<Expr>,
     /// `Some(class)` for a scoped static-field target `Class::name = ...`.

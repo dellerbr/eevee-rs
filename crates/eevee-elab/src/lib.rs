@@ -22,7 +22,9 @@ use std::rc::Rc;
 
 use eevee_ast::*;
 use eevee_core::{LogicVec, Timescale};
-use eevee_ir::{ClassDef, CollOp, ExecBackend, Inst, Linkage, Program, ProgramBuilder, Reg, Value};
+use eevee_ir::{
+    ArgMode, ClassDef, CollOp, ExecBackend, Inst, Linkage, Program, ProgramBuilder, Reg, Value,
+};
 use eevee_sched::{EdgeKind, ForkJoin, NetId, Sim};
 
 /// Statistics from a global elaboration pass (how much UVM we ingested).
@@ -38,6 +40,13 @@ pub struct ElabStats {
     pub stub_reasons: Vec<(String, usize)>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CollInfo {
+    kind: CollKind,
+    elem_class: Option<u32>,
+    key_class: Option<u32>,
+}
+
 /// The global program shared by every module: class layout, the name→FuncId
 /// map, and the compiled [`Linkage`].
 struct Global {
@@ -47,8 +56,8 @@ struct Global {
     consts: HashMap<String, LogicVec>,
     /// Package-level global variables: name -> static-storage id.
     globals: HashMap<String, u32>,
-    /// Collection-typed globals: name -> (kind, element class id).
-    global_coll: HashMap<String, (CollKind, Option<u32>)>,
+    /// Collection-typed globals and their element/key class types.
+    global_coll: HashMap<String, CollInfo>,
     /// Class-handle globals: name -> class id.
     global_class: HashMap<String, u32>,
     /// Package/module-scope type aliases: alias name -> class id.
@@ -225,6 +234,8 @@ fn builtin_classes() -> Vec<ClassDecl> {
             width: 32,
             class_name: None,
             type_args: Vec::new(),
+            coll: None,
+            key_class_name: None,
         }
     }
     let ret0 = Stmt::Return(Some(Expr::Literal(LogicVec::zero(32))));
@@ -269,6 +280,7 @@ fn builtin_classes() -> Vec<ClassDecl> {
         params: Vec::new(),
         base_args: Vec::new(),
         consts: Vec::new(),
+        is_struct: false,
     };
     // IEEE-1800 built-in `mailbox #(T)`: unbounded/bounded queue of handles.
     // Parameterized, but since we don't have the source, inject a generic stub
@@ -314,6 +326,7 @@ fn builtin_classes() -> Vec<ClassDecl> {
         params: Vec::new(),
         base_args: Vec::new(),
         consts: Vec::new(),
+        is_struct: false,
     };
     vec![process, mailbox]
 }
@@ -514,7 +527,7 @@ fn build_global(
     // global variable. Package globals are allocated first (stable ids).
     let mut statics_defaults: Vec<Value> = Vec::new();
     let mut globals: HashMap<String, u32> = HashMap::new();
-    let mut global_coll: HashMap<String, (CollKind, Option<u32>)> = HashMap::new();
+    let mut global_coll: HashMap<String, CollInfo> = HashMap::new();
     let mut global_class: HashMap<String, u32> = HashMap::new();
     for v in global_vars {
         if globals.contains_key(&v.name) {
@@ -532,9 +545,20 @@ fn build_global(
             .class_name
             .as_deref()
             .and_then(|cn| class_ids.get(cn).copied());
+        let key_class = v
+            .key_class_name
+            .as_deref()
+            .and_then(|cn| class_ids.get(cn).copied());
         match v.coll {
             Some(kind) => {
-                global_coll.insert(v.name.clone(), (kind, elem));
+                global_coll.insert(
+                    v.name.clone(),
+                    CollInfo {
+                        kind,
+                        elem_class: elem,
+                        key_class,
+                    },
+                );
             }
             None => {
                 if let Some(c) = elem {
@@ -675,7 +699,7 @@ fn build_global(
                     }
                 }
                 *reasons.entry(reason).or_insert(0) += 1;
-                funcs.push(Rc::new(stub_program(f)));
+                funcs.push(Rc::new(stub_program(f, cc.is_some())));
             }
         }
     }
@@ -698,9 +722,26 @@ fn build_global(
             let coll_fields: Vec<(u32, bool)> = ci
                 .field_coll
                 .iter()
-                .filter_map(|(name, (kind, _))| {
+                .filter_map(|(name, info)| {
                     let slot = ci.field_slot.get(name)?.0;
-                    Some((slot, matches!(kind, CollKind::Assoc)))
+                    Some((slot, matches!(info.kind, CollKind::Assoc)))
+                })
+                .collect();
+            // Struct-typed fields (an unpacked `typedef struct {...}` member,
+            // modeled as a no-method class — see `ClassDecl::is_struct`) also
+            // get a fresh auto-constructed sub-object per `New`: SV structs
+            // are always fully default-initialized, never left as a null
+            // handle awaiting an explicit `new()` the way a real class-typed
+            // field is.
+            let struct_fields: Vec<(u32, u32)> = ci
+                .field_class
+                .iter()
+                .filter_map(|(name, &cid)| {
+                    if !class_infos[cid as usize].is_struct {
+                        return None;
+                    }
+                    let slot = ci.field_slot.get(name)?.0;
+                    Some((slot, cid))
                 })
                 .collect();
             ClassDef {
@@ -708,6 +749,7 @@ fn build_global(
                 field_defaults: ci.field_defaults.clone().into_boxed_slice(),
                 vtable: ci.vtable.clone().into_boxed_slice(),
                 coll_fields: coll_fields.into_boxed_slice(),
+                struct_fields: struct_fields.into_boxed_slice(),
             }
         })
         .collect();
@@ -850,6 +892,7 @@ fn build_class_info(
     };
     for fld in &c.fields {
         let elem_class = fld.class_name.as_deref().and_then(resolve_ty);
+        let key_class = fld.key_class_name.as_deref().and_then(resolve_ty);
         if fld.is_static {
             // Static fields live in global storage, not per-instance slots.
             // A static collection field is initialized to fresh empty storage.
@@ -865,7 +908,14 @@ fn build_class_info(
                 static_field_class.insert(fld.name.clone(), fc);
             }
             if let Some(kind) = fld.coll {
-                static_field_coll.insert(fld.name.clone(), (kind, elem_class));
+                static_field_coll.insert(
+                    fld.name.clone(),
+                    CollInfo {
+                        kind,
+                        elem_class,
+                        key_class,
+                    },
+                );
             }
             continue;
         }
@@ -873,7 +923,14 @@ fn build_class_info(
         field_slot.insert(fld.name.clone(), (slot, fld.width));
         match fld.coll {
             Some(kind) => {
-                field_coll.insert(fld.name.clone(), (kind, elem_class));
+                field_coll.insert(
+                    fld.name.clone(),
+                    CollInfo {
+                        kind,
+                        elem_class,
+                        key_class,
+                    },
+                );
             }
             None => {
                 if let Some(fc) = elem_class {
@@ -915,6 +972,7 @@ fn build_class_info(
         vtable,
         vslot_of,
         ctor: fids.ctor_fid,
+        is_struct: c.is_struct,
     }
 }
 
@@ -947,6 +1005,7 @@ fn panic_category(payload: &(dyn std::any::Any + Send)) -> String {
 fn synth_default_ctor(base: Option<u32>, class_infos: &[ClassInfo]) -> Program {
     let mut pb = ProgramBuilder::new("default new");
     let this = pb.new_reg(); // reg 0 = this
+    pb.set_arg_modes(&[ArgMode::Input]);
     if let Some(b) = base {
         if let Some(base_ctor) = class_infos[b as usize].ctor {
             let arglist = pb.arglist(&[this]);
@@ -964,8 +1023,18 @@ fn synth_default_ctor(base: Option<u32>, class_infos: &[ClassInfo]) -> Program {
 
 /// A placeholder body for a callable we cannot compile yet: returns the default
 /// value (so the program is well-formed and the rest of the design links).
-fn stub_program(f: &FuncDecl) -> Program {
+fn stub_program(f: &FuncDecl, has_this: bool) -> Program {
     let mut pb = ProgramBuilder::new(format!("stub {}", f.name));
+    let mut modes = Vec::with_capacity(f.params.len() + usize::from(has_this));
+    if has_this {
+        pb.new_reg();
+        modes.push(ArgMode::Input);
+    }
+    for param in &f.params {
+        pb.new_reg();
+        modes.push(arg_mode(param.dir));
+    }
+    pb.set_arg_modes(&modes);
     if f.is_void {
         pb.emit(Inst::ReturnVoid);
     } else {
@@ -975,6 +1044,15 @@ fn stub_program(f: &FuncDecl) -> Program {
         pb.emit(Inst::Return { value: r });
     }
     pb.build()
+}
+
+fn arg_mode(dir: PortDir) -> ArgMode {
+    match dir {
+        PortDir::Input => ArgMode::Input,
+        PortDir::Output => ArgMode::Output,
+        PortDir::Inout => ArgMode::Inout,
+        PortDir::Ref => ArgMode::Ref,
+    }
 }
 
 /// Build a module's nets and compile its `always`/`initial` processes against
@@ -1049,15 +1127,14 @@ struct ClassInfo {
     /// Fields whose declared type is a class: name -> class id (for resolving
     /// `obj.field.method(...)` receiver chains).
     field_class: HashMap<String, u32>,
-    /// Collection fields: name -> (kind, element class id if elements are
-    /// class handles).
-    field_coll: HashMap<String, (CollKind, Option<u32>)>,
+    /// Collection fields and their element/key class types.
+    field_coll: HashMap<String, CollInfo>,
     /// Static fields: name -> global static id (shared storage).
     static_fields: HashMap<String, u32>,
     /// Static fields whose type is a class: name -> class id.
     static_field_class: HashMap<String, u32>,
-    /// Static fields that are collections: name -> (kind, element class id).
-    static_field_coll: HashMap<String, (CollKind, Option<u32>)>,
+    /// Static collection fields and their element/key class types.
+    static_field_coll: HashMap<String, CollInfo>,
     /// Type parameters with a class default: param name -> default class id
     /// (used to resolve `type_param`-typed fields and `extends type_param`).
     type_param_default: HashMap<String, u32>,
@@ -1071,6 +1148,11 @@ struct ClassInfo {
     vtable: Vec<u32>,
     vslot_of: HashMap<String, u32>,
     ctor: Option<u32>,
+    /// True for a synthetic class generated from `typedef struct {...}`: its
+    /// struct-typed fields get an auto-constructed sub-object at `new` time
+    /// instead of staying null until an explicit `= new()` (see
+    /// `ClassDef::struct_fields`).
+    is_struct: bool,
 }
 
 /// The default value of a class field (a collection placeholder, a null handle,
@@ -1102,8 +1184,8 @@ struct CodeGen<'a> {
     this_reg: Reg,
     /// Local class-handle variables: name -> class id.
     local_classes: HashMap<String, u32>,
-    /// Local collection variables: name -> (kind, element class id).
-    local_colls: HashMap<String, (CollKind, Option<u32>)>,
+    /// Local collection variables and their element/key class types.
+    local_colls: HashMap<String, CollInfo>,
     /// Local enum-typed variables: name -> enum table id (for `.name()`).
     local_enums: HashMap<String, u32>,
     locals: HashMap<String, (Reg, u32)>,
@@ -1113,7 +1195,7 @@ struct CodeGen<'a> {
 /// Borrowed package-global tables passed to the codegen.
 struct GlobalVars<'a> {
     vars: &'a HashMap<String, u32>,
-    coll: &'a HashMap<String, (CollKind, Option<u32>)>,
+    coll: &'a HashMap<String, CollInfo>,
     class: &'a HashMap<String, u32>,
     /// Package/module-scope type aliases: alias name -> class id.
     type_aliases: &'a HashMap<String, u32>,
@@ -1185,12 +1267,34 @@ impl<'a> CodeGen<'a> {
         self.local_colls.clear();
         self.local_enums.clear();
         self.class_ctx = class_ctx;
+        let mut arg_modes = Vec::with_capacity(f.params.len() + usize::from(class_ctx.is_some()));
         if class_ctx.is_some() {
             self.this_reg = pb.new_reg(); // register 0 = this
+            arg_modes.push(ArgMode::Input);
         }
         for p in &f.params {
             let reg = pb.new_reg();
+            arg_modes.push(arg_mode(p.dir));
             self.locals.insert(p.name.clone(), (reg, p.width));
+            if let Some(kind) = p.coll {
+                let elem_class = p
+                    .class_name
+                    .as_deref()
+                    .and_then(|name| self.resolve_class(name));
+                let key_class = p
+                    .key_class_name
+                    .as_deref()
+                    .and_then(|name| self.resolve_class(name));
+                self.local_colls.insert(
+                    p.name.clone(),
+                    CollInfo {
+                        kind,
+                        elem_class,
+                        key_class,
+                    },
+                );
+                continue;
+            }
             if let Some(cn) = &p.class_name {
                 if let Some(cid) = self.resolve_class(cn) {
                     self.local_classes.insert(p.name.clone(), cid);
@@ -1199,6 +1303,7 @@ impl<'a> CodeGen<'a> {
                 }
             }
         }
+        pb.set_arg_modes(&arg_modes);
         let ret_width = f.ret_width.max(1);
         let ret_reg = pb.new_reg();
         self.locals.insert(f.name.clone(), (ret_reg, ret_width));
@@ -1277,7 +1382,18 @@ impl<'a> CodeGen<'a> {
                         .class_name
                         .as_deref()
                         .and_then(|cn| self.resolve_class(cn));
-                    self.local_colls.insert(v.name.clone(), (kind, elem));
+                    let key_class = v
+                        .key_class_name
+                        .as_deref()
+                        .and_then(|cn| self.resolve_class(cn));
+                    self.local_colls.insert(
+                        v.name.clone(),
+                        CollInfo {
+                            kind,
+                            elem_class: elem,
+                            key_class,
+                        },
+                    );
                     match kind {
                         CollKind::Assoc => pb.emit(Inst::NewAssoc { dst: reg }),
                         CollKind::Queue => pb.emit(Inst::NewQueue { dst: reg }),
@@ -1406,6 +1522,61 @@ impl<'a> CodeGen<'a> {
                         pb.bind(end_lbl);
                     }
                     None => pb.bind(else_lbl),
+                }
+            }
+            Stmt::Foreach {
+                collection,
+                index,
+                body,
+            } => {
+                let info = self
+                    .coll_of_receiver(collection)
+                    .unwrap_or_else(|| panic!("foreach receiver is not a collection"));
+                let base = self.gen_expr(collection, pb);
+                let index_reg = pb.new_reg();
+                let previous_local = self.locals.insert(index.clone(), (index_reg, 32));
+                let previous_class = match info.key_class {
+                    Some(class) => self.local_classes.insert(index.clone(), class),
+                    None => self.local_classes.remove(index),
+                };
+
+                let args = pb.arglist(&[index_reg]);
+                let has_item = pb.new_reg();
+                pb.emit(Inst::CollMethod {
+                    dst: has_item,
+                    base,
+                    op: CollOp::First,
+                    args,
+                });
+                let check = pb.new_label();
+                let done = pb.new_label();
+                pb.bind(check);
+                pb.branch_false(has_item, done);
+                self.gen_stmt(body, pb);
+                pb.emit(Inst::CollMethod {
+                    dst: has_item,
+                    base,
+                    op: CollOp::Next,
+                    args,
+                });
+                pb.jump(check);
+                pb.bind(done);
+
+                match previous_local {
+                    Some(local) => {
+                        self.locals.insert(index.clone(), local);
+                    }
+                    None => {
+                        self.locals.remove(index);
+                    }
+                }
+                match previous_class {
+                    Some(class) => {
+                        self.local_classes.insert(index.clone(), class);
+                    }
+                    None => {
+                        self.local_classes.remove(index);
+                    }
                 }
             }
             Stmt::SysCall { name, args } => self.gen_sys_call(name, args, pb),
@@ -1610,7 +1781,12 @@ impl<'a> CodeGen<'a> {
                 dst
             }
             Expr::Call { name, args } => {
-                if let Some(&fid) = self.funcs.get(name) {
+                if self.method_of_ctx(name) {
+                    // Class-scope lookup precedes compilation-unit functions:
+                    // an unqualified `f()` in a method means `this.f()` when
+                    // the class has a member named `f`.
+                    self.gen_method_on_this(name, args, pb)
+                } else if let Some(&fid) = self.funcs.get(name) {
                     let arg_regs: Vec<Reg> = args.iter().map(|a| self.gen_expr(a, pb)).collect();
                     let arglist = pb.arglist(&arg_regs);
                     let ret = pb.new_reg();
@@ -1620,9 +1796,6 @@ impl<'a> CodeGen<'a> {
                         ret,
                     });
                     ret
-                } else if self.method_of_ctx(name) {
-                    // Unqualified call of a method of the current class -> this.m().
-                    self.gen_method_on_this(name, args, pb)
                 } else {
                     panic!("call to unknown function '{name}'")
                 }
@@ -2106,7 +2279,7 @@ impl<'a> CodeGen<'a> {
 
     /// The `(kind, element class)` of the collection that `base` refers to, if
     /// `base` is a queue/array/assoc local or field.
-    fn coll_of_receiver(&self, base: &Expr) -> Option<(CollKind, Option<u32>)> {
+    fn coll_of_receiver(&self, base: &Expr) -> Option<CollInfo> {
         match base {
             Expr::Ref(name) if name == "this" => None,
             Expr::Ref(name) => self
@@ -2153,7 +2326,7 @@ impl<'a> CodeGen<'a> {
 
     /// The element class id of a collection `base` (if its elements are handles).
     fn coll_elem_class(&self, base: &Expr) -> Option<u32> {
-        self.coll_of_receiver(base).and_then(|(_, e)| e)
+        self.coll_of_receiver(base).and_then(|info| info.elem_class)
     }
 
     /// Non-panicking class resolution of a receiver (for collection lookups).
@@ -2345,6 +2518,16 @@ impl<'a> CodeGen<'a> {
         if let Some(&cid) = self.class_ids.get(name) {
             return Some(cid);
         }
+        if let Some((owner, aliases)) = name.split_once("::") {
+            let mut cid = self.resolve_class(owner)?;
+            for alias in aliases.split("::") {
+                cid = self.classes[cid as usize]
+                    .type_aliases
+                    .get(alias)
+                    .copied()?;
+            }
+            return Some(cid);
+        }
         // Package/module-scope typedef (`typedef uvm_pool#(string,int) foo;`).
         if let Some(&cid) = self.globals.type_aliases.get(name) {
             return Some(cid);
@@ -2408,7 +2591,20 @@ impl<'a> CodeGen<'a> {
         if let Some(index) = &lhs.index {
             // `base[index] = src` — element write through the shared collection
             // handle (mutates the underlying storage).
-            let base = self.gen_expr(&Expr::Ref(lhs.name.clone()), pb);
+            let base_expr = match &lhs.scope {
+                Some(scope) => Expr::StaticRef {
+                    class_name: scope.clone(),
+                    field: lhs.name.clone(),
+                },
+                None => match &lhs.receiver {
+                    Some(receiver) => Expr::Field {
+                        obj: receiver.clone(),
+                        field: lhs.name.clone(),
+                    },
+                    None => Expr::Ref(lhs.name.clone()),
+                },
+            };
+            let base = self.gen_expr(&base_expr, pb);
             let idx = self.gen_expr(index, pb);
             pb.emit(Inst::IndexSet { base, idx, src });
         } else if let Some(scope) = &lhs.scope {
@@ -2421,6 +2617,20 @@ impl<'a> CodeGen<'a> {
                 .get(&lhs.name)
                 .unwrap_or_else(|| panic!("no static field '{}' on class '{scope}'", lhs.name));
             pb.emit(Inst::StaticSet { id, src });
+        } else if let Some(receiver) = &lhs.receiver {
+            let obj = self.gen_expr(receiver, pb);
+            let cid = self.receiver_class(receiver);
+            let slot = self.classes[cid as usize]
+                .field_slot
+                .get(&lhs.name)
+                .map(|(slot, _)| *slot)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no field '{}' on class '{}'",
+                        lhs.name, self.classes[cid as usize].name
+                    )
+                });
+            pb.emit(Inst::SetField { obj, slot, src });
         } else {
             self.gen_assign(&lhs.name, src, nonblocking, pb);
         }

@@ -198,3 +198,52 @@ fn string_field_param_and_display() {
     let sim = run(src);
     assert_eq!(sim.kernel_ref().output(), ["name=alpha"]);
 }
+
+#[test]
+fn unqualified_class_method_shadows_global_function() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      function int pick();\n\
+        return 1;\n\
+      endfunction\n\
+      class Picker;\n\
+        function int pick();\n\
+          return 42;\n\
+        endfunction\n\
+        function int run();\n\
+          return pick();\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Picker p = new();\n\
+        r = p.run();\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 42);
+}
+
+#[test]
+fn virtual_output_class_handle_is_copied_to_caller() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Item;\n\
+        int value;\n\
+      endclass\n\
+      class Holder;\n\
+        Item stored;\n\
+        virtual function bit try_get(output Item value);\n\
+          value = stored;\n\
+          return 1;\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Item item = new();\n\
+        Item result;\n\
+        Holder holder = new();\n\
+        item.value = 42;\n\
+        holder.stored = item;\n\
+        if (holder.try_get(result)) r = result.value;\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 42);
+}

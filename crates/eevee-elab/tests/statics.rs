@@ -81,3 +81,43 @@ fn static_singleton_via_static_method() {
     // get() builds the singleton; two touches on the shared static `hits` -> 2.
     assert_eq!(net(&run(src), "r"), 2);
 }
+
+#[test]
+fn scoped_static_associative_array_element_write() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class registry;\n\
+        static int values[int];\n\
+        static function void put(int key, int value);\n\
+          registry::values[key] = value;\n\
+        endfunction\n\
+        static function int get(int key);\n\
+          return registry::values[key];\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        registry::put(7, 42);\n\
+        r = registry::get(7);\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 42);
+}
+
+#[test]
+fn static_call_through_class_scoped_typedef() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Registry;\n\
+        static function int create(); return 42; endfunction\n\
+      endclass\n\
+      class Product;\n\
+        typedef Registry type_id;\n\
+        function int make(); return Product::type_id::create(); endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Product product = new();\n\
+        r = product.make();\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 42);
+}

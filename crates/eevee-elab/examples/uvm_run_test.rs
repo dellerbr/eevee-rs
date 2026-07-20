@@ -39,7 +39,20 @@ class my_test extends uvm_test;
 endclass
 
 module top;
-  initial run_test("my_test");
+  // `run_test("my_test")` needs `my_test` registered with the factory by
+  // NAME, which only happens the first time `type_id::create` runs for that
+  // type (uvm_registry_common::create in uvm_registry.svh) -- `get_type()`
+  // alone does NOT register (confirmed by reading the real UVM source: the
+  // only `factory.register(...)` call site is inside `create`, not `get`).
+  // Real UVM supports constructing the test top manually instead: if
+  // `run_test()` is called with NO name and a component already exists as a
+  // child of `uvm_root` (a `parent=null` component, e.g. named
+  // "uvm_test_top"), it skips the factory lookup entirely and just runs the
+  // phases against whatever is there. Use that path here.
+  initial begin
+    my_test t = new("uvm_test_top", null);
+    run_test("");
+  end
 endmodule
 "#;
 

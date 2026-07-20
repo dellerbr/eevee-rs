@@ -140,3 +140,130 @@ fn init_values_present() {
         }
     }
 }
+
+#[test]
+fn nested_static_call_is_preserved_as_method_argument() {
+    let src = "module top;\n\
+      initial begin\n\
+        C common;\n\
+        P bld;\n\
+        bld = common.find(P::get());\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source(src).expect("verible parse");
+    let m = module(&file);
+    let ModuleItem::Initial(Stmt::Block(stmts)) = &m.items[0] else {
+        panic!("expected initial block, got {:?}", m.items[0]);
+    };
+    let Stmt::Blocking { rhs, .. } = &stmts[2] else {
+        panic!("expected blocking assignment, got {:?}", stmts[2]);
+    };
+    let Expr::MethodCall { obj, method, args } = rhs else {
+        panic!("expected common.find(P::get()), got {rhs:?}");
+    };
+    assert!(matches!(&**obj, Expr::Ref(name) if name == "common"));
+    assert_eq!(method, "find");
+    assert!(matches!(
+        args.as_slice(),
+        [Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            ..
+        }] if class_name == "P" && method == "get" && args.is_empty()
+    ));
+}
+
+#[test]
+fn class_field_preserves_collection_typedef_kind() {
+    let src = "module top;\n\
+            class Node;\n\
+                typedef bit edges_t[Node];\n\
+                edges_t predecessors;\n\
+            endclass\n\
+        endmodule\n";
+    let file = parse_source(src).expect("verible parse");
+    let m = module(&file);
+    let ModuleItem::Class(class) = &m.items[0] else {
+        panic!("expected class, got {:?}", m.items[0]);
+    };
+    let field = &class.fields[0];
+    assert_eq!(field.name, "predecessors");
+    assert_eq!(field.coll, Some(CollKind::Assoc));
+    assert_eq!(field.class_name, None);
+    assert_eq!(field.key_class_name.as_deref(), Some("Node"));
+}
+
+#[test]
+fn foreach_preserves_collection_and_index() {
+    let src = "module top;\n\
+          initial begin\n\
+            int values[int];\n\
+            foreach (values[key]) values[key] = key;\n\
+          end\n\
+        endmodule\n";
+    let file = parse_source(src).expect("verible parse");
+    let m = module(&file);
+    let ModuleItem::Initial(Stmt::Block(stmts)) = &m.items[0] else {
+        panic!("expected initial block, got {:?}", m.items[0]);
+    };
+    let Stmt::Foreach {
+        collection, index, ..
+    } = &stmts[1]
+    else {
+        panic!("expected foreach, got {:?}", stmts[1]);
+    };
+    assert!(matches!(collection, Expr::Ref(name) if name == "values"));
+    assert_eq!(index, "key");
+}
+
+#[test]
+fn class_scoped_typedef_static_call_keeps_full_scope() {
+    let src = "module top;\n\
+          initial begin\n\
+            Product product;\n\
+            product = Product::type_id::create();\n\
+          end\n\
+        endmodule\n";
+    let file = parse_source(src).expect("verible parse");
+    let m = module(&file);
+    let ModuleItem::Initial(Stmt::Block(stmts)) = &m.items[0] else {
+        panic!("expected initial block, got {:?}", m.items[0]);
+    };
+    let Stmt::Blocking { rhs, .. } = &stmts[1] else {
+        panic!("expected assignment, got {:?}", stmts[1]);
+    };
+    assert!(matches!(
+        rhs,
+        Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            ..
+        } if class_name == "Product::type_id" && method == "create" && args.is_empty()
+    ));
+}
+
+#[test]
+fn function_formal_directions_are_preserved() {
+    let src = "module top;\n\
+          function void transfer(input int source, output int result,\n\
+                                 inout int state, ref int shared);\n\
+          endfunction\n\
+        endmodule\n";
+    let file = parse_source(src).expect("verible parse");
+    let m = module(&file);
+    let ModuleItem::Func(func) = &m.items[0] else {
+        panic!("expected function, got {:?}", m.items[0]);
+    };
+    let directions: Vec<PortDir> = func.params.iter().map(|param| param.dir).collect();
+    assert_eq!(
+        directions,
+        vec![
+            PortDir::Input,
+            PortDir::Output,
+            PortDir::Inout,
+            PortDir::Ref,
+        ]
+    );
+}

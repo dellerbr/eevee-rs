@@ -43,6 +43,22 @@ pub type ClassId = u32;
 /// Index into [`Program::fork_groups`].
 pub type ForkGroupId = u32;
 
+/// Runtime passing mode for one callable argument register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgMode {
+    Input,
+    Output,
+    Inout,
+    Ref,
+}
+
+impl ArgMode {
+    #[inline]
+    pub fn copies_out(self) -> bool {
+        matches!(self, Self::Output | Self::Inout | Self::Ref)
+    }
+}
+
 /// A single IR instruction. `Copy` and small by construction.
 #[derive(Clone, Copy, Debug)]
 pub enum Inst {
@@ -271,6 +287,9 @@ pub struct Program {
     pub fork_groups: Vec<Box<[u32]>>,
     /// Number of registers (frame size).
     pub n_regs: u32,
+    /// Passing mode of each leading formal register, including an implicit
+    /// input `this` at index 0 for methods.
+    pub arg_modes: Box<[ArgMode]>,
     /// Human-readable label (debug/trace/VCD).
     pub label: String,
 }
@@ -286,6 +305,13 @@ pub struct ClassDef {
     /// Collection-typed fields `(slot, is_assoc)` — initialized to a *fresh*
     /// queue/assoc on every [`Inst::New`] so instances never share storage.
     pub coll_fields: Box<[(u32, bool)]>,
+    /// Struct-typed fields `(slot, struct_class_id)` — an unpacked
+    /// `typedef struct {...}` field (modeled as a no-method class, see
+    /// `ClassId`/`is_struct` on the elaborator side) is fully default-
+    /// constructed on every [`Inst::New`] via a *fresh* recursive
+    /// [`ClassId`] instance, rather than staying a null handle awaiting an
+    /// explicit `new()` the way a real class-typed field does.
+    pub struct_fields: Box<[(u32, ClassId)]>,
 }
 
 /// The design's shared linkage tables: every callable function/task and every
@@ -326,6 +352,7 @@ pub struct ProgramBuilder {
     forks_want_this: Vec<bool>,
     fork_groups: Vec<Box<[u32]>>,
     n_regs: u32,
+    arg_modes: Vec<ArgMode>,
     /// label id -> bound code address (`u32::MAX` while unbound).
     labels: Vec<u32>,
     /// (code index of a jump, label id it targets) to fix up at `build`.
@@ -345,6 +372,7 @@ impl ProgramBuilder {
             forks_want_this: Vec::new(),
             fork_groups: Vec::new(),
             n_regs: 0,
+            arg_modes: Vec::new(),
             labels: Vec::new(),
             patches: Vec::new(),
             name: name.into(),
@@ -356,6 +384,12 @@ impl ProgramBuilder {
         let r = self.n_regs;
         self.n_regs += 1;
         r
+    }
+
+    /// Record the passing modes of the leading argument registers.
+    pub fn set_arg_modes(&mut self, modes: &[ArgMode]) {
+        self.arg_modes.clear();
+        self.arg_modes.extend_from_slice(modes);
     }
 
     /// Intern a constant value, returning its id.
@@ -470,6 +504,7 @@ impl ProgramBuilder {
             forks_want_this: self.forks_want_this,
             fork_groups: self.fork_groups,
             n_regs: self.n_regs,
+            arg_modes: self.arg_modes.into_boxed_slice(),
             label: self.name,
         }
     }

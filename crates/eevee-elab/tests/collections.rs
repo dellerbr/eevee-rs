@@ -95,3 +95,106 @@ fn queue_indexed_write() {
     // 40 + 2 = 42
     assert_eq!(net(&run(src), "r"), 42);
 }
+
+#[test]
+fn scalar_and_indexed_object_field_writes() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Node;\n\
+        int value;\n\
+        int edges[int];\n\
+        function void update(Node other);\n\
+          other.value = 2;\n\
+          other.edges[7] = 40;\n\
+        endfunction\n\
+        function int total();\n\
+          return value + edges[7];\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Node a = new();\n\
+        Node b = new();\n\
+        a.update(b);\n\
+        r = b.total();\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 42);
+}
+
+#[test]
+fn associative_array_distinguishes_object_handle_keys() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Node;\n\
+      endclass\n\
+      initial begin\n\
+        Node first = new();\n\
+        Node second = new();\n\
+        int values[Node];\n\
+        values[first] = 1;\n\
+        values[second] = 2;\n\
+        r = values[first] + values[second];\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 3);
+}
+
+#[test]
+fn foreach_iterates_object_handle_keys() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Node;\n\
+        int value;\n\
+        function int get(); return value; endfunction\n\
+      endclass\n\
+      class Graph;\n\
+        bit edges[Node];\n\
+        function void add(Node node); edges[node] = 1; endfunction\n\
+        function int total();\n\
+          int sum;\n\
+          foreach (edges[node]) sum = sum + node.get();\n\
+          return sum;\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Node first = new();\n\
+        Node second = new();\n\
+        Graph graph = new();\n\
+        first.value = 20;\n\
+        second.value = 22;\n\
+        graph.add(first);\n\
+        graph.add(second);\n\
+        r = graph.total();\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 42);
+}
+
+#[test]
+fn foreach_iterates_collection_formal() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Item;\n\
+        int value;\n\
+      endclass\n\
+      class Summer;\n\
+        function int total(ref Item items[$]);\n\
+          int sum;\n\
+          foreach (items[index]) sum = sum + items[index].value;\n\
+          return sum;\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Item items[$];\n\
+        Item first = new();\n\
+        Item second = new();\n\
+        Summer summer = new();\n\
+        first.value = 20;\n\
+        second.value = 22;\n\
+        items.push_back(first);\n\
+        items.push_back(second);\n\
+        r = summer.total(items);\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 42);
+}

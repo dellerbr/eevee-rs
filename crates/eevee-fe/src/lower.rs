@@ -64,10 +64,14 @@ fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
             }
         }
         // `typedef enum {...}` contributes named compile-time constants;
-        // `typedef <Class>#(...) <alias>;` contributes a type alias.
+        // `typedef struct {...} Name;` contributes a synthetic no-method
+        // class (see `lower_struct_typedef`); `typedef <Class>#(...) <alias>;`
+        // contributes a type alias.
         "kTypeDeclaration" => {
             lower_enum_consts(item, out);
-            if let Some(alias) = lower_class_typedef(item) {
+            if let Some(sd) = lower_struct_typedef(item) {
+                out.push(ModuleItem::Class(sd));
+            } else if let Some(alias) = lower_class_typedef(item) {
                 out.push(ModuleItem::TypeAlias(alias));
             }
         }
@@ -248,6 +252,7 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
                 type_args: type_args.clone(),
                 is_string,
                 coll,
+                key_class_name: assoc_key_class_name(rv),
                 is_static,
                 init,
             });
@@ -314,8 +319,9 @@ fn type_ref_of_datatype(dt: &Value) -> TypeRef {
 /// fixed array (`Queue`), an associative array (`Assoc`), or a scalar (`None`).
 /// Mirrors the Python front-end's `_classify_unpacked_dim`.
 fn classify_coll(rv: &Value) -> Option<CollKind> {
-    let unpacked = find(rv, "kUnpackedDimensions")?;
-    let dims = find(unpacked, "kDeclarationDimensions")?;
+    let dims = find(rv, "kUnpackedDimensions")
+        .and_then(|unpacked| find(unpacked, "kDeclarationDimensions"))
+        .or_else(|| find(rv, "kDeclarationDimensions"))?;
     for dim in kids(dims) {
         match tag(dim) {
             "kDimensionAssociativeType" => return Some(CollKind::Assoc),
@@ -343,6 +349,19 @@ fn classify_coll(rv: &Value) -> Option<CollKind> {
         }
     }
     None
+}
+
+fn assoc_key_class_name(rv: &Value) -> Option<String> {
+    if classify_coll(rv) != Some(CollKind::Assoc) {
+        return None;
+    }
+    let dims = find(rv, "kUnpackedDimensions")
+        .and_then(|unpacked| find(unpacked, "kDeclarationDimensions"))
+        .or_else(|| find(rv, "kDeclarationDimensions"))?;
+    kids(dims)
+        .find(|dimension| tag(dimension) == "kDimensionScalar")
+        .and_then(|dimension| find_deep(dimension, "SymbolIdentifier"))
+        .map(|identifier| text(identifier).to_string())
 }
 
 /// If a `kDataType` names a class / user type (a bare identifier rather than a
@@ -496,6 +515,15 @@ fn lower_port_item(n: &Value) -> Param {
     let width = dtype.map(packed_width).unwrap_or(32);
     let class_name = dtype.and_then(class_type_name);
     let type_args = dtype.map(type_args_of).unwrap_or_default();
+    let dir = if find_deep(n, "output").is_some() {
+        PortDir::Output
+    } else if find_deep(n, "inout").is_some() {
+        PortDir::Inout
+    } else if find_deep(n, "ref").is_some() {
+        PortDir::Ref
+    } else {
+        PortDir::Input
+    };
     let name = find(inner, "kUnqualifiedId")
         .and_then(|u| find(u, "SymbolIdentifier"))
         .map(text)
@@ -503,10 +531,12 @@ fn lower_port_item(n: &Value) -> Param {
         .to_string();
     Param {
         name,
-        dir: PortDir::Input,
+        dir,
         width,
         class_name,
         type_args,
+        coll: classify_coll(inner).or_else(|| classify_coll(n)),
+        key_class_name: assoc_key_class_name(inner).or_else(|| assoc_key_class_name(n)),
     }
 }
 
@@ -531,11 +561,37 @@ fn lower_class(n: &Value) -> ClassDecl {
     let mut methods = Vec::new();
     let mut constructor = None;
     let mut type_aliases = Vec::new();
+    let mut collection_aliases: Vec<(String, CollKind, Option<TypeRef>, Option<TypeRef>)> =
+        Vec::new();
     let mut consts: Vec<(String, LogicVec)> = Vec::new();
     if let Some(items) = find(n, "kClassItems") {
         for item in kids(items) {
             match tag(item) {
-                "kDataDeclaration" => fields.extend(lower_data_decl(item)),
+                "kDataDeclaration" => {
+                    let mut declarations = lower_data_decl(item);
+                    for declaration in &mut declarations {
+                        if declaration.coll.is_some() {
+                            continue;
+                        }
+                        let Some(alias_name) = declaration.class_name.as_deref() else {
+                            continue;
+                        };
+                        let Some((_, kind, element, key)) = collection_aliases
+                            .iter()
+                            .find(|(name, _, _, _)| name == alias_name)
+                        else {
+                            continue;
+                        };
+                        declaration.coll = Some(*kind);
+                        declaration.class_name = element.as_ref().map(|ty| ty.name.clone());
+                        declaration.type_args = element
+                            .as_ref()
+                            .map(|ty| ty.args.clone())
+                            .unwrap_or_default();
+                        declaration.key_class_name = key.as_ref().map(|ty| ty.name.clone());
+                    }
+                    fields.extend(declarations);
+                }
                 "kFunctionDeclaration" | "kTaskDeclaration" => methods.push(lower_function(item)),
                 "kClassConstructor" => constructor = Some(lower_constructor(item)),
                 // `pure virtual` / `extern` prototypes: capture as (virtual)
@@ -547,6 +603,9 @@ fn lower_class(n: &Value) -> ClassDecl {
                     }
                 }
                 "kTypeDeclaration" => {
+                    if let Some(alias) = lower_collection_typedef(item) {
+                        collection_aliases.push(alias);
+                    }
                     if let Some(alias) = lower_class_typedef(item) {
                         type_aliases.push(alias);
                     }
@@ -569,6 +628,7 @@ fn lower_class(n: &Value) -> ClassDecl {
         params,
         base_args,
         consts,
+        is_struct: false,
     }
 }
 
@@ -642,6 +702,87 @@ fn lower_class_typedef(n: &Value) -> Option<TypeAlias> {
             name,
             args: type_args_of(dtype),
         },
+    })
+}
+
+/// A class-local collection typedef such as
+/// `typedef bit edges_t[uvm_phase]`. Fields declared with the alias must keep
+/// the collection kind; otherwise `edges_t m_predecessors` is mistaken for a
+/// class handle named `edges_t` during elaboration.
+fn lower_collection_typedef(
+    n: &Value,
+) -> Option<(String, CollKind, Option<TypeRef>, Option<TypeRef>)> {
+    let alias = find(n, "SymbolIdentifier").map(text)?.to_string();
+    let kind = classify_coll(n)?;
+    let dtype = find(n, "kDataType")?;
+    let element = class_type_name(dtype).map(|name| TypeRef {
+        name,
+        args: type_args_of(dtype),
+    });
+    let key = assoc_key_class_name(n).map(TypeRef::simple);
+    Some((alias, kind, element, key))
+}
+
+/// `typedef struct {members...} Name;` -> a synthetic no-method, no-
+/// constructor [`ClassDecl`] (`is_struct: true`). Unpacked struct instances
+/// are modeled as ordinary objects reusing the class field/`GetField`
+/// machinery (see `ClassInfo`/`ClassDef::struct_fields` in eevee-elab/
+/// eevee-ir) — this is what lets a chained read like `lindex.ovrd.m_type`
+/// (a struct-typed class field, itself holding a class-handle member)
+/// resolve through the *existing* `receiver_class`/`field_class` chain
+/// lookup with zero changes to expression codegen.
+/// CST: `kTypeDeclaration > [typedef, kDataType > kDataTypePrimitive >
+/// kStructType > [struct, kBraceGroup > { kStructUnionMemberList kStructUnion
+/// Member* } ], kPackedDimensions, SymbolIdentifier(name), ;]`. Each member is
+/// `kStructUnionMember > kDataTypeImplicitIdDimensions > [kDataType,
+/// SymbolIdentifier(member name), kUnpackedDimensions]` (the member name is a
+/// *direct* child here, unlike a port item's `kUnqualifiedId`-wrapped name).
+fn lower_struct_typedef(n: &Value) -> Option<ClassDecl> {
+    let dtype = find(n, "kDataType")?;
+    let prim = find(dtype, "kDataTypePrimitive")?;
+    let struct_ty = find(prim, "kStructType")?;
+    let name = find(n, "SymbolIdentifier").map(text)?.to_string();
+    let members = find(struct_ty, "kBraceGroup").and_then(|b| find(b, "kStructUnionMemberList"))?;
+    let mut fields = Vec::new();
+    for m in kids(members) {
+        if tag(m) != "kStructUnionMember" {
+            continue;
+        }
+        let Some(inner) = find(m, "kDataTypeImplicitIdDimensions") else {
+            continue;
+        };
+        let mdtype = find(inner, "kDataType");
+        let mname = find(inner, "SymbolIdentifier")
+            .map(text)
+            .unwrap_or_default()
+            .to_string();
+        if mname.is_empty() {
+            continue;
+        }
+        fields.push(VarDecl {
+            name: mname,
+            width: mdtype.map(packed_width).unwrap_or(1),
+            signed: false,
+            class_name: mdtype.and_then(class_type_name),
+            type_args: mdtype.map(type_args_of).unwrap_or_default(),
+            is_string: mdtype.map(is_string_type).unwrap_or(false),
+            coll: None,
+            key_class_name: None,
+            is_static: false,
+            init: None,
+        });
+    }
+    Some(ClassDecl {
+        name,
+        base: None,
+        fields,
+        methods: Vec::new(),
+        constructor: None,
+        type_aliases: Vec::new(),
+        params: Vec::new(),
+        base_args: Vec::new(),
+        consts: Vec::new(),
+        is_struct: true,
     })
 }
 
@@ -738,6 +879,27 @@ fn lower_stmt(n: &Value) -> Stmt {
             }
         }
         "kConditionalStatement" => lower_if(n),
+        "kForeachLoopStatement" => {
+            let chain = find(n, "kReference")
+                .map(lower_reference_chain)
+                .unwrap_or_else(|| Expr::Literal(LogicVec::zero(32)));
+            let (collection, index) = match chain {
+                Expr::Index { base, index } => {
+                    let name = match *index {
+                        Expr::Ref(name) => name,
+                        _ => String::new(),
+                    };
+                    (*base, name)
+                }
+                other => (other, String::new()),
+            };
+            let body = kids(n).last().map(lower_stmt).unwrap_or(Stmt::Null);
+            Stmt::Foreach {
+                collection,
+                index,
+                body: Box::new(body),
+            }
+        }
         "kSystemTFCall" => lower_sys_call(n),
         "kJumpStatement" => {
             if kids(n).next().map(tag) == Some("return") {
@@ -778,27 +940,68 @@ fn lower_stmt(n: &Value) -> Stmt {
 
 fn lower_lvalue(n: &Value) -> Lvalue {
     let lp = find(n, "kLPValue");
-    // A scoped target `Class::field = ...` (e.g. a static field write).
-    if let Some(segs) = lp.and_then(qualified_segments) {
-        return Lvalue {
-            scope: Some(segs[0].clone()),
-            name: segs[segs.len() - 1].clone(),
-            index: None,
-        };
-    }
-    let name = lp
-        .and_then(|lp| find_deep(lp, "SymbolIdentifier"))
-        .map(text)
-        .unwrap_or_default()
-        .to_string();
-    // `name[index] = ...` — an element assignment.
     let index = lp
         .and_then(|lp| find_deep(lp, "kDimensionScalar"))
         .and_then(|dim| find(dim, "kExpressionList"))
         .and_then(|el| kids(el).find(|c| tag(c) == "kExpression"))
         .map(lower_expr);
+    // A scoped target `Class::field = ...` (e.g. a static field write).
+    if let Some(segs) = lp.and_then(qualified_segments) {
+        return Lvalue {
+            scope: Some(segs[0].clone()),
+            name: segs[segs.len() - 1].clone(),
+            receiver: None,
+            index,
+        };
+    }
+    if let Some(reference) = lp.and_then(|value| find(value, "kReference")) {
+        match lower_reference_chain(reference) {
+            Expr::Index { base, index } => match *base {
+                Expr::Field { obj, field } => {
+                    return Lvalue {
+                        name: field,
+                        receiver: Some(obj),
+                        index: Some(*index),
+                        scope: None,
+                    };
+                }
+                Expr::Ref(name) => {
+                    return Lvalue {
+                        name,
+                        receiver: None,
+                        index: Some(*index),
+                        scope: None,
+                    };
+                }
+                _ => {}
+            },
+            Expr::Field { obj, field } => {
+                return Lvalue {
+                    name: field,
+                    receiver: Some(obj),
+                    index: None,
+                    scope: None,
+                };
+            }
+            Expr::Ref(name) => {
+                return Lvalue {
+                    name,
+                    receiver: None,
+                    index: None,
+                    scope: None,
+                };
+            }
+            _ => {}
+        }
+    }
+    let name = lp
+        .and_then(|value| find_deep(value, "SymbolIdentifier"))
+        .map(text)
+        .unwrap_or_default()
+        .to_string();
     Lvalue {
         name,
+        receiver: None,
         index,
         scope: None,
     }
@@ -817,12 +1020,23 @@ fn lower_rhs(n: &Value) -> Expr {
 
 /// Read the current value of an l-value (a plain ref or an indexed element).
 fn lvalue_read(lhs: &Lvalue) -> Expr {
+    let base = match (&lhs.scope, &lhs.receiver) {
+        (Some(scope), _) => Expr::StaticRef {
+            class_name: scope.clone(),
+            field: lhs.name.clone(),
+        },
+        (None, Some(receiver)) => Expr::Field {
+            obj: receiver.clone(),
+            field: lhs.name.clone(),
+        },
+        (None, None) => Expr::Ref(lhs.name.clone()),
+    };
     match &lhs.index {
         Some(idx) => Expr::Index {
-            base: Box::new(Expr::Ref(lhs.name.clone())),
+            base: Box::new(base),
             index: Box::new(idx.clone()),
         },
-        None => Expr::Ref(lhs.name.clone()),
+        None => base,
     }
 }
 
@@ -1045,12 +1259,28 @@ fn ref_or_zero(n: &Value) -> Expr {
 /// The last `::` segment of a scope-resolution reference (`kQualifiedId`),
 /// `#(...)` params stripped, or `None` if there is no qualified id.
 fn last_qualified_segment(n: &Value) -> Option<String> {
-    let qid = find_deep(n, "kQualifiedId")?;
+    let qid = own_qualified_id(n)?;
     kids(qid)
         .filter(|c| tag(c) == "kUnqualifiedId")
         .filter_map(|u| find(u, "SymbolIdentifier"))
         .map(|id| text(id).to_string())
         .last()
+}
+
+/// The `kQualifiedId` belonging to this reference's own local root. This must
+/// not use `find_deep`: a method argument may itself contain `P::get()`, and a
+/// recursive search from the outer `common.find(P::get())` reference would
+/// otherwise steal that nested qualified id and mis-lower the whole call as
+/// `P::get`.
+fn own_qualified_id(n: &Value) -> Option<&Value> {
+    match tag(n) {
+        "kQualifiedId" => Some(n),
+        "kLocalRoot" => find(n, "kQualifiedId"),
+        "kReference" => find(n, "kLocalRoot").and_then(|root| find(root, "kQualifiedId")),
+        _ => find(n, "kQualifiedId")
+            .or_else(|| find(n, "kLocalRoot").and_then(own_qualified_id))
+            .or_else(|| find(n, "kReference").and_then(own_qualified_id)),
+    }
 }
 
 /// Distinguish a function call, a method call (`obj.m(args)`), a field access
@@ -1073,12 +1303,14 @@ fn lower_call_or_ref(n: &Value) -> Expr {
         // Scope resolution `Class::member` (kQualifiedId) — static call /
         // scoped constant. Segment identifiers strip any `#(...)` params.
         if let Some(segs) = qualified_segments(reference) {
-            if segs.len() == 2 {
+            if segs.len() >= 2 {
+                let member = segs.last().cloned().unwrap_or_default();
+                let scope = segs[..segs.len() - 1].join("::");
                 return match paren {
                     Some(p) => Expr::StaticCall {
-                        class_name: segs[0].clone(),
+                        class_name: scope,
                         class_args: first_segment_args(reference),
-                        method: segs[1].clone(),
+                        method: member,
                         args: lower_arg_list(p),
                     },
                     // Static field read `Class::field` — keep the class name so
@@ -1086,14 +1318,15 @@ fn lower_call_or_ref(n: &Value) -> Expr {
                     // Falls back to Expr::Ref for package-scope enum constants
                     // like `uvm_pkg::UVM_LOW` (the class lookup will fail, and
                     // the const table will catch it instead).
-                    None => Expr::StaticRef {
-                        class_name: segs[0].clone(),
-                        field: segs[1].clone(),
-                    },
+                    None => lower_reference_dimensions(
+                        reference,
+                        Expr::StaticRef {
+                            class_name: scope,
+                            field: member,
+                        },
+                    ),
                 };
             }
-            // 3+ segments (e.g. `T::type_id::create`) need the factory; fall
-            // through to the chain path (which stubs for now).
         }
 
         // Build the left-leaning Ref / Index / Field chain.
@@ -1124,7 +1357,7 @@ fn lower_call_or_ref(n: &Value) -> Expr {
 /// The `#(...)` arguments of the first segment of a scope-resolution reference
 /// (the class in `Class#(args)::method`).
 fn first_segment_args(reference: &Value) -> Vec<TypeRef> {
-    find_deep(reference, "kQualifiedId")
+    own_qualified_id(reference)
         .and_then(|qid| kids(qid).find(|c| tag(c) == "kUnqualifiedId"))
         .and_then(|u| find(u, "kActualParameterList"))
         .map(lower_actual_args)
@@ -1135,7 +1368,7 @@ fn first_segment_args(reference: &Value) -> Vec<TypeRef> {
 /// reference (`kQualifiedId`), stripping any `#(...)` type parameters. Returns
 /// `None` if the reference is not a qualified id.
 fn qualified_segments(reference: &Value) -> Option<Vec<String>> {
-    let qid = find_deep(reference, "kQualifiedId")?;
+    let qid = own_qualified_id(reference)?;
     let mut segs = Vec::new();
     for c in kids(qid) {
         if tag(c) == "kUnqualifiedId" {
@@ -1167,13 +1400,45 @@ fn lower_reference_chain(reference: &Value) -> Expr {
             }
             "kHierarchyExtension" => {
                 if let Some(b) = result.take() {
-                    let member = find_deep(c, "SymbolIdentifier")
+                    let member = find(c, "kUnqualifiedId")
+                        .and_then(|u| find(u, "SymbolIdentifier"))
                         .map(text)
                         .unwrap_or_default()
                         .to_string();
-                    result = Some(Expr::Field {
+                    result = match find(c, "kParenGroup") {
+                        Some(paren) => Some(Expr::MethodCall {
+                            obj: Box::new(b),
+                            method: member,
+                            args: lower_arg_list(paren),
+                        }),
+                        None => Some(Expr::Field {
+                            obj: Box::new(b),
+                            field: member,
+                        }),
+                    };
+                }
+            }
+            // Verible gives names that overlap built-in array methods (e.g.
+            // `find`) a distinct extension node even when the receiver is a
+            // class handle: `common.find(P::get())` becomes
+            // `kReference[kLocalRoot(common), kBuiltinArrayMethodCallExtension
+            // [., find, kParenGroup(args)]]`. The parentheses live inside the
+            // extension, so there is no enclosing `kReferenceCallBase` for
+            // `lower_call_or_ref` to recognize.
+            "kBuiltinArrayMethodCallExtension" => {
+                if let Some(b) = result.take() {
+                    let method = kids(c)
+                        .find(|child| !matches!(tag(child), "." | "kParenGroup"))
+                        .map(leaf_op)
+                        .unwrap_or_default()
+                        .to_string();
+                    let args = find(c, "kParenGroup")
+                        .map(lower_arg_list)
+                        .unwrap_or_default();
+                    result = Some(Expr::MethodCall {
                         obj: Box::new(b),
-                        field: member,
+                        method,
+                        args,
                     });
                 }
             }
@@ -1181,6 +1446,18 @@ fn lower_reference_chain(reference: &Value) -> Expr {
         }
     }
     result.unwrap_or_else(|| Expr::Literal(LogicVec::zero(32)))
+}
+
+fn lower_reference_dimensions(reference: &Value, mut base: Expr) -> Expr {
+    for child in kids(reference) {
+        if matches!(
+            tag(child),
+            "kDimensionScalar" | "kDimensionRange" | "kDimensionSlice"
+        ) {
+            base = lower_dimension_subscript(base, child);
+        }
+    }
+    base
 }
 
 /// The base identifier of a reference: `super`, `this`, a scoped `pkg::Class`

@@ -231,6 +231,7 @@ impl Mono {
             params: Vec::new(),
             base_args: Vec::new(),
             consts: tmpl.consts.clone(),
+            is_struct: tmpl.is_struct,
         }
     }
 
@@ -242,6 +243,9 @@ impl Mono {
             });
             v.class_name = Some(resolved);
             v.type_args = Vec::new();
+        }
+        if let Some(key_class) = &v.key_class_name {
+            v.key_class_name = Some(self.resolve(&TypeRef::simple(key_class.clone())));
         }
     }
 
@@ -257,6 +261,9 @@ impl Mono {
                 });
                 p.class_name = Some(resolved);
                 p.type_args = Vec::new();
+            }
+            if let Some(key_class) = &p.key_class_name {
+                p.key_class_name = Some(self.resolve(&TypeRef::simple(key_class.clone())));
             }
         }
         let mut body = std::mem::replace(&mut f.body, Stmt::Null);
@@ -289,6 +296,12 @@ impl Mono {
                 if let Some(e) = else_branch {
                     self.subst_stmt(e);
                 }
+            }
+            Stmt::Foreach {
+                collection, body, ..
+            } => {
+                self.subst_expr(collection);
+                self.subst_stmt(body);
             }
             Stmt::Expr(e) => self.subst_expr(e),
             Stmt::Return(Some(e)) => self.subst_expr(e),
@@ -430,5 +443,6 @@ fn stub(name: &str) -> ClassDecl {
         params: Vec::new(),
         base_args: Vec::new(),
         consts: Vec::new(),
+        is_struct: false,
     }
 }

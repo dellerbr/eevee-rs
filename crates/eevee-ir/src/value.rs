@@ -20,7 +20,9 @@
 //! local to this module + the interpreter; they do not reshape the IR.
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use eevee_core::LogicVec;
@@ -38,10 +40,68 @@ pub struct ObjData {
 /// Key of an associative array. SV assoc arrays are keyed by integers or
 /// strings; we keep them ordered (`BTreeMap`) so `first`/`next`/`last`/`prev`
 /// iterate deterministically.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug)]
 pub enum AssocKey {
     Int(i64),
     Str(Rc<str>),
+    Obj(Rc<RefCell<ObjData>>),
+    Null,
+}
+
+impl AssocKey {
+    fn rank(&self) -> u8 {
+        match self {
+            AssocKey::Int(_) => 0,
+            AssocKey::Str(_) => 1,
+            AssocKey::Obj(_) => 2,
+            AssocKey::Null => 3,
+        }
+    }
+}
+
+impl PartialEq for AssocKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (AssocKey::Int(left), AssocKey::Int(right)) => left == right,
+            (AssocKey::Str(left), AssocKey::Str(right)) => left == right,
+            (AssocKey::Obj(left), AssocKey::Obj(right)) => Rc::ptr_eq(left, right),
+            (AssocKey::Null, AssocKey::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AssocKey {}
+
+impl PartialOrd for AssocKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AssocKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (AssocKey::Int(left), AssocKey::Int(right)) => left.cmp(right),
+            (AssocKey::Str(left), AssocKey::Str(right)) => left.cmp(right),
+            (AssocKey::Obj(left), AssocKey::Obj(right)) => {
+                (Rc::as_ptr(left) as usize).cmp(&(Rc::as_ptr(right) as usize))
+            }
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+impl Hash for AssocKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.rank().hash(state);
+        match self {
+            AssocKey::Int(value) => value.hash(state),
+            AssocKey::Str(value) => value.hash(state),
+            AssocKey::Obj(value) => (Rc::as_ptr(value) as usize).hash(state),
+            AssocKey::Null => {}
+        }
+    }
 }
 
 /// A value living in an interpreter register or a design slot.
