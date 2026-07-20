@@ -1,65 +1,231 @@
 # eevee-rs
 
-A from-scratch **Rust** SystemVerilog simulator, ported from the Python `eevee`
-reference (`../eevee`). Goal: a production-usable simulator that
+A native Rust SystemVerilog simulator targeting IEEE 1800 semantics and
+unmodified Accellera UVM execution.
 
-1. executes the **actual Accellera UVM 1800.2-2020 SystemVerilog source**
-   unmodified (no UVM re-implementation, no shims),
-2. simulates real synthesizable RTL at signal level (4-state, IEEE 1800-2017
-   stratified event queue),
-3. is fast enough for the OpenTitan DV suite (millions of cycles per test).
+This is the active successor to the archived Python `eevee` executable
+specification. The Rust implementation replaces coroutine-per-process
+scheduling, polling waits, and runtime name lookup with an event-driven kernel
+and register bytecode interpreter.
 
-The Python `eevee` is a correct-but-slow **executable specification**. This port
-keeps the semantics it proved out and replaces the three things that capped its
-speed: coroutine-per-process scheduling, busy-poll `wait`, and per-access name
-resolution.
+> **Development status:** pre-alpha, not a signoff simulator. The complete
+> source-to-execution pipeline works, real UVM source preprocesses and
+> elaborates, real UVM reporting runs, and the real registry/factory path now
+> creates objects. Full IEEE 1800 compliance and a complete UVM `run_test`
+> remain in progress.
 
-## Status
+## Non-Negotiable Rule
 
-| Phase | Scope | State |
-| --- | --- | --- |
-| P0 | Skeleton + CI, 4-state bitvec, fs time, stratified regions, front-end decision | in progress |
-| P1 | Event-driven scheduler MVP (sensitivity lists, NBA, `always_ff`, `#delay`, event-woken `wait`) + counter benchmark | done (~9.5 M cyc/s) |
-| P2 | Procedural interpreter + class runtime | in progress (full pipeline **SV source → run** landed via register IR; classes next) |
-| P3 | Load & run real UVM library (no-shims proof) | — |
-| P4 | Randomization + constraints (Z3), SVA, coverage | — |
-| P5 | DPI-C real FFI + backdoor (`uvm_hdl_*`, force/release) | — |
-| P6 | OpenTitan vertical slice (RAL frontdoor/backdoor) | — |
-| P7 | Scale-up + bytecode/IR perf (JIT via Cranelift behind the backend seam) | — |
+**No UVM shims.** The simulator executes the actual SystemVerilog methods from
+the vendored UVM library. It must not detect UVM class or method names and
+replace their behavior with Rust implementations.
 
-## Layout
+Native Rust implementations are allowed only for IEEE 1800 language/runtime
+primitives such as process scheduling, events, mailboxes, semaphores, queues,
+randomization, system tasks, and signal updates. When UVM exposes a missing
+simulator behavior, the fix belongs in the language front end, elaborator, IR,
+interpreter, or scheduler.
 
-``` layout
-crates/
-  eevee-core/   4-state LogicVec, SimTime (fs), Timescale, Region (stratified queue)
-  eevee-sched/  event-driven scheduler: nets + sensitivity lists, processes, NBA
-  eevee-ir/     register bytecode IR + interpreter (ExecBackend seam for a future JIT)
-  eevee-ast/    the SystemVerilog AST schema
-  eevee-fe/     front-end: Verible subprocess (JSON CST) + CST→AST lowering
-  eevee-elab/   elaborator: AST → nets + IR-compiled processes (a runnable Sim)
-docs/
-  frontend-decision.md   slang vs Verible — Verible (subprocess+JSON) chosen for v0
-  perf-log.md            cycles/sec trend, recorded every phase
+## Current Status
+
+Validated on July 20, 2026:
+
+- 101 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+  classes, parameterization, collections, statics, and concurrency.
+- `cargo fmt --all -- --check` passes.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  passes.
+- The event-driven hand-written counter kernel sustains roughly 9.5 million
+  cycles/second; the bytecode interpreter baseline is roughly 5.5 million
+  cycles/second on the development workstation.
+- The real UVM library lays out 676 classes and compiles 7,206 of 7,475
+  callables (96.4%). Unsupported callables are isolated as resilient compile
+  stubs so the rest of the library remains executable while language coverage
+  grows.
+- The real UVM report server executes end to end and emits native UVM report
+  lines.
+- Real `type_id::create` crosses the unmodified
+  `uvm_object_registry -> uvm_default_factory -> override lookup ->
+  create_object_by_type` path and constructs the requested object.
+- The current `run_test` frontier is a zero-time loop while constructing the
+  UVM common phase domain (`uvm_phase::add`); it has not yet reached the user
+  test's `run_phase`.
+
+## Implemented Language Surface
+
+The current implementation includes:
+
+- Four-state `LogicVec` values with narrow and wide representations,
+  arithmetic, shifts, comparisons, reductions, slicing, concatenation, and
+  X/Z propagation.
+- Femtosecond simulation time and an event-driven Active/Inactive/NBA kernel.
+- Blocking/nonblocking assignments, delays, edge/event waits, and event-driven
+  `wait(condition)` read sets.
+- Register bytecode with suspendable process frames and recursive function/task
+  calls.
+- Verible JSON-CST front end and recursive SystemVerilog preprocessing
+  (`include`, macros, conditionals, stringize/paste, `__FILE__`, `__LINE__`).
+- Packages, compilation-unit declarations, functions, tasks, extern method
+  bodies, and class-scoped static calls.
+- Classes, constructors, inheritance, virtual dispatch, `super`, strings,
+  static fields, and shared object handles.
+- Parameterized-class monomorphization, type/value parameters, typedef
+  substitution, and independent specialized static state.
+- Queues, dynamic arrays, associative arrays, object-handle keys, collection
+  methods, indexed access, and `foreach`.
+- Unpacked struct typedefs needed by UVM factory override records.
+- Formal `input`, `output`, `inout`, and `ref` directions with copy-back through
+  normal and virtual calls.
+- `fork/join`, `join_any`, and `join_none` as real scheduler processes.
+- UVM-oriented report formatting primitives including enum names, string
+  concatenation, `$sformatf`, `$swrite`, `$cast`, and simulation time.
+
+## Architecture
+
+```text
+SystemVerilog source
+        |
+        v
+eevee-fe       preprocessing + Verible CST -> typed AST
+        |
+        v
+eevee-elab     global declarations, class specialization, names -> IDs,
+               procedural AST -> register bytecode
+        |
+        v
+eevee-ir       register programs + resumable interpreter + future JIT seam
+        |
+        v
+eevee-sched    nets, sensitivity lists, process table, time wheel, NBA
+        |
+        v
+eevee-core     four-state values, time, timescale, event regions
 ```
 
-The full pipeline is wired end to end: `eevee_fe::parse_source(sv)` →
-`eevee_elab::elaborate(&ast, &backend)` → a `Sim` you can `run`. See
-`crates/eevee-elab/tests/end_to_end.rs` for the counter running from `.sv` text.
+| Crate | Responsibility |
+| --- | --- |
+| `eevee-core` | Four-state values, time, timescale, event regions |
+| `eevee-sched` | Event-driven kernel, nets, waits, process scheduling |
+| `eevee-ir` | Register bytecode, runtime values, interpreter, backend seam |
+| `eevee-ast` | Typed SystemVerilog AST |
+| `eevee-fe` | Preprocessor, Verible subprocess, CST lowering |
+| `eevee-elab` | Global elaboration, specialization, bytecode generation |
 
-## Build & test
+The front end invokes Verible as a subprocess; simulation itself is a native
+Rust process. A future Cranelift backend can implement the existing
+`ExecBackend` interface for hot static RTL without changing scheduler
+semantics. Dynamic UVM remains interpreted.
+
+## Build and Validate
+
+The development machine uses the GNU Windows target because no MSVC SDK/linker
+is installed:
 
 ```powershell
-# Rust toolchain is at %USERPROFILE%\.cargo\bin (may not be on PATH)
 $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
-cd eevee-rs
-cargo test
-cargo run --release -p eevee-sched --example counter_bench   # P1 hand-coded cycles/sec
-cargo run --release -p eevee-ir    --example counter_ir_bench # P2 IR-interpreted cycles/sec
+Set-Location C:\path\to\eevee-rs
+rustup override set stable-x86_64-pc-windows-gnu
+
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-## Non-negotiable rule
+Useful probes:
 
-**No shims.** The simulator must execute real UVM SV for UVM constructs. Only
-IEEE 1800-2017 *language* builtins (`process`, `semaphore`, `mailbox`, `event`,
-`wait`, `$display`, queues, randomize, SVA, the scheduler) may be native Rust.
-See `../eevee`'s memory notes and `docs/frontend-decision.md`.
+```powershell
+cargo run --release -p eevee-sched --example counter_bench -- 10000000
+cargo run --release -p eevee-ir --example counter_ir_bench -- 10000000
+cargo run -q -p eevee-elab --example uvm_elab
+cargo run -q -p eevee-elab --example uvm_run
+cargo run -q -p eevee-elab --example uvm_run_test
+```
+
+Debugging controls:
+
+- `EEVEE_TRACE=1` prints interpreted SV calls/returns and selected state.
+- `EEVEE_DUMP_STUBS=1` lists resilient compile stubs; use a substring instead
+  of `1` to filter by qualified callable name.
+- `EEVEE_DUMP_GLOBALS=1` dumps package/global declarations; a substring
+  filters the output.
+- Runtime panics include an SV-level call stack.
+
+The repository currently vendors the Windows Verible syntax binary and the
+Accellera UVM source. Linux/macOS CI needs per-platform Verible binaries or an
+installation/download step before front-end tests can be portable.
+
+## Roadmap to IEEE 1800 Compliance
+
+The project advances by observable conformance slices: add a focused SV test,
+implement the owning language/runtime abstraction, run the full Rust suite,
+then rerun the real UVM frontier. UVM behavior is never substituted.
+
+1. **Complete UVM execution path**
+   - Make common-domain phase graph construction terminate correctly.
+   - Execute build/connect/elaboration/run/extract/check/report/final phases.
+   - Implement complete objection, event, process, mailbox, and semaphore
+     blocking semantics.
+   - Run a user `uvm_test` through `run_phase` and final report summary.
+
+2. **Core elaboration and hierarchy**
+   - Module/interface ports, instances, parameter overrides, generate
+     if/case/for, genvar scopes, hierarchy, bind, modports, clocking blocks,
+     virtual interfaces, and robust hierarchical references.
+   - Net types, continuous assignments, strengths/delays, primitives, UDPs,
+     and scheduling across all IEEE event regions.
+
+3. **Complete type and expression semantics**
+   - Signedness and sizing/coercion rules, packed/unpacked arrays, structs,
+     unions/tagged unions, enums, casts, streaming concatenation, assignment
+     patterns, wildcard equality, inside/dist, and iterator/query methods.
+   - Automatic/static lifetime, ref aliasing, default arguments, protected/
+     local members, interfaces/virtual classes, pure virtual methods, and
+     nested classes.
+
+4. **Concurrency and runtime primitives**
+   - Full process handles/status/control, disable fork/named blocks, event
+     trigger variants, wait fork/order, semaphore/mailbox fairness, named
+     events, force/release, procedural continuous assignment, and all scheduler
+     regions including observed/reactive/postponed behavior.
+
+5. **Randomization and constraints**
+   - `rand`/`randc`, deterministic process RNG state, inline/class constraints,
+     solve-before, soft, dist, implication, foreach constraints, array sizing,
+     and a solver backend with reproducible seeds.
+
+6. **Assertions and coverage**
+   - Immediate and concurrent assertions, sampled-value functions, sequences,
+     properties, local variables, repetition, multi-clock operation, assertion
+     control, covergroups, bins, crosses, options, and coverage reporting.
+
+7. **DPI, files, waves, and tooling**
+   - ABI-correct DPI-C import/export and open arrays, VPI/backdoor APIs,
+     complete file/system tasks, VCD/FST waveforms, plusargs, diagnostics,
+     source locations, lint-quality errors, and deterministic replay.
+
+8. **Conformance and performance closure**
+   - Run chapter-organized IEEE tests, sv-tests, UVM examples, and OpenTitan
+     vertical slices with tracked pass rates.
+   - Profile before optimizing; add opcode fusion/typed slots and optional
+     Cranelift JIT only where measurements justify it.
+   - Define release gates for semantics, determinism, diagnostics, portability,
+     and performance before claiming broad IEEE 1800 compliance.
+
+## Known Limitations
+
+- This is not yet a complete IEEE 1800 implementation or a production/signoff
+  simulator.
+- The current full-UVM runtime stalls while constructing the common phase
+  domain; `run_phase` has not completed end to end.
+- Some UVM callables still use resilient compile stubs while missing language
+  features are implemented. Treat compile percentage as progress telemetry,
+  not proof of behavioral correctness.
+- Several hierarchy, interface, generate, randomization, assertion, coverage,
+  DPI, and waveform features remain incomplete or absent.
+- Forked branches currently capture `this` but do not yet provide general
+  closure capture for arbitrary parent locals.
+
+## License Notes
+
+The vendored `uvm-core/` tree retains its upstream Accellera license and notice.
+Review upstream licenses before redistributing vendored dependencies.
