@@ -3,10 +3,11 @@
 A native Rust SystemVerilog simulator targeting IEEE 1800 semantics and
 unmodified Accellera UVM execution.
 
-This is the active successor to the archived Python `eevee` executable
-specification. The Rust implementation replaces coroutine-per-process
-scheduling, polling waits, and runtime name lookup with an event-driven kernel
-and register bytecode interpreter.
+This is the active successor to the
+[archived Python `eevee` executable specification](https://github.com/intel-sandbox/Eevee).
+The Rust implementation replaces coroutine-per-process scheduling, polling
+waits, and runtime name lookup with an event-driven kernel and register
+bytecode interpreter.
 
 > **Development status:** pre-alpha, not a signoff simulator. The complete
 > source-to-execution pipeline works, real UVM source preprocesses and
