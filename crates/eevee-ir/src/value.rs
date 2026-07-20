@@ -120,12 +120,33 @@ pub enum Value {
     Queue(Rc<RefCell<Vec<Value>>>),
     /// An associative array (shared, mutable).
     Assoc(Rc<RefCell<BTreeMap<AssocKey, Value>>>),
+    /// IEEE named-event identity. Copying the value aliases the same event.
+    Event(eevee_sched::EventId),
     /// Null handle / unset slot.
     #[default]
     Null,
 }
 
 impl Value {
+    /// Copy a value across a SystemVerilog assignment boundary. Arrays are
+    /// value types, while class handles, named events, and array elements that
+    /// are class handles retain their identity.
+    pub fn assignment_copy(&self) -> Value {
+        match self {
+            Value::Queue(values) => Value::Queue(Rc::new(RefCell::new(
+                values.borrow().iter().map(Value::assignment_copy).collect(),
+            ))),
+            Value::Assoc(values) => Value::Assoc(Rc::new(RefCell::new(
+                values
+                    .borrow()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.assignment_copy()))
+                    .collect(),
+            ))),
+            value => value.clone(),
+        }
+    }
+
     /// Borrow as a [`LogicVec`]. A `Null` slot reads as numeric zero — this is
     /// the SV default for an uninitialized / missing associative-array element
     /// of an integral type (`int m[key]; ... m[absent]++`). Other non-logic
@@ -162,6 +183,14 @@ impl Value {
     #[inline]
     pub fn new_assoc() -> Value {
         Value::Assoc(Rc::new(RefCell::new(BTreeMap::new())))
+    }
+
+    /// A fresh IEEE named event.
+    #[inline]
+    pub fn new_event() -> Value {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_EVENT: AtomicU64 = AtomicU64::new(1);
+        Value::Event(NEXT_EVENT.fetch_add(1, Ordering::Relaxed))
     }
 }
 

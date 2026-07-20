@@ -4,16 +4,20 @@ A native Rust SystemVerilog simulator targeting IEEE 1800 semantics and
 unmodified Accellera UVM execution.
 
 This is the active successor to the
-[archived Python `eevee` executable specification](https://github.com/intel-sandbox/Eevee).
+[reference-only Python `eevee` executable specification](https://github.com/intel-sandbox/Eevee).
 The Rust implementation replaces coroutine-per-process scheduling, polling
 waits, and runtime name lookup with an event-driven kernel and register
 bytecode interpreter.
 
+The Python predecessor receives no new feature work. Its GitHub repository
+archive setting is managed separately and is not changed by this repository.
+
 > **Development status:** pre-alpha, not a signoff simulator. The complete
 > source-to-execution pipeline works, real UVM source preprocesses and
 > elaborates, real UVM reporting runs, and the real registry/factory path now
-> creates objects. Full IEEE 1800 compliance and a complete UVM `run_test`
-> remain in progress.
+> creates objects. The real UVM phase graph now executes a user test's
+> `run_phase` through a delayed objection lifecycle. Full IEEE 1800 compliance
+> and broader UVM workflows remain in progress.
 
 ## Non-Negotiable Rule
 
@@ -31,7 +35,7 @@ interpreter, or scheduler.
 
 Validated on July 20, 2026:
 
-- 101 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 125 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -39,8 +43,8 @@ Validated on July 20, 2026:
 - The event-driven hand-written counter kernel sustains roughly 9.5 million
   cycles/second; the bytecode interpreter baseline is roughly 5.5 million
   cycles/second on the development workstation.
-- The real UVM library lays out 676 classes and compiles 7,206 of 7,475
-  callables (96.4%). Unsupported callables are isolated as resilient compile
+- The real UVM library lays out 680 classes and compiles 7,284 of 7,535
+  callables (96.7%). Unsupported callables are isolated as resilient compile
   stubs so the rest of the library remains executable while language coverage
   grows.
 - The real UVM report server executes end to end and emits native UVM report
@@ -48,9 +52,13 @@ Validated on July 20, 2026:
 - Real `type_id::create` crosses the unmodified
   `uvm_object_registry -> uvm_default_factory -> override lookup ->
   create_object_by_type` path and constructs the requested object.
-- The current `run_test` frontier is a zero-time loop while constructing the
-  UVM common phase domain (`uvm_phase::add`); it has not yet reached the user
-  test's `run_phase`.
+- Imported DPI-C functions compile to generic host calls. A per-simulation
+  registry supplies UVM command-line iteration and tool identity; callers can
+  register additional host functions without changing the interpreter.
+- The `uvm_run_test` probe elaborates 683 classes and compiles 7,308 of 7,559
+  callables. Real UVM traversal invokes `my_test::run_phase`, reports at time
+  zero, resumes after `#10`, reports at 10,000,000 fs, drops its objection, and
+  exits normally.
 
 ## Implemented Language Surface
 
@@ -61,7 +69,9 @@ The current implementation includes:
   X/Z propagation.
 - Femtosecond simulation time and an event-driven Active/Inactive/NBA kernel.
 - Blocking/nonblocking assignments, delays, edge/event waits, and event-driven
-  `wait(condition)` read sets.
+  `wait(condition)` read sets, including procedural NBA expression events.
+- Packed bit/part selects, numeric concatenation, `do...while`, `break`, and
+  `continue` control flow.
 - Register bytecode with suspendable process frames and recursive function/task
   calls.
 - Verible JSON-CST front end and recursive SystemVerilog preprocessing
@@ -69,7 +79,8 @@ The current implementation includes:
 - Packages, compilation-unit declarations, functions, tasks, extern method
   bodies, and class-scoped static calls.
 - Classes, constructors, inheritance, virtual dispatch, `super`, strings,
-  static fields, and shared object handles.
+  static fields, constant property initializers, inherited virtual overrides,
+  and shared object handles.
 - Parameterized-class monomorphization, type/value parameters, typedef
   substitution, and independent specialized static state.
 - Queues, dynamic arrays, associative arrays, object-handle keys, collection
@@ -78,6 +89,8 @@ The current implementation includes:
 - Formal `input`, `output`, `inout`, and `ref` directions with copy-back through
   normal and virtual calls.
 - `fork/join`, `join_any`, and `join_none` as real scheduler processes.
+- Imported DPI-C callables with injectable, per-simulation host bindings and
+  `input`/`output`/`inout` value transfer.
 - UVM-oriented report formatting primitives including enum names, string
   concatenation, `$sformatf`, `$swrite`, `$cast`, and simulation time.
 
@@ -162,11 +175,12 @@ implement the owning language/runtime abstraction, run the full Rust suite,
 then rerun the real UVM frontier. UVM behavior is never substituted.
 
 1. **Complete UVM execution path**
-   - Make common-domain phase graph construction terminate correctly.
-   - Execute build/connect/elaboration/run/extract/check/report/final phases.
-   - Implement complete objection, event, process, mailbox, and semaphore
-     blocking semantics.
-   - Run a user `uvm_test` through `run_phase` and final report summary.
+   - Support named `run_test("my_test")`, `+UVM_TESTNAME`, and normal static
+     registry discovery without manually constructing `uvm_test_top`.
+   - Complete report-summary, phase-worker teardown, process handle/status,
+     mailbox, semaphore, and remaining objection/event edge semantics.
+   - Run representative UVM factory, TLM, sequence, config-db, and callback
+     examples through unmodified source.
 
 2. **Core elaboration and hierarchy**
    - Module/interface ports, instances, parameter overrides, generate
@@ -200,7 +214,8 @@ then rerun the real UVM frontier. UVM behavior is never substituted.
      control, covergroups, bins, crosses, options, and coverage reporting.
 
 7. **DPI, files, waves, and tooling**
-   - ABI-correct DPI-C import/export and open arrays, VPI/backdoor APIs,
+   - ABI-correct native-library DPI-C import/export and open arrays,
+     UVM regex/polling/HDL backdoor bindings, VPI/backdoor APIs,
      complete file/system tasks, VCD/FST waveforms, plusargs, diagnostics,
      source locations, lint-quality errors, and deterministic replay.
 
@@ -216,15 +231,19 @@ then rerun the real UVM frontier. UVM behavior is never substituted.
 
 - This is not yet a complete IEEE 1800 implementation or a production/signoff
   simulator.
-- The current full-UVM runtime stalls while constructing the common phase
-  domain; `run_phase` has not completed end to end.
+- The passing phase probe constructs `uvm_test_top` directly and calls
+  `run_test("")`; named test selection and plusarg-driven factory registration
+  are not yet complete.
 - Some UVM callables still use resilient compile stubs while missing language
   features are implemented. Treat compile percentage as progress telemetry,
   not proof of behavioral correctness.
+- Default DPI bindings currently cover UVM argv iteration and tool identity.
+  UVM regex, polling, and HDL backdoor imports remain unbound unless supplied
+  through the host registry.
+- Nonconstant class property initializer execution and full process-handle
+  lifecycle semantics remain incomplete.
 - Several hierarchy, interface, generate, randomization, assertion, coverage,
   DPI, and waveform features remain incomplete or absent.
-- Forked branches currently capture `this` but do not yet provide general
-  closure capture for arbitrary parent locals.
 
 ## License Notes
 

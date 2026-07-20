@@ -211,6 +211,23 @@ impl Mono {
             })
             .collect();
 
+        let collection_aliases = tmpl
+            .collection_aliases
+            .iter()
+            .map(|alias| CollectionAlias {
+                alias: alias.alias.clone(),
+                kind: alias.kind,
+                element: alias
+                    .element
+                    .as_ref()
+                    .map(|ty| TypeRef::simple(self.resolve(ty))),
+                key: alias
+                    .key
+                    .as_ref()
+                    .map(|ty| TypeRef::simple(self.resolve(ty))),
+            })
+            .collect();
+
         let mut methods = tmpl.methods.clone();
         for mth in &mut methods {
             self.subst_func(mth);
@@ -228,6 +245,7 @@ impl Mono {
             methods,
             constructor,
             type_aliases,
+            collection_aliases,
             params: Vec::new(),
             base_args: Vec::new(),
             consts: tmpl.consts.clone(),
@@ -265,6 +283,9 @@ impl Mono {
             if let Some(key_class) = &p.key_class_name {
                 p.key_class_name = Some(self.resolve(&TypeRef::simple(key_class.clone())));
             }
+            if let Some(default) = &mut p.default {
+                self.subst_expr(default);
+            }
         }
         let mut body = std::mem::replace(&mut f.body, Stmt::Null);
         self.subst_stmt(&mut body);
@@ -284,7 +305,19 @@ impl Mono {
                     self.subst_expr(init);
                 }
             }
-            Stmt::Timed { body, .. } => self.subst_stmt(body),
+            Stmt::Timed { control, body } => {
+                match control {
+                    TimingControl::Delay(expr) | TimingControl::Wait(expr) => {
+                        self.subst_expr(expr);
+                    }
+                    TimingControl::Event(events) => {
+                        for event in events {
+                            self.subst_expr(&mut event.expr);
+                        }
+                    }
+                }
+                self.subst_stmt(body);
+            }
             Stmt::Blocking { rhs, .. } | Stmt::Nonblocking { rhs, .. } => self.subst_expr(rhs),
             Stmt::If {
                 cond,
@@ -297,20 +330,40 @@ impl Mono {
                     self.subst_stmt(e);
                 }
             }
+            Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
+                self.subst_expr(cond);
+                self.subst_stmt(body);
+            }
+            Stmt::Case {
+                expr,
+                items,
+                default,
+            } => {
+                self.subst_expr(expr);
+                for (values, body) in items {
+                    for value in values {
+                        self.subst_expr(value);
+                    }
+                    self.subst_stmt(body);
+                }
+                if let Some(body) = default {
+                    self.subst_stmt(body);
+                }
+            }
             Stmt::Foreach {
                 collection, body, ..
             } => {
                 self.subst_expr(collection);
                 self.subst_stmt(body);
             }
-            Stmt::Expr(e) => self.subst_expr(e),
+            Stmt::Expr(e) | Stmt::Trigger(e) => self.subst_expr(e),
             Stmt::Return(Some(e)) => self.subst_expr(e),
             Stmt::SysCall { args, .. } => {
                 for a in args {
                     self.subst_expr(a);
                 }
             }
-            Stmt::Return(None) | Stmt::Null => {}
+            Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Null => {}
             Stmt::Fork { branches, .. } => {
                 for b in branches {
                     self.subst_stmt(b);
@@ -373,6 +426,11 @@ impl Mono {
             Expr::Index { base, index } => {
                 self.subst_expr(base);
                 self.subst_expr(index);
+            }
+            Expr::PartSelect { base, left, right } => {
+                self.subst_expr(base);
+                self.subst_expr(left);
+                self.subst_expr(right);
             }
             Expr::New { args } => {
                 for a in args {
@@ -440,6 +498,7 @@ fn stub(name: &str) -> ClassDecl {
         methods: Vec::new(),
         constructor: None,
         type_aliases: Vec::new(),
+        collection_aliases: Vec::new(),
         params: Vec::new(),
         base_args: Vec::new(),
         consts: Vec::new(),

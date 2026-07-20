@@ -23,7 +23,8 @@ use std::rc::Rc;
 use eevee_ast::*;
 use eevee_core::{LogicVec, Timescale};
 use eevee_ir::{
-    ArgMode, ClassDef, CollOp, ExecBackend, Inst, Linkage, Program, ProgramBuilder, Reg, Value,
+    ArgMode, ClassDef, CollOp, DpiRegistry, ExecBackend, Inst, Label, Linkage, Program,
+    ProgramBuilder, Reg, Value,
 };
 use eevee_sched::{EdgeKind, ForkJoin, NetId, Sim};
 
@@ -40,7 +41,7 @@ pub struct ElabStats {
     pub stub_reasons: Vec<(String, usize)>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CollInfo {
     kind: CollKind,
     elem_class: Option<u32>,
@@ -64,6 +65,8 @@ struct Global {
     global_type_aliases: HashMap<String, u32>,
     /// Unambiguous class-scoped typedefs (same mapping across all classes).
     class_typedefs: HashMap<String, u32>,
+    /// Unambiguous class-scoped collection typedefs.
+    class_collection_typedefs: HashMap<String, CollInfo>,
     /// Enum type name -> value-name table id (into `linkage.enum_tables`).
     enum_types: HashMap<String, u32>,
     linkage: Rc<Linkage>,
@@ -75,9 +78,23 @@ pub fn elaborate(file: &SourceFile, backend: &dyn ExecBackend) -> Sim {
     elaborate_with_stats(file, backend).0
 }
 
+/// Elaborate with caller-provided DPI-C host bindings.
+pub fn elaborate_with_dpi(file: &SourceFile, backend: &dyn ExecBackend, dpi: DpiRegistry) -> Sim {
+    elaborate_with_stats_and_dpi(file, backend, dpi).0
+}
+
 /// Like [`elaborate`], but also returns how much of the design was ingested
 /// (useful for measuring UVM coverage during the port).
 pub fn elaborate_with_stats(file: &SourceFile, backend: &dyn ExecBackend) -> (Sim, ElabStats) {
+    elaborate_with_stats_and_dpi(file, backend, DpiRegistry::simulator_defaults())
+}
+
+/// Elaborate with statistics and caller-provided DPI-C host bindings.
+pub fn elaborate_with_stats_and_dpi(
+    file: &SourceFile,
+    backend: &dyn ExecBackend,
+    dpi: DpiRegistry,
+) -> (Sim, ElabStats) {
     let mut sim = Sim::with_default_timescale();
     let ts = sim.kernel().timescale();
 
@@ -188,6 +205,7 @@ pub fn elaborate_with_stats(file: &SourceFile, backend: &dyn ExecBackend) -> (Si
         consts,
         enum_types,
         enum_tables,
+        dpi,
         ts,
         backend,
     );
@@ -221,6 +239,7 @@ fn builtin_classes() -> Vec<ClassDecl> {
             ret_width: 32,
             ret_class: ret_class.map(str::to_string),
             class_scope: None,
+            dpi_name: None,
             is_void,
             is_virtual: false,
             params,
@@ -233,9 +252,11 @@ fn builtin_classes() -> Vec<ClassDecl> {
             dir: PortDir::Input,
             width: 32,
             class_name: None,
+            type_scope: None,
             type_args: Vec::new(),
             coll: None,
             key_class_name: None,
+            default: None,
         }
     }
     let ret0 = Stmt::Return(Some(Expr::Literal(LogicVec::zero(32))));
@@ -277,6 +298,7 @@ fn builtin_classes() -> Vec<ClassDecl> {
         ],
         constructor: None,
         type_aliases: Vec::new(),
+        collection_aliases: Vec::new(),
         params: Vec::new(),
         base_args: Vec::new(),
         consts: Vec::new(),
@@ -323,6 +345,7 @@ fn builtin_classes() -> Vec<ClassDecl> {
         ],
         constructor: None,
         type_aliases: Vec::new(),
+        collection_aliases: Vec::new(),
         params: Vec::new(),
         base_args: Vec::new(),
         consts: Vec::new(),
@@ -414,6 +437,7 @@ fn build_global(
     consts: HashMap<String, LogicVec>,
     enum_types: HashMap<String, u32>,
     enum_tables: Vec<HashMap<i64, Rc<str>>>,
+    dpi: DpiRegistry,
     ts: Timescale,
     _backend: &dyn ExecBackend,
 ) -> Global {
@@ -537,7 +561,7 @@ fn build_global(
         let default = match v.coll {
             Some(CollKind::Assoc) => Value::new_assoc(),
             Some(CollKind::Queue) => Value::new_queue(),
-            None => default_value(v),
+            None => default_value(v, &consts),
         };
         statics_defaults.push(default);
         globals.insert(v.name.clone(), id);
@@ -601,6 +625,7 @@ fn build_global(
                 &built,
                 &class_fids[cid],
                 &class_ids,
+                &consts,
                 &mut statics_defaults,
             ));
             progress = true;
@@ -618,6 +643,7 @@ fn build_global(
                 &built,
                 &class_fids[cid],
                 &class_ids,
+                &consts,
                 &mut statics_defaults,
             ));
         }
@@ -649,6 +675,28 @@ fn build_global(
         }
     }
 
+    let mut class_collection_typedefs: HashMap<String, CollInfo> = HashMap::new();
+    {
+        let mut ambiguous: HashSet<String> = HashSet::new();
+        for ci in &class_infos {
+            for (alias, &info) in &ci.collection_aliases {
+                if ambiguous.contains(alias) {
+                    continue;
+                }
+                match class_collection_typedefs.get(alias) {
+                    Some(&existing) if existing == info => {}
+                    Some(_) => {
+                        class_collection_typedefs.remove(alias);
+                        ambiguous.insert(alias.clone());
+                    }
+                    None => {
+                        class_collection_typedefs.insert(alias.clone(), info);
+                    }
+                }
+            }
+        }
+    }
+
     // Compile every callable. Package callables have no module nets in scope.
     // A body that hits an unsupported construct panics inside the codegen; we
     // catch it and substitute a stub so the rest of the library still loads.
@@ -660,6 +708,7 @@ fn build_global(
         type_aliases: &global_type_aliases,
         enums: &enum_types,
         class_typedefs: &class_typedefs,
+        class_collection_typedefs: &class_collection_typedefs,
     };
     let mut funcs: Vec<Rc<Program>> = Vec::with_capacity(jobs.len());
     let mut stubbed = 0usize;
@@ -672,6 +721,10 @@ fn build_global(
     std::panic::set_hook(Box::new(|_| {})); // silence the resilient-compile noise
     for (f, class_ctx) in &jobs {
         let cc = *class_ctx;
+        if f.dpi_name.is_some() {
+            funcs.push(Rc::new(dpi_program(f)));
+            continue;
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             CodeGen::new(
                 &empty_scope,
@@ -727,6 +780,11 @@ fn build_global(
                     Some((slot, matches!(info.kind, CollKind::Assoc)))
                 })
                 .collect();
+            let event_fields: Vec<u32> = ci
+                .field_events
+                .iter()
+                .filter_map(|name| ci.field_slot.get(name).map(|(slot, _)| *slot))
+                .collect();
             // Struct-typed fields (an unpacked `typedef struct {...}` member,
             // modeled as a no-method class — see `ClassDecl::is_struct`) also
             // get a fresh auto-constructed sub-object per `New`: SV structs
@@ -746,9 +804,11 @@ fn build_global(
                 .collect();
             ClassDef {
                 name: ci.name.clone(),
+                base: ci.base,
                 field_defaults: ci.field_defaults.clone().into_boxed_slice(),
                 vtable: ci.vtable.clone().into_boxed_slice(),
                 coll_fields: coll_fields.into_boxed_slice(),
+                event_fields: event_fields.into_boxed_slice(),
                 struct_fields: struct_fields.into_boxed_slice(),
             }
         })
@@ -764,6 +824,7 @@ fn build_global(
         classes,
         statics: statics_defaults.into_iter().map(RefCell::new).collect(),
         enum_tables,
+        dpi,
     });
     Global {
         class_ids,
@@ -775,6 +836,7 @@ fn build_global(
         global_class,
         global_type_aliases,
         class_typedefs,
+        class_collection_typedefs,
         enum_types,
         linkage,
         stats,
@@ -789,16 +851,19 @@ fn build_class_info(
     built: &[Option<ClassInfo>],
     fids: &ClassFids,
     class_ids: &HashMap<String, u32>,
+    consts: &HashMap<String, LogicVec>,
     statics_defaults: &mut Vec<Value>,
 ) -> ClassInfo {
     let (
         mut field_slot,
         mut field_class,
         mut field_coll,
+        mut field_events,
         mut static_fields,
         mut static_field_class,
         mut static_field_coll,
         mut type_aliases,
+        mut collection_aliases,
         mut method_ret_class,
         mut field_defaults,
         mut methods,
@@ -813,10 +878,12 @@ fn build_class_info(
                 b.field_slot.clone(),
                 b.field_class.clone(),
                 b.field_coll.clone(),
+                b.field_events.clone(),
                 b.static_fields.clone(),
                 b.static_field_class.clone(),
                 b.static_field_coll.clone(),
                 b.type_aliases.clone(),
+                b.collection_aliases.clone(),
                 b.method_ret_class.clone(),
                 b.field_defaults.clone(),
                 b.methods.clone(),
@@ -828,10 +895,12 @@ fn build_class_info(
             HashMap::new(), // field_slot
             HashMap::new(), // field_class
             HashMap::new(), // field_coll
+            HashSet::new(), // field_events
             HashMap::new(), // static_fields
             HashMap::new(), // static_field_class
             HashMap::new(), // static_field_coll
             HashMap::new(), // type_aliases
+            HashMap::new(), // collection_aliases
             HashMap::new(), // method_ret_class
             Vec::new(),     // field_defaults
             HashMap::new(), // methods
@@ -890,6 +959,16 @@ fn build_class_info(
             .or_else(|| type_aliases.get(name).copied())
             .or_else(|| type_param_default.get(name).copied())
     };
+    for alias in &c.collection_aliases {
+        collection_aliases.insert(
+            alias.alias.clone(),
+            CollInfo {
+                kind: alias.kind,
+                elem_class: alias.element.as_ref().and_then(|ty| resolve_ty(&ty.name)),
+                key_class: alias.key.as_ref().and_then(|ty| resolve_ty(&ty.name)),
+            },
+        );
+    }
     for fld in &c.fields {
         let elem_class = fld.class_name.as_deref().and_then(resolve_ty);
         let key_class = fld.key_class_name.as_deref().and_then(resolve_ty);
@@ -900,7 +979,7 @@ fn build_class_info(
             let default = match fld.coll {
                 Some(CollKind::Assoc) => Value::new_assoc(),
                 Some(CollKind::Queue) => Value::new_queue(),
-                None => default_value(fld),
+                None => default_value(fld, consts),
             };
             statics_defaults.push(default);
             static_fields.insert(fld.name.clone(), id);
@@ -921,6 +1000,9 @@ fn build_class_info(
         }
         let slot = field_defaults.len() as u32;
         field_slot.insert(fld.name.clone(), (slot, fld.width));
+        if fld.is_event {
+            field_events.insert(fld.name.clone());
+        }
         match fld.coll {
             Some(kind) => {
                 field_coll.insert(
@@ -938,21 +1020,20 @@ fn build_class_info(
                 }
             }
         }
-        field_defaults.push(default_value(fld));
+        field_defaults.push(default_value(fld, consts));
     }
     for (name, fid, is_virtual, ret_class) in &fids.method_fids {
         methods.insert(name.clone(), *fid);
         if let Some(rid) = ret_class {
             method_ret_class.insert(name.clone(), *rid);
         }
-        if *is_virtual {
-            match vslot_of.get(name).copied() {
-                Some(vslot) => vtable[vslot as usize] = *fid,
-                None => {
-                    vslot_of.insert(name.clone(), vtable.len() as u32);
-                    vtable.push(*fid);
-                }
+        match vslot_of.get(name).copied() {
+            Some(vslot) => vtable[vslot as usize] = *fid,
+            None if *is_virtual => {
+                vslot_of.insert(name.clone(), vtable.len() as u32);
+                vtable.push(*fid);
             }
+            None => {}
         }
     }
     ClassInfo {
@@ -961,11 +1042,13 @@ fn build_class_info(
         field_slot,
         field_class,
         field_coll,
+        field_events,
         static_fields,
         static_field_class,
         static_field_coll,
         type_param_default,
         type_aliases,
+        collection_aliases,
         method_ret_class,
         field_defaults,
         methods,
@@ -1046,6 +1129,28 @@ fn stub_program(f: &FuncDecl, has_this: bool) -> Program {
     pb.build()
 }
 
+fn dpi_program(f: &FuncDecl) -> Program {
+    let name = f.dpi_name.as_deref().expect("DPI program without a symbol");
+    let mut pb = ProgramBuilder::new(format!("dpi {name}"));
+    let mut args = Vec::with_capacity(f.params.len());
+    let mut modes = Vec::with_capacity(f.params.len());
+    for param in &f.params {
+        args.push(pb.new_reg());
+        modes.push(arg_mode(param.dir));
+    }
+    pb.set_arg_modes(&modes);
+    let args = pb.arglist(&args);
+    let name = pb.konst(Value::Str(Rc::from(name)));
+    let dst = pb.new_reg();
+    pb.emit(Inst::DpiCall { dst, name, args });
+    if f.is_void {
+        pb.emit(Inst::ReturnVoid);
+    } else {
+        pb.emit(Inst::Return { value: dst });
+    }
+    pb.build()
+}
+
 fn arg_mode(dir: PortDir) -> ArgMode {
     match dir {
         PortDir::Input => ArgMode::Input,
@@ -1078,6 +1183,7 @@ fn elaborate_module_processes(m: &Module, g: &Global, sim: &mut Sim, backend: &d
         type_aliases: &g.global_type_aliases,
         enums: &g.enum_types,
         class_typedefs: &g.class_typedefs,
+        class_collection_typedefs: &g.class_collection_typedefs,
     };
     for it in &m.items {
         match it {
@@ -1129,6 +1235,8 @@ struct ClassInfo {
     field_class: HashMap<String, u32>,
     /// Collection fields and their element/key class types.
     field_coll: HashMap<String, CollInfo>,
+    /// Event-typed field names, initialized to a fresh identity per instance.
+    field_events: HashSet<String>,
     /// Static fields: name -> global static id (shared storage).
     static_fields: HashMap<String, u32>,
     /// Static fields whose type is a class: name -> class id.
@@ -1140,6 +1248,8 @@ struct ClassInfo {
     type_param_default: HashMap<String, u32>,
     /// Class-scoped typedef aliases (e.g. `type_id`) -> target class id.
     type_aliases: HashMap<String, u32>,
+    /// Class-scoped unpacked collection typedef aliases.
+    collection_aliases: HashMap<String, CollInfo>,
     /// Methods that return a class handle: method name -> return class id
     /// (for resolving chained `a.method().next()` receivers).
     method_ret_class: HashMap<String, u32>,
@@ -1158,11 +1268,18 @@ struct ClassInfo {
 /// The default value of a class field (a collection placeholder, a null handle,
 /// an empty string, or a zero bit-vector). Collection fields are given fresh
 /// storage at [`Inst::New`] time, so their stored default is just `Null`.
-fn default_value(fld: &VarDecl) -> Value {
+fn default_value(fld: &VarDecl, consts: &HashMap<String, LogicVec>) -> Value {
     if fld.coll.is_some() || fld.class_name.is_some() {
         Value::Null
+    } else if fld.is_event {
+        Value::new_event()
     } else if fld.is_string {
-        Value::Str(Rc::from(""))
+        match &fld.init {
+            Some(Expr::Str(value)) => Value::Str(Rc::from(value.as_str())),
+            _ => Value::Str(Rc::from("")),
+        }
+    } else if let Some(init) = &fld.init {
+        Value::Logic(const_eval_with(init, Some(consts)).resize(fld.width.max(1), fld.signed))
     } else {
         Value::Logic(LogicVec::zero(fld.width.max(1)))
     }
@@ -1188,7 +1305,11 @@ struct CodeGen<'a> {
     local_colls: HashMap<String, CollInfo>,
     /// Local enum-typed variables: name -> enum table id (for `.name()`).
     local_enums: HashMap<String, u32>,
+    /// Local variables whose declared type is the IEEE named-event type.
+    local_events: HashSet<String>,
     locals: HashMap<String, (Reg, u32)>,
+    /// `(break target, continue target)` for nested procedural loops.
+    loop_targets: Vec<(Label, Label)>,
     ts: Timescale,
 }
 
@@ -1205,6 +1326,8 @@ struct GlobalVars<'a> {
     /// `uvm_resource_types`): alias name -> class id. Only contains names
     /// that map to the *same* class across all classes that define them.
     class_typedefs: &'a HashMap<String, u32>,
+    /// Unambiguous class-scoped unpacked collection typedef aliases.
+    class_collection_typedefs: &'a HashMap<String, CollInfo>,
 }
 
 impl<'a> CodeGen<'a> {
@@ -1229,7 +1352,9 @@ impl<'a> CodeGen<'a> {
             local_classes: HashMap::new(),
             local_colls: HashMap::new(),
             local_enums: HashMap::new(),
+            local_events: HashSet::new(),
             locals: HashMap::new(),
+            loop_targets: Vec::new(),
             ts,
         }
     }
@@ -1266,6 +1391,7 @@ impl<'a> CodeGen<'a> {
         self.local_classes.clear();
         self.local_colls.clear();
         self.local_enums.clear();
+        self.local_events.clear();
         self.class_ctx = class_ctx;
         let mut arg_modes = Vec::with_capacity(f.params.len() + usize::from(class_ctx.is_some()));
         if class_ctx.is_some() {
@@ -1276,23 +1402,24 @@ impl<'a> CodeGen<'a> {
             let reg = pb.new_reg();
             arg_modes.push(arg_mode(p.dir));
             self.locals.insert(p.name.clone(), (reg, p.width));
-            if let Some(kind) = p.coll {
-                let elem_class = p
+            let collection = p.coll.map(|kind| CollInfo {
+                kind,
+                elem_class: p
                     .class_name
                     .as_deref()
-                    .and_then(|name| self.resolve_class(name));
-                let key_class = p
+                    .and_then(|name| self.resolve_class(name)),
+                key_class: p
                     .key_class_name
                     .as_deref()
-                    .and_then(|name| self.resolve_class(name));
-                self.local_colls.insert(
-                    p.name.clone(),
-                    CollInfo {
-                        kind,
-                        elem_class,
-                        key_class,
-                    },
-                );
+                    .and_then(|name| self.resolve_class(name)),
+            });
+            let collection = collection.or_else(|| {
+                p.class_name
+                    .as_deref()
+                    .and_then(|name| self.resolve_collection_alias(p.type_scope.as_deref(), name))
+            });
+            if let Some(info) = collection {
+                self.local_colls.insert(p.name.clone(), info);
                 continue;
             }
             if let Some(cn) = &p.class_name {
@@ -1304,6 +1431,21 @@ impl<'a> CodeGen<'a> {
             }
         }
         pb.set_arg_modes(&arg_modes);
+        let first_formal = u32::from(class_ctx.is_some());
+        for (offset, param) in f.params.iter().enumerate() {
+            let Some(default) = &param.default else {
+                continue;
+            };
+            let formal = first_formal + offset as u32;
+            let supplied = pb.new_label();
+            pb.branch_arg_provided(formal, supplied);
+            let value = self.gen_expr(default, &mut pb);
+            pb.emit(Inst::Assign {
+                dst: formal,
+                src: value,
+            });
+            pb.bind(supplied);
+        }
         let ret_width = f.ret_width.max(1);
         let ret_reg = pb.new_reg();
         self.locals.insert(f.name.clone(), (ret_reg, ret_width));
@@ -1330,16 +1472,11 @@ impl<'a> CodeGen<'a> {
     /// independent concurrent process, not a callee frame — it ends with
     /// `Inst::Finish`, not `Return`). It gets a *fresh* register file and
     /// local-variable scope: SystemVerilog runs each branch as a genuinely
-    /// concurrent process, so it cannot share the parent's registers (which
-    /// may be suspended mid-branch itself). The branch still sees the same
-    /// class fields/statics/globals as the parent, and — if compiled in a
-    /// class context — the same `this` (reg 0, seeded at spawn time by the
-    /// interpreter; see `Inst::Fork`). Bare references to the *parent's own
-    /// local variables* declared before the `fork` are the one gap this
-    /// leaves (a fresh frame has no way to alias them); the common UVM
-    /// pattern of forking a method/task call or a self-contained block is
-    /// unaffected. Returns the compiled program and whether it wants `this`.
-    fn gen_fork_branch(&mut self, body: &Stmt) -> (Rc<Program>, bool) {
+    /// concurrent process, so it cannot use the parent's register file
+    /// directly. Enclosing locals and `this` receive fresh child registers
+    /// plus capture mappings sampled when `Inst::Fork` executes. Object and
+    /// collection handles preserve shared identity across the processes.
+    fn gen_fork_branch(&mut self, body: &Stmt) -> (Rc<Program>, Vec<(Reg, Reg)>) {
         let label = match self.class_ctx {
             Some(cid) => format!("{}::<fork>", self.classes[cid as usize].name),
             None => "<fork>".to_string(),
@@ -1349,11 +1486,25 @@ impl<'a> CodeGen<'a> {
         let saved_classes = std::mem::take(&mut self.local_classes);
         let saved_colls = std::mem::take(&mut self.local_colls);
         let saved_enums = std::mem::take(&mut self.local_enums);
+        let saved_events = std::mem::take(&mut self.local_events);
+        let saved_loop_targets = std::mem::take(&mut self.loop_targets);
         let saved_this_reg = self.this_reg;
-        let wants_this = self.class_ctx.is_some();
-        if wants_this {
+        let mut captures = Vec::with_capacity(saved_locals.len() + 1);
+        if self.class_ctx.is_some() {
             self.this_reg = pb.new_reg(); // reg 0 = this, seeded by the scheduler at spawn
+            captures.push((self.this_reg, saved_this_reg));
         }
+        let mut locals: Vec<_> = saved_locals.iter().collect();
+        locals.sort_by_key(|(_, value)| value.0);
+        for (name, &(parent_reg, width)) in locals {
+            let child_reg = pb.new_reg();
+            self.locals.insert(name.clone(), (child_reg, width));
+            captures.push((child_reg, parent_reg));
+        }
+        self.local_classes = saved_classes.clone();
+        self.local_colls = saved_colls.clone();
+        self.local_enums = saved_enums.clone();
+        self.local_events = saved_events.clone();
         self.gen_stmt(body, &mut pb);
         pb.emit(Inst::Finish);
         let prog = pb.build();
@@ -1361,8 +1512,10 @@ impl<'a> CodeGen<'a> {
         self.local_classes = saved_classes;
         self.local_colls = saved_colls;
         self.local_enums = saved_enums;
+        self.local_events = saved_events;
+        self.loop_targets = saved_loop_targets;
         self.this_reg = saved_this_reg;
-        (Rc::new(prog), wants_this)
+        (Rc::new(prog), captures)
     }
 
     fn gen_stmt(&mut self, s: &Stmt, pb: &mut ProgramBuilder) {
@@ -1375,26 +1528,39 @@ impl<'a> CodeGen<'a> {
             Stmt::VarDecl(v) => {
                 let reg = pb.new_reg();
                 self.locals.insert(v.name.clone(), (reg, v.width));
-                if let Some(kind) = v.coll {
+                if v.is_event {
+                    self.local_events.insert(v.name.clone());
+                    match &v.init {
+                        Some(init) => {
+                            let src = self.gen_expr(init, pb);
+                            pb.emit(Inst::Assign { dst: reg, src });
+                        }
+                        None => pb.emit(Inst::NewEvent { dst: reg }),
+                    }
+                } else if let Some(info) = v
+                    .coll
+                    .map(|kind| CollInfo {
+                        kind,
+                        elem_class: v
+                            .class_name
+                            .as_deref()
+                            .and_then(|name| self.resolve_class(name)),
+                        key_class: v
+                            .key_class_name
+                            .as_deref()
+                            .and_then(|name| self.resolve_class(name)),
+                    })
+                    .or_else(|| {
+                        v.class_name.as_deref().and_then(|name| {
+                            self.resolve_collection_alias(v.type_scope.as_deref(), name)
+                        })
+                    })
+                {
+                    self.local_events.remove(&v.name);
                     // Queue / dynamic array / associative array: initialize to
                     // fresh empty storage and record its kind + element class.
-                    let elem = v
-                        .class_name
-                        .as_deref()
-                        .and_then(|cn| self.resolve_class(cn));
-                    let key_class = v
-                        .key_class_name
-                        .as_deref()
-                        .and_then(|cn| self.resolve_class(cn));
-                    self.local_colls.insert(
-                        v.name.clone(),
-                        CollInfo {
-                            kind,
-                            elem_class: elem,
-                            key_class,
-                        },
-                    );
-                    match kind {
+                    self.local_colls.insert(v.name.clone(), info);
+                    match info.kind {
                         CollKind::Assoc => pb.emit(Inst::NewAssoc { dst: reg }),
                         CollKind::Queue => pb.emit(Inst::NewQueue { dst: reg }),
                     }
@@ -1414,7 +1580,7 @@ impl<'a> CodeGen<'a> {
                         Some(Expr::New { args }) => self.gen_new(&v.name, args, pb),
                         Some(e) => {
                             let init = self.gen_expr(e, pb);
-                            pb.emit(Inst::Mov {
+                            pb.emit(Inst::Assign {
                                 dst: reg,
                                 src: init,
                             });
@@ -1431,7 +1597,7 @@ impl<'a> CodeGen<'a> {
                             dst
                         }
                     };
-                    pb.emit(Inst::Mov {
+                    pb.emit(Inst::Assign {
                         dst: reg,
                         src: init,
                     });
@@ -1446,7 +1612,7 @@ impl<'a> CodeGen<'a> {
                             dst
                         }
                     };
-                    pb.emit(Inst::Mov {
+                    pb.emit(Inst::Assign {
                         dst: reg,
                         src: init,
                     });
@@ -1524,6 +1690,64 @@ impl<'a> CodeGen<'a> {
                     None => pb.bind(else_lbl),
                 }
             }
+            Stmt::While { cond, body } => {
+                let top = pb.new_label();
+                let done = pb.new_label();
+                pb.bind(top);
+                let value = self.gen_expr(cond, pb);
+                pb.branch_false(value, done);
+                self.loop_targets.push((done, top));
+                self.gen_stmt(body, pb);
+                self.loop_targets.pop();
+                pb.jump(top);
+                pb.bind(done);
+            }
+            Stmt::DoWhile { cond, body } => {
+                let top = pb.new_label();
+                let check = pb.new_label();
+                let done = pb.new_label();
+                pb.bind(top);
+                self.loop_targets.push((done, check));
+                self.gen_stmt(body, pb);
+                self.loop_targets.pop();
+                pb.bind(check);
+                let value = self.gen_expr(cond, pb);
+                pb.branch_true(value, top);
+                pb.bind(done);
+            }
+            Stmt::Case {
+                expr,
+                items,
+                default,
+            } => {
+                let selector = self.gen_expr(expr, pb);
+                let done = pb.new_label();
+                let labels: Vec<_> = items.iter().map(|_| pb.new_label()).collect();
+                let default_label = default.as_ref().map(|_| pb.new_label());
+                for ((values, _), &label) in items.iter().zip(&labels) {
+                    for value in values {
+                        let candidate = self.gen_expr(value, pb);
+                        let equal = pb.new_reg();
+                        pb.emit(Inst::Eq {
+                            dst: equal,
+                            a: selector,
+                            b: candidate,
+                        });
+                        pb.branch_true(equal, label);
+                    }
+                }
+                pb.jump(default_label.unwrap_or(done));
+                for ((_, body), &label) in items.iter().zip(&labels) {
+                    pb.bind(label);
+                    self.gen_stmt(body, pb);
+                    pb.jump(done);
+                }
+                if let (Some(body), Some(label)) = (default, default_label) {
+                    pb.bind(label);
+                    self.gen_stmt(body, pb);
+                }
+                pb.bind(done);
+            }
             Stmt::Foreach {
                 collection,
                 index,
@@ -1549,10 +1773,14 @@ impl<'a> CodeGen<'a> {
                     args,
                 });
                 let check = pb.new_label();
+                let advance = pb.new_label();
                 let done = pb.new_label();
                 pb.bind(check);
                 pb.branch_false(has_item, done);
+                self.loop_targets.push((done, advance));
                 self.gen_stmt(body, pb);
+                self.loop_targets.pop();
+                pb.bind(advance);
                 pb.emit(Inst::CollMethod {
                     dst: has_item,
                     base,
@@ -1587,15 +1815,35 @@ impl<'a> CodeGen<'a> {
                 }
                 None => pb.emit(Inst::ReturnVoid),
             },
+            Stmt::Break => {
+                let (target, _) = self
+                    .loop_targets
+                    .last()
+                    .copied()
+                    .expect("break used outside a loop");
+                pb.jump(target);
+            }
+            Stmt::Continue => {
+                let (_, target) = self
+                    .loop_targets
+                    .last()
+                    .copied()
+                    .expect("continue used outside a loop");
+                pb.jump(target);
+            }
             Stmt::Expr(e) => {
                 self.gen_expr(e, pb);
+            }
+            Stmt::Trigger(event) => {
+                let event = self.gen_expr(event, pb);
+                pb.emit(Inst::TriggerEvent { event });
             }
             Stmt::Fork { branches, join } => {
                 let ids: Vec<u32> = branches
                     .iter()
                     .map(|b| {
-                        let (prog, wants_this) = self.gen_fork_branch(b);
-                        pb.add_fork_branch(prog, wants_this)
+                        let (prog, captures) = self.gen_fork_branch(b);
+                        pb.add_fork_branch(prog, &captures)
                     })
                     .collect();
                 let group = pb.fork_group(&ids);
@@ -1647,12 +1895,10 @@ impl<'a> CodeGen<'a> {
                     self.gen_assign(dst_name, tmp, false, pb);
                 }
             }
-            // `$cast(dst, src)` as a statement: assign dst = src.
+            // `$cast(dst, src)` as a statement uses the same dynamic class
+            // compatibility check as its function form.
             "$cast" if args.len() == 2 => {
-                let src = self.gen_expr(&args[1], pb);
-                if let Expr::Ref(name) = &args[0] {
-                    self.gen_assign(name, src, false, pb);
-                }
+                let _ = self.gen_cast(args, pb);
             }
             // Other system tasks are ignored for now (graceful no-op).
             _ => {}
@@ -1672,15 +1918,34 @@ impl<'a> CodeGen<'a> {
                     "multi-signal sensitivity not yet supported (needs a WaitAny opcode)"
                 );
                 let ev = &evs[0];
-                let net = self.net_of_expr(&ev.expr);
-                let edge = match ev.edge {
-                    Edge::Posedge => EdgeKind::Posedge,
-                    Edge::Negedge => EdgeKind::Negedge,
-                    Edge::AnyChange => EdgeKind::AnyChange,
-                };
-                pb.emit(Inst::WaitEdge { net, edge });
+                if let Expr::Ref(name) = &ev.expr {
+                    if let Some(&(net, _)) = self.nets.get(name) {
+                        let edge = match ev.edge {
+                            Edge::Posedge => EdgeKind::Posedge,
+                            Edge::Negedge => EdgeKind::Negedge,
+                            Edge::AnyChange => EdgeKind::AnyChange,
+                        };
+                        pb.emit(Inst::WaitEdge { net, edge });
+                        return;
+                    }
+                }
+                let event = self.gen_expr(&ev.expr, pb);
+                if self.is_named_event_expr(&ev.expr) {
+                    pb.emit(Inst::WaitEvent { event });
+                } else {
+                    pb.emit(Inst::WaitChange { value: event });
+                }
             }
-            TimingControl::Wait(_) => unimplemented!("wait(cond) codegen — next slice"),
+            TimingControl::Wait(cond) => {
+                let check = pb.new_label();
+                let ready = pb.new_label();
+                pb.bind(check);
+                let value = self.gen_expr(cond, pb);
+                pb.branch_true(value, ready);
+                pb.emit(Inst::WaitRuntime);
+                pb.jump(check);
+                pb.bind(ready);
+            }
         }
     }
 
@@ -1972,6 +2237,19 @@ impl<'a> CodeGen<'a> {
                 });
                 dst
             }
+            Expr::PartSelect { base, left, right } => {
+                let base = self.gen_expr(base, pb);
+                let left = self.gen_expr(left, pb);
+                let right = self.gen_expr(right, pb);
+                let dst = pb.new_reg();
+                pb.emit(Inst::PartSelect {
+                    dst,
+                    base,
+                    left,
+                    right,
+                });
+                dst
+            }
             Expr::StaticCall {
                 class_name,
                 method,
@@ -2080,7 +2358,7 @@ impl<'a> CodeGen<'a> {
                 let regs: Vec<Reg> = parts.iter().map(|e| self.gen_expr(e, pb)).collect();
                 let arglist = pb.arglist(&regs);
                 let dst = pb.new_reg();
-                pb.emit(Inst::ConcatStr { dst, args: arglist });
+                pb.emit(Inst::Concat { dst, args: arglist });
                 dst
             }
             Expr::SysCall { name, args } => self.gen_sys_func(name, args, pb),
@@ -2123,18 +2401,7 @@ impl<'a> CodeGen<'a> {
                     dst
                 }
             },
-            // `$cast(dst, src)` in expression position: do the assignment and
-            // yield success (1). Type-checking is not enforced.
-            "$cast" if args.len() == 2 => {
-                let src = self.gen_expr(&args[1], pb);
-                if let Expr::Ref(name) = &args[0] {
-                    self.gen_assign(name, src, false, pb);
-                }
-                let dst = pb.new_reg();
-                let k = pb.konst_logic(LogicVec::from_u64(1, 32));
-                pb.emit(Inst::LoadConst { dst, k });
-                dst
-            }
+            "$cast" if args.len() == 2 => self.gen_cast(args, pb),
             // Unknown system function: yield 0 (graceful).
             _ => {
                 for a in args {
@@ -2146,6 +2413,40 @@ impl<'a> CodeGen<'a> {
                 dst
             }
         }
+    }
+
+    fn gen_cast(&mut self, args: &[Expr], pb: &mut ProgramBuilder) -> Reg {
+        let src = self.gen_expr(&args[1], pb);
+        let success = pb.new_reg();
+        if let Expr::Ref(name) = &args[0] {
+            if let Some(class) = self.try_class_of(&args[0]) {
+                pb.emit(Inst::ClassCast {
+                    dst: success,
+                    src,
+                    class,
+                });
+                let done = pb.new_label();
+                pb.branch_false(success, done);
+                self.gen_assign(name, src, false, pb);
+                pb.bind(done);
+                return success;
+            }
+
+            self.gen_assign(name, src, false, pb);
+            let one = pb.konst_logic(LogicVec::from_u64(1, 1));
+            pb.emit(Inst::LoadConst {
+                dst: success,
+                k: one,
+            });
+            return success;
+        }
+
+        let zero = pb.konst_logic(LogicVec::zero(1));
+        pb.emit(Inst::LoadConst {
+            dst: success,
+            k: zero,
+        });
+        success
     }
 
     /// `handle = new(args)`: allocate the object and run its constructor.
@@ -2544,6 +2845,22 @@ impl<'a> CodeGen<'a> {
             .or_else(|| ci.type_param_default.get(name).copied())
     }
 
+    fn resolve_collection_alias(&self, scope: Option<&str>, name: &str) -> Option<CollInfo> {
+        if let Some(owner) = scope {
+            if let Some(cid) = self.resolve_class(owner) {
+                if let Some(&info) = self.classes[cid as usize].collection_aliases.get(name) {
+                    return Some(info);
+                }
+            }
+        }
+        if let Some(cid) = self.class_ctx {
+            if let Some(&info) = self.classes[cid as usize].collection_aliases.get(name) {
+                return Some(info);
+            }
+        }
+        self.globals.class_collection_typedefs.get(name).copied()
+    }
+
     /// True if `name` is a method of the class currently being compiled.
     fn method_of_ctx(&self, name: &str) -> bool {
         self.class_ctx
@@ -2639,7 +2956,11 @@ impl<'a> CodeGen<'a> {
     /// Assign `src` to `name` (a local move, a class-field write, or a net write).
     fn gen_assign(&mut self, name: &str, src: Reg, nonblocking: bool, pb: &mut ProgramBuilder) {
         if let Some((reg, _)) = self.locals.get(name).copied() {
-            pb.emit(Inst::Mov { dst: reg, src });
+            if nonblocking {
+                pb.emit(Inst::NbaAssign { dst: reg, src });
+            } else {
+                pb.emit(Inst::Assign { dst: reg, src });
+            }
         } else if let Some((slot, _)) = self.class_field(name) {
             let this = self.this_reg;
             pb.emit(Inst::SetField {
@@ -2668,10 +2989,19 @@ impl<'a> CodeGen<'a> {
             .0
     }
 
-    fn net_of_expr(&self, e: &Expr) -> NetId {
-        match e {
-            Expr::Ref(name) => self.net(name),
-            _ => panic!("event expression must be a simple signal reference"),
+    fn is_named_event_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Ref(name) => {
+                self.local_events.contains(name)
+                    || self.class_ctx.is_some_and(|class| {
+                        self.classes[class as usize].field_events.contains(name)
+                    })
+            }
+            Expr::Field { obj, field } => {
+                let class = self.receiver_class(obj);
+                self.classes[class as usize].field_events.contains(field)
+            }
+            _ => false,
         }
     }
 }
@@ -2711,20 +3041,49 @@ fn coll_op(method: &str) -> Option<CollOp> {
 
 /// Constant-fold an expression (for init values and `#delay` amounts).
 fn const_eval(e: &Expr) -> LogicVec {
+    const_eval_with(e, None)
+}
+
+fn const_eval_with(e: &Expr, consts: Option<&HashMap<String, LogicVec>>) -> LogicVec {
     match e {
         Expr::Literal(lv) => lv.clone(),
         Expr::Str(_) => LogicVec::zero(32),
-        Expr::Ref(_) => LogicVec::zero(32),
+        Expr::Ref(name) => consts
+            .and_then(|values| values.get(name))
+            .cloned()
+            .unwrap_or_else(|| LogicVec::zero(32)),
         Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Field { .. } | Expr::New { .. } => {
             LogicVec::zero(32)
         }
         Expr::StaticCall { .. } => LogicVec::zero(32),
         Expr::StaticRef { .. } => LogicVec::zero(32),
         Expr::Index { .. } => LogicVec::zero(32),
+        Expr::PartSelect { base, left, right } => {
+            let value = const_eval_with(base, consts);
+            let left = const_eval_with(left, consts).to_u64() as u32;
+            let right = const_eval_with(right, consts).to_u64() as u32;
+            if left >= right {
+                value.slice(left, right)
+            } else {
+                let width = right - left + 1;
+                let mut selected = LogicVec::zero(width);
+                for offset in 0..width {
+                    selected.set_bit(offset, value.get_bit(right - offset));
+                }
+                selected
+            }
+        }
         Expr::Null => LogicVec::zero(32),
-        Expr::Concat(_) | Expr::SysCall { .. } => LogicVec::zero(32),
+        Expr::Concat(parts) => {
+            let mut parts = parts.iter().map(|part| const_eval_with(part, consts));
+            let Some(first) = parts.next() else {
+                return LogicVec::zero(1);
+            };
+            parts.fold(first, |value, part| value.concat(&part))
+        }
+        Expr::SysCall { .. } => LogicVec::zero(32),
         Expr::Unary { op, operand } => {
-            let v = const_eval(operand);
+            let v = const_eval_with(operand, consts);
             match op {
                 UnaryOp::BitNot => v.bitnot(),
                 UnaryOp::Neg => LogicVec::zero(v.width()).sub(&v),
@@ -2732,8 +3091,8 @@ fn const_eval(e: &Expr) -> LogicVec {
             }
         }
         Expr::Binary { op, lhs, rhs } => {
-            let l = const_eval(lhs);
-            let r = const_eval(rhs);
+            let l = const_eval_with(lhs, consts);
+            let r = const_eval_with(rhs, consts);
             match op {
                 BinOp::Add => l.add(&r),
                 BinOp::Sub => l.sub(&r),

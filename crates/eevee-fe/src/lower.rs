@@ -31,8 +31,11 @@ fn collect_descriptions(n: &Value, out: &mut Vec<Item>) {
         "kModuleDeclaration" => out.push(Item::Module(lower_module(n))),
         "kPackageDeclaration" => out.push(Item::Package(lower_package(n))),
         // Compilation-unit-scope class / function (real testbenches use these).
-        "kClassDeclaration" => out.push(Item::Class(lower_class(n))),
-        "kFunctionDeclaration" | "kTaskDeclaration" => out.push(Item::Func(lower_function(n))),
+        "kClassDeclaration" => out.push(Item::Class(Box::new(lower_class(n)))),
+        "kFunctionDeclaration" | "kTaskDeclaration" => {
+            out.push(Item::Func(Box::new(lower_function(n))))
+        }
+        "kDPIImportItem" => out.push(Item::Func(Box::new(lower_dpi_import(n)))),
         // Descend through wrappers (kDescriptionList, etc.).
         _ => {
             for c in kids(n) {
@@ -56,7 +59,8 @@ fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
         "kFunctionDeclaration" | "kTaskDeclaration" => {
             out.push(ModuleItem::Func(lower_function(item)))
         }
-        "kClassDeclaration" => out.push(ModuleItem::Class(lower_class(item))),
+        "kDPIImportItem" => out.push(ModuleItem::Func(lower_dpi_import(item))),
+        "kClassDeclaration" => out.push(ModuleItem::Class(Box::new(lower_class(item)))),
         // `localparam`/`parameter NAME = value;` -> a named constant.
         "kParamDeclaration" => {
             if let Some((name, value)) = param_const_pair(item) {
@@ -70,7 +74,7 @@ fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
         "kTypeDeclaration" => {
             lower_enum_consts(item, out);
             if let Some(sd) = lower_struct_typedef(item) {
-                out.push(ModuleItem::Class(sd));
+                out.push(ModuleItem::Class(Box::new(sd)));
             } else if let Some(alias) = lower_class_typedef(item) {
                 out.push(ModuleItem::TypeAlias(alias));
             }
@@ -144,15 +148,69 @@ fn enum_const_pairs(n: &Value) -> Vec<(String, LogicVec)> {
 }
 
 /// A class/package `localparam`/`parameter NAME = value;` -> `(name, value)`.
-/// The value is taken as the first integer literal in the declaration.
+/// Evaluate the initializer expression rather than taking its first numeric
+/// leaf: UVM's operation flags are parameters such as `(1 << 6)`, and reducing
+/// every one to `1` makes unrelated bit flags alias each other at runtime.
 fn param_const_pair(n: &Value) -> Option<(String, LogicVec)> {
     let pt = find(n, "kParamType")?;
     let name = find(pt, "SymbolIdentifier").map(text)?.to_string();
     if name.is_empty() {
         return None;
     }
-    let value = const_int(n).unwrap_or(0);
-    Some((name, LogicVec::from_i64(value, 32)))
+    let value = find_deep(n, "kTrailingAssign")
+        .and_then(|assign| find(assign, "kExpression"))
+        .map(lower_expr)
+        .as_ref()
+        .and_then(eval_const_expr)
+        .or_else(|| const_int(n).map(|value| LogicVec::from_i64(value, 32)))
+        .unwrap_or_else(|| LogicVec::zero(32));
+    Some((name, value))
+}
+
+/// Evaluate the integral expression subset valid in constant parameter
+/// initializers. References are intentionally unresolved here (package-level
+/// dependency resolution belongs in a later constant-table pass), but literal,
+/// unary, arithmetic, bitwise, shift, comparison, and logical expressions are
+/// exact and retain four-state behavior through [`LogicVec`].
+fn eval_const_expr(expr: &Expr) -> Option<LogicVec> {
+    match expr {
+        Expr::Literal(value) => Some(value.clone()),
+        Expr::Unary { op, operand } => {
+            let value = eval_const_expr(operand)?;
+            Some(match op {
+                UnaryOp::BitNot => value.bitnot(),
+                UnaryOp::LogNot => value.lognot(),
+                UnaryOp::Neg => value.neg(),
+                UnaryOp::Plus => value,
+                UnaryOp::ReduceAnd => LogicVec::from_bit(value.reduce_and()),
+                UnaryOp::ReduceOr => LogicVec::from_bit(value.reduce_or()),
+                UnaryOp::ReduceXor => LogicVec::from_bit(value.reduce_xor()),
+            })
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let left = eval_const_expr(lhs)?;
+            let right = eval_const_expr(rhs)?;
+            Some(match op {
+                BinOp::Add => left.add(&right),
+                BinOp::Sub => left.sub(&right),
+                BinOp::Mul => left.mul(&right),
+                BinOp::And => left.bitand(&right),
+                BinOp::Or => left.bitor(&right),
+                BinOp::Xor => left.bitxor(&right),
+                BinOp::Eq => left.eq_logical(&right),
+                BinOp::Neq => left.ne_logical(&right),
+                BinOp::Lt => left.ult(&right),
+                BinOp::Gt => left.ugt(&right),
+                BinOp::Le => left.ule(&right),
+                BinOp::Ge => left.uge(&right),
+                BinOp::Shl => left.shl(right.to_u64() as u32),
+                BinOp::Shr => left.shr(right.to_u64() as u32),
+                BinOp::LogAnd => LogicVec::from_u64((left.is_true() && right.is_true()) as u64, 1),
+                BinOp::LogOr => LogicVec::from_u64((left.is_true() || right.is_true()) as u64, 1),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn lower_module(n: &Value) -> Module {
@@ -202,8 +260,10 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
         .and_then(|b| find(b, "kInstantiationType"))
         .and_then(|t| find(t, "kDataType"));
     let class_name = dtype.and_then(class_type_name);
+    let type_scope = dtype.and_then(class_type_scope);
     let type_args = dtype.map(type_args_of).unwrap_or_default();
     let is_string = dtype.map(is_string_type).unwrap_or(false);
+    let is_event = dtype.is_some_and(|value| find_deep(value, "event").is_some());
     let width = dtype.map(packed_width).unwrap_or(1);
     // A `static` qualifier sits in a kQualifierList directly under the decl.
     let is_static = find(n, "kQualifierList")
@@ -249,8 +309,10 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
                 width,
                 signed: false,
                 class_name: class_name.clone(),
+                type_scope: type_scope.clone(),
                 type_args: type_args.clone(),
                 is_string,
+                is_event,
                 coll,
                 key_class_name: assoc_key_class_name(rv),
                 is_static,
@@ -385,6 +447,21 @@ fn class_type_name(dtype: &Value) -> Option<String> {
     find_deep(dtype, "SymbolIdentifier").map(|id| text(id).to_string())
 }
 
+/// The qualifier preceding the final user-type name, if present.
+fn class_type_scope(dtype: &Value) -> Option<String> {
+    let qid = find_deep(dtype, "kQualifiedId")?;
+    let mut segments: Vec<String> = kids(qid)
+        .filter(|child| tag(child) == "kUnqualifiedId")
+        .filter_map(|child| find(child, "SymbolIdentifier"))
+        .map(|id| text(id).to_string())
+        .collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    segments.pop();
+    Some(segments.join("::"))
+}
+
 /// True if the data type is the SV `string` primitive.
 fn is_string_type(dtype: &Value) -> bool {
     find_deep(dtype, "kDataTypePrimitive")
@@ -492,11 +569,21 @@ fn lower_function(n: &Value) -> FuncDecl {
         ret_width,
         ret_class,
         class_scope,
+        dpi_name: None,
         is_void: is_task || is_void_return,
         is_virtual,
         params,
         body: Stmt::Block(stmts),
     }
+}
+
+fn lower_dpi_import(n: &Value) -> FuncDecl {
+    let prototype = find(n, "kFunctionPrototype")
+        .or_else(|| find(n, "kTaskPrototype"))
+        .expect("DPI import without a callable prototype");
+    let mut function = lower_function(prototype);
+    function.dpi_name = Some(function.name.clone());
+    function
 }
 
 fn lower_port_list(n: &Value) -> Vec<Param> {
@@ -514,6 +601,7 @@ fn lower_port_item(n: &Value) -> Param {
     let dtype = find(inner, "kDataType");
     let width = dtype.map(packed_width).unwrap_or(32);
     let class_name = dtype.and_then(class_type_name);
+    let type_scope = dtype.and_then(class_type_scope);
     let type_args = dtype.map(type_args_of).unwrap_or_default();
     let dir = if find_deep(n, "output").is_some() {
         PortDir::Output
@@ -529,14 +617,21 @@ fn lower_port_item(n: &Value) -> Param {
         .map(text)
         .unwrap_or_default()
         .to_string();
+    let default = find(n, "kTrailingAssign").and_then(|assign| {
+        find(assign, "kExpression")
+            .or_else(|| find(assign, "kClassNew"))
+            .map(lower_expr)
+    });
     Param {
         name,
         dir,
         width,
         class_name,
+        type_scope,
         type_args,
         coll: classify_coll(inner).or_else(|| classify_coll(n)),
         key_class_name: assoc_key_class_name(inner).or_else(|| assoc_key_class_name(n)),
+        default,
     }
 }
 
@@ -561,8 +656,7 @@ fn lower_class(n: &Value) -> ClassDecl {
     let mut methods = Vec::new();
     let mut constructor = None;
     let mut type_aliases = Vec::new();
-    let mut collection_aliases: Vec<(String, CollKind, Option<TypeRef>, Option<TypeRef>)> =
-        Vec::new();
+    let mut collection_aliases: Vec<CollectionAlias> = Vec::new();
     let mut consts: Vec<(String, LogicVec)> = Vec::new();
     if let Some(items) = find(n, "kClassItems") {
         for item in kids(items) {
@@ -576,19 +670,21 @@ fn lower_class(n: &Value) -> ClassDecl {
                         let Some(alias_name) = declaration.class_name.as_deref() else {
                             continue;
                         };
-                        let Some((_, kind, element, key)) = collection_aliases
+                        let Some(alias) = collection_aliases
                             .iter()
-                            .find(|(name, _, _, _)| name == alias_name)
+                            .find(|alias| alias.alias == alias_name)
                         else {
                             continue;
                         };
-                        declaration.coll = Some(*kind);
-                        declaration.class_name = element.as_ref().map(|ty| ty.name.clone());
-                        declaration.type_args = element
+                        declaration.coll = Some(alias.kind);
+                        declaration.class_name = alias.element.as_ref().map(|ty| ty.name.clone());
+                        declaration.type_scope = None;
+                        declaration.type_args = alias
+                            .element
                             .as_ref()
                             .map(|ty| ty.args.clone())
                             .unwrap_or_default();
-                        declaration.key_class_name = key.as_ref().map(|ty| ty.name.clone());
+                        declaration.key_class_name = alias.key.as_ref().map(|ty| ty.name.clone());
                     }
                     fields.extend(declarations);
                 }
@@ -625,6 +721,7 @@ fn lower_class(n: &Value) -> ClassDecl {
         methods,
         constructor,
         type_aliases,
+        collection_aliases,
         params,
         base_args,
         consts,
@@ -709,9 +806,7 @@ fn lower_class_typedef(n: &Value) -> Option<TypeAlias> {
 /// `typedef bit edges_t[uvm_phase]`. Fields declared with the alias must keep
 /// the collection kind; otherwise `edges_t m_predecessors` is mistaken for a
 /// class handle named `edges_t` during elaboration.
-fn lower_collection_typedef(
-    n: &Value,
-) -> Option<(String, CollKind, Option<TypeRef>, Option<TypeRef>)> {
+fn lower_collection_typedef(n: &Value) -> Option<CollectionAlias> {
     let alias = find(n, "SymbolIdentifier").map(text)?.to_string();
     let kind = classify_coll(n)?;
     let dtype = find(n, "kDataType")?;
@@ -720,7 +815,12 @@ fn lower_collection_typedef(
         args: type_args_of(dtype),
     });
     let key = assoc_key_class_name(n).map(TypeRef::simple);
-    Some((alias, kind, element, key))
+    Some(CollectionAlias {
+        alias,
+        kind,
+        element,
+        key,
+    })
 }
 
 /// `typedef struct {members...} Name;` -> a synthetic no-method, no-
@@ -764,8 +864,10 @@ fn lower_struct_typedef(n: &Value) -> Option<ClassDecl> {
             width: mdtype.map(packed_width).unwrap_or(1),
             signed: false,
             class_name: mdtype.and_then(class_type_name),
+            type_scope: mdtype.and_then(class_type_scope),
             type_args: mdtype.map(type_args_of).unwrap_or_default(),
             is_string: mdtype.map(is_string_type).unwrap_or(false),
+            is_event: mdtype.is_some_and(|value| find_deep(value, "event").is_some()),
             coll: None,
             key_class_name: None,
             is_static: false,
@@ -779,6 +881,7 @@ fn lower_struct_typedef(n: &Value) -> Option<ClassDecl> {
         methods: Vec::new(),
         constructor: None,
         type_aliases: Vec::new(),
+        collection_aliases: Vec::new(),
         params: Vec::new(),
         base_args: Vec::new(),
         consts: Vec::new(),
@@ -803,6 +906,7 @@ fn lower_constructor(n: &Value) -> FuncDecl {
         ret_width: 0,
         ret_class: None,
         class_scope: None,
+        dpi_name: None,
         is_void: true,
         is_virtual: false,
         params,
@@ -879,6 +983,52 @@ fn lower_stmt(n: &Value) -> Stmt {
             }
         }
         "kConditionalStatement" => lower_if(n),
+        "kCaseStatement" => lower_case(n),
+        "kBlockingEventTriggerStatement" => find(n, "kReference")
+            .map(lower_reference_chain)
+            .map(Stmt::Trigger)
+            .unwrap_or(Stmt::Null),
+        "kWaitStatement" => {
+            let cond = find(n, "kWaitHeader")
+                .and_then(|header| find_deep(header, "kExpression"))
+                .map(lower_expr)
+                .unwrap_or_else(|| Expr::Literal(LogicVec::zero(1)));
+            let body = find(n, "kWaitBody")
+                .and_then(|wait_body| kids(wait_body).next())
+                .map(lower_stmt)
+                .unwrap_or(Stmt::Null);
+            Stmt::Timed {
+                control: TimingControl::Wait(cond),
+                body: Box::new(body),
+            }
+        }
+        "kWhileLoopStatement" => {
+            let cond = find(n, "kExpression")
+                .map(lower_expr)
+                .unwrap_or_else(|| Expr::Literal(LogicVec::zero(1)));
+            let body = kids(n).last().map(lower_stmt).unwrap_or(Stmt::Null);
+            Stmt::While {
+                cond,
+                body: Box::new(body),
+            }
+        }
+        "kDoWhileLoopStatement" => {
+            let cond = find(n, "kExpression")
+                .map(lower_expr)
+                .unwrap_or_else(|| Expr::Literal(LogicVec::zero(1)));
+            let body = kids(n).nth(1).map(lower_stmt).unwrap_or(Stmt::Null);
+            Stmt::DoWhile {
+                cond,
+                body: Box::new(body),
+            }
+        }
+        "kForeverLoopStatement" => {
+            let body = kids(n).last().map(lower_stmt).unwrap_or(Stmt::Null);
+            Stmt::While {
+                cond: Expr::Literal(LogicVec::from_u64(1, 1)),
+                body: Box::new(body),
+            }
+        }
         "kForeachLoopStatement" => {
             let chain = find(n, "kReference")
                 .map(lower_reference_chain)
@@ -901,29 +1051,31 @@ fn lower_stmt(n: &Value) -> Stmt {
             }
         }
         "kSystemTFCall" => lower_sys_call(n),
-        "kJumpStatement" => {
-            if kids(n).next().map(tag) == Some("return") {
-                Stmt::Return(find(n, "kExpression").map(lower_expr))
-            } else {
-                Stmt::Null // break / continue — later
-            }
-        }
+        "kJumpStatement" => match kids(n).next().map(tag) {
+            Some("return") => Stmt::Return(find(n, "kExpression").map(lower_expr)),
+            Some("break") => Stmt::Break,
+            Some("continue") => Stmt::Continue,
+            _ => Stmt::Null,
+        },
         "kStatement" | "kStatementItem" => {
             // wrappers — descend to the inner statement
             kids(n).next().map(lower_stmt).unwrap_or(Stmt::Null)
         }
         "kParBlock" => {
-            // `fork branches join/join_any/join_none` (LRM 9.3.2). Children:
-            // [fork, kBlockItemStatementList (one kStatement/kSeqBlock per
-            // branch), join keyword leaf]. The join keyword is a leaf whose
-            // *tag* carries the keyword (empty text), like `fork` above.
+            // Fork-block declarations initialize before any child process
+            // starts and are then visible to every branch (LRM 9.3.2).
+            let mut setup = Vec::new();
             let mut branches = Vec::new();
             let mut join = ForkJoin::All;
             for c in kids(n) {
                 match tag(c) {
                     "kBlockItemStatementList" => {
                         for s in kids(c) {
-                            branches.push(lower_stmt(s));
+                            if tag(s) == "kDataDeclaration" {
+                                setup.push(lower_stmt(s));
+                            } else {
+                                branches.push(lower_stmt(s));
+                            }
                         }
                     }
                     "join_none" => join = ForkJoin::None,
@@ -932,7 +1084,13 @@ fn lower_stmt(n: &Value) -> Stmt {
                     _ => {}
                 }
             }
-            Stmt::Fork { branches, join }
+            let fork = Stmt::Fork { branches, join };
+            if setup.is_empty() {
+                fork
+            } else {
+                setup.push(fork);
+                Stmt::Block(setup)
+            }
         }
         _ => Stmt::Null,
     }
@@ -1102,6 +1260,43 @@ fn lower_if(n: &Value) -> Stmt {
         cond,
         then_branch: Box::new(then_branch),
         else_branch,
+    }
+}
+
+fn lower_case(n: &Value) -> Stmt {
+    let expr = find(n, "kParenGroup")
+        .and_then(|group| find(group, "kExpression"))
+        .map(lower_expr)
+        .unwrap_or_else(|| Expr::Literal(LogicVec::zero(32)));
+    let mut items = Vec::new();
+    let mut default = None;
+    if let Some(list) = find(n, "kCaseItemList") {
+        for item in kids(list) {
+            match tag(item) {
+                "kCaseItem" => {
+                    let values = find(item, "kExpressionList")
+                        .map(|expressions| {
+                            kids(expressions)
+                                .filter(|value| tag(value) == "kExpression")
+                                .map(lower_expr)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let body = kids(item).last().map(lower_stmt).unwrap_or(Stmt::Null);
+                    items.push((values, body));
+                }
+                "kDefaultItem" => {
+                    let body = kids(item).last().map(lower_stmt).unwrap_or(Stmt::Null);
+                    default = Some(Box::new(body));
+                }
+                _ => {}
+            }
+        }
+    }
+    Stmt::Case {
+        expr,
+        items,
+        default,
     }
 }
 
@@ -1478,9 +1673,24 @@ fn lower_local_root(root: &Value) -> Expr {
     Expr::Literal(LogicVec::zero(32))
 }
 
-/// Lower an array subscript into an `Index` expression. Slices and part-selects
-/// are approximated by the base value for now.
+/// Lower an array subscript, packed bit-select, or packed part-select.
 fn lower_dimension_subscript(base: Expr, dim: &Value) -> Expr {
+    if tag(dim) == "kDimensionRange" {
+        let mut bounds = kids(dim)
+            .filter(|child| tag(child) == "kExpression")
+            .map(lower_expr);
+        let left = bounds
+            .next()
+            .unwrap_or_else(|| Expr::Literal(LogicVec::zero(32)));
+        let right = bounds
+            .next()
+            .unwrap_or_else(|| Expr::Literal(LogicVec::zero(32)));
+        return Expr::PartSelect {
+            base: Box::new(base),
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
     if tag(dim) != "kDimensionScalar" {
         return base;
     }

@@ -24,6 +24,9 @@ pub struct ProcId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NetId(pub usize);
 
+/// Identity of an IEEE named `event` value.
+pub type EventId = u64;
+
 /// The kind of net activity a process is sensitive to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EdgeKind {
@@ -66,6 +69,14 @@ pub enum Wait {
     /// (where the process re-evaluates the condition). The process is woken
     /// only on real writes to these nets — never by delta polling.
     Cond(Vec<NetId>),
+    /// `wait(cond)` over class fields, statics, or collections. The process is
+    /// rechecked after a runtime mutation notification, never delta-polled.
+    RuntimeCond,
+    /// Resume in the NBA region so the process can apply a pending procedural
+    /// variable update before continuing past an expression event control.
+    Nba,
+    /// Suspend until the named event is triggered.
+    NamedEvent(EventId),
     /// `fork branches join*`: spawn each of `children` as an independent
     /// concurrent process. The scheduler (not this process) owns the process
     /// table, so spawning happens one level up — [`crate::Sim`] intercepts

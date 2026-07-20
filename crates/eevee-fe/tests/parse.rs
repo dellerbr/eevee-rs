@@ -175,6 +175,55 @@ fn nested_static_call_is_preserved_as_method_argument() {
 }
 
 #[test]
+fn package_parameter_constant_expressions_are_evaluated() {
+    let src = "package p;\n\
+      parameter int COPY = (1 << 0);\n\
+      parameter int RECORD = (1 << 6);\n\
+      parameter int COMBINED = (4 | 16);\n\
+    endpackage\n";
+    let file = parse_source(src).expect("verible parse");
+    let Item::Package(package) = &file.items[0] else {
+        panic!("expected package, got {:?}", file.items[0]);
+    };
+    let constants: std::collections::HashMap<_, _> = package
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::EnumConst { name, value } => Some((name.as_str(), value.to_u64())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(constants["COPY"], 1);
+    assert_eq!(constants["RECORD"], 64);
+    assert_eq!(constants["COMBINED"], 20);
+}
+
+#[test]
+fn implicit_enum_members_increment_from_zero() {
+    let src = "package p;\n\
+      typedef enum { IMP, NODE, TERMINAL, SCHEDULE, DOMAIN, GLOBAL } phase_type;\n\
+    endpackage\n";
+    let file = parse_source(src).expect("verible parse");
+    let Item::Package(package) = &file.items[0] else {
+        panic!("expected package, got {:?}", file.items[0]);
+    };
+    let constants: std::collections::HashMap<_, _> = package
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::EnumConst { name, value } => Some((name.as_str(), value.to_u64())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(constants["IMP"], 0);
+    assert_eq!(constants["NODE"], 1);
+    assert_eq!(constants["TERMINAL"], 2);
+    assert_eq!(constants["SCHEDULE"], 3);
+    assert_eq!(constants["DOMAIN"], 4);
+    assert_eq!(constants["GLOBAL"], 5);
+}
+
+#[test]
 fn class_field_preserves_collection_typedef_kind() {
     let src = "module top;\n\
             class Node;\n\

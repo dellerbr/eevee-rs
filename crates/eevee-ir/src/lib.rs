@@ -23,8 +23,8 @@ pub mod interp;
 pub mod value;
 
 pub use inst::{
-    ArgListId, ArgMode, ClassDef, ClassId, CodeAddr, CollOp, ConstId, FuncId, Inst, Label, Linkage,
-    NetListId, Program, ProgramBuilder, Reg,
+    ArgListId, ArgMode, ClassDef, ClassId, CodeAddr, CollOp, ConstId, DpiRegistry, FuncId, Inst,
+    Label, Linkage, NetListId, Program, ProgramBuilder, Reg,
 };
 pub use interp::{ExecBackend, Interp, IrProcess};
 pub use value::{AssocKey, ObjData, Value};

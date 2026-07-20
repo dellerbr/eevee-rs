@@ -72,3 +72,17 @@ fn funcname_return_form() {
     endmodule\n";
     assert_eq!(run_get(src, "r"), 81);
 }
+
+#[test]
+fn omitted_formal_uses_runtime_default_expression() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      function int add_default(int base, int increment = base + 2);\n\
+        return base + increment;\n\
+      endfunction\n\
+      initial begin\n\
+        r = add_default(20);\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(run_get(src, "r"), 42);
+}

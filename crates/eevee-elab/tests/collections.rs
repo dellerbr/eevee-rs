@@ -140,6 +140,79 @@ fn associative_array_distinguishes_object_handle_keys() {
 }
 
 #[test]
+fn associative_array_compound_updates_object_key() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Node;\n\
+      endclass\n\
+      initial begin\n\
+        Node node = new();\n\
+        int counts[Node];\n\
+        if (counts.exists(node)) counts[node] += 1;\n\
+        else counts[node] = 1;\n\
+        counts[node] += 2;\n\
+        r = counts[node];\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 3);
+}
+
+#[test]
+fn associative_array_field_assignment_copies_storage() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Node;\n\
+      endclass\n\
+      class Graph;\n\
+        bit edges[Node];\n\
+        function void add(Node node); edges[node] = 1; endfunction\n\
+        function void copy_from(Graph other); edges = other.edges; endfunction\n\
+        function void clear(); edges.delete(); endfunction\n\
+        function int has(Node node); return edges.exists(node); endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Node node = new();\n\
+        Graph source = new();\n\
+        Graph copy = new();\n\
+        source.add(node);\n\
+        copy.copy_from(source);\n\
+        copy.clear();\n\
+        r = source.has(node);\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 1);
+}
+
+#[test]
+fn class_field_assoc_count_uses_base_handle_key() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Base;\n\
+      endclass\n\
+      class Derived extends Base;\n\
+      endclass\n\
+      class Counter;\n\
+        int counts[Base];\n\
+        function void raise_count(Base obj);\n\
+          if (counts.exists(obj)) counts[obj] += 1;\n\
+          else counts[obj] = 1;\n\
+        endfunction\n\
+        function int get_total(Base obj);\n\
+          if (!counts.exists(obj)) return 0;\n\
+          return counts[obj];\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Derived obj = new();\n\
+        Counter counter = new();\n\
+        counter.raise_count(obj);\n\
+        r = counter.get_total(obj);\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 1);
+}
+
+#[test]
 fn foreach_iterates_object_handle_keys() {
     let src = "module top;\n\
       logic [31:0] r = 0;\n\
@@ -194,6 +267,35 @@ fn foreach_iterates_collection_formal() {
         items.push_back(first);\n\
         items.push_back(second);\n\
         r = summer.total(items);\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 42);
+}
+
+#[test]
+fn foreach_iterates_class_scoped_collection_typedef() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Node;\n\
+        typedef bit edges_t[Node];\n\
+        int value;\n\
+        function int get(); return value; endfunction\n\
+      endclass\n\
+      class Graph;\n\
+        function int total();\n\
+          Node first = new();\n\
+          Node second = new();\n\
+          Node::edges_t edges;\n\
+          first.value = 20;\n\
+          second.value = 22;\n\
+          edges[first] = 1;\n\
+          edges[second] = 1;\n\
+          foreach (edges[node]) total = total + node.get();\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Graph graph = new();\n\
+        r = graph.total();\n\
       end\n\
     endmodule\n";
     assert_eq!(net(&run(src), "r"), 42);

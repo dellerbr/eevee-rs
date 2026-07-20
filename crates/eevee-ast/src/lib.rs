@@ -27,9 +27,9 @@ pub enum Item {
     Module(Module),
     Package(Package),
     /// A class declared at compilation-unit scope (outside any package/module).
-    Class(ClassDecl),
+    Class(Box<ClassDecl>),
     /// A function/task declared at compilation-unit scope.
-    Func(FuncDecl),
+    Func(Box<FuncDecl>),
     // Interface, ... (later)
 }
 
@@ -74,7 +74,7 @@ pub enum ModuleItem {
     Always(AlwaysBlock),
     Initial(Stmt),
     Func(FuncDecl),
-    Class(ClassDecl),
+    Class(Box<ClassDecl>),
     /// A named enum member, lowered to a compile-time constant
     /// (`enum {UVM_LOW, ...}` -> `UVM_LOW = 0`, ...).
     EnumConst {
@@ -121,11 +121,16 @@ pub struct VarDecl {
     /// For a collection, this is the *element* class (if the elements are
     /// class handles).
     pub class_name: Option<String>,
+    /// Qualifying scope of a user type, e.g. `uvm_phase` in
+    /// `uvm_phase::edges_t`. Kept separately so class names stay normalized.
+    pub type_scope: Option<String>,
     /// Actual `#(...)` type arguments of a parameterized type, e.g. the
     /// `string, my_obj` in `uvm_pool#(string, my_obj) p;`.
     pub type_args: Vec<TypeRef>,
     /// True for a `string`-typed variable.
     pub is_string: bool,
+    /// True for an IEEE named `event` variable.
+    pub is_event: bool,
     /// `Some(kind)` if this is a queue / dynamic array / associative array.
     pub coll: Option<CollKind>,
     /// Class type used as an associative-array key, if any (`value[Key]`).
@@ -155,6 +160,8 @@ pub struct ClassDecl {
     /// Class-scoped `typedef <Class> <alias>;` aliases (notably the factory
     /// `type_id`). The target carries any `#(...)` args for monomorphization.
     pub type_aliases: Vec<TypeAlias>,
+    /// Class-scoped aliases for unpacked collection types.
+    pub collection_aliases: Vec<CollectionAlias>,
     /// Formal parameters of a parameterized class `class C #(type T=int, ...)`.
     pub params: Vec<ParamDecl>,
     /// Actual `#(...)` arguments on the `extends Base#(args)` clause.
@@ -177,6 +184,18 @@ pub struct TypeAlias {
     pub target: TypeRef,
 }
 
+/// A class-scoped unpacked collection typedef such as
+/// `typedef bit edges_t[uvm_phase];`.
+#[derive(Debug, Clone)]
+pub struct CollectionAlias {
+    pub alias: String,
+    pub kind: CollKind,
+    /// Class-handle element type, if the collection stores handles.
+    pub element: Option<TypeRef>,
+    /// Class-handle associative key type, if any.
+    pub key: Option<TypeRef>,
+}
+
 /// A formal parameter of a parameterized class.
 #[derive(Debug, Clone)]
 pub struct ParamDecl {
@@ -197,6 +216,8 @@ pub struct FuncDecl {
     pub ret_class: Option<String>,
     /// `Some(class)` for an out-of-body (`extern`) definition `Class::method`.
     pub class_scope: Option<String>,
+    /// Foreign symbol for an imported DPI-C callable.
+    pub dpi_name: Option<String>,
     pub is_void: bool,
     pub is_virtual: bool,
     pub params: Vec<Param>,
@@ -211,6 +232,8 @@ pub struct Param {
     pub width: u32,
     /// `Some(class)` if the parameter is a class handle.
     pub class_name: Option<String>,
+    /// Qualifying scope of a user type, if explicitly scoped.
+    pub type_scope: Option<String>,
     /// Type arguments of a parameterized parameter type (e.g. `#(uvm_callback)`
     /// in `uvm_queue #(uvm_callback) q`). Consumed by mono; empty after that.
     pub type_args: Vec<TypeRef>,
@@ -218,6 +241,8 @@ pub struct Param {
     pub coll: Option<CollKind>,
     /// Class type used as an associative-array key, if any.
     pub key_class_name: Option<String>,
+    /// Expression evaluated when the caller omits this argument.
+    pub default: Option<Expr>,
 }
 
 /// Which flavor of `always` block.
@@ -263,6 +288,16 @@ pub enum Stmt {
         then_branch: Box<Stmt>,
         else_branch: Option<Box<Stmt>>,
     },
+    /// `while (cond) body`.
+    While { cond: Expr, body: Box<Stmt> },
+    /// `do body while (cond)`.
+    DoWhile { cond: Expr, body: Box<Stmt> },
+    /// `case (expr) ... endcase`. Each item can have multiple match values.
+    Case {
+        expr: Expr,
+        items: Vec<(Vec<Expr>, Stmt)>,
+        default: Option<Box<Stmt>>,
+    },
     /// `foreach (collection[index]) body`.
     Foreach {
         collection: Expr,
@@ -273,8 +308,14 @@ pub enum Stmt {
     SysCall { name: String, args: Vec<Expr> },
     /// An expression evaluated for its side effects (e.g. a void method call).
     Expr(Expr),
+    /// Blocking named-event trigger `-> event_expr`.
+    Trigger(Expr),
     /// `return [expr];`
     Return(Option<Expr>),
+    /// Exit the nearest enclosing loop.
+    Break,
+    /// Start the next iteration of the nearest enclosing loop.
+    Continue,
     /// `fork branches join/join_any/join_none` — each branch runs as its own
     /// concurrent process.
     Fork { branches: Vec<Stmt>, join: ForkJoin },
@@ -374,12 +415,17 @@ pub enum Expr {
     StaticRef { class_name: String, field: String },
     /// Index / element access `base[index]` (queue/array element or assoc key).
     Index { base: Box<Expr>, index: Box<Expr> },
+    /// Packed part-select `base[left:right]`.
+    PartSelect {
+        base: Box<Expr>,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// `new(args...)` — allocate an object (class inferred from context).
     New { args: Vec<Expr> },
     /// The `null` class-handle literal.
     Null,
-    /// A concatenation `{a, b, c}` (string concatenation for the report path;
-    /// bit concatenation is a later refinement).
+    /// A packed or string concatenation `{a, b, c}`.
     Concat(Vec<Expr>),
     /// A system function call in expression position, e.g. `$sformatf(...)`,
     /// `$realtime`, `$cast(...)`, `$time`.

@@ -38,7 +38,13 @@ struct Frame {
     ret_dst: Reg,
     /// Copy-out mappings owned by this frame: `(formal, caller actual)`.
     copy_out: Vec<(usize, Reg)>,
+    /// Number of leading formal registers supplied by the caller.
+    provided_args: usize,
+    /// Procedural-variable updates queued by this activation for NBA.
+    pending_nba: Vec<(Reg, Value)>,
 }
+
+type ForkChild = (Rc<Program>, Vec<(Reg, Value)>);
 
 /// What running one frame to its next transition produced.
 enum Step {
@@ -55,11 +61,10 @@ enum Step {
     /// Pop the current frame, delivering `Some(value)` to the caller's
     /// `ret_dst` (or nothing for a void return).
     Return(Option<Value>),
-    /// `fork`: spawn `children` (branch program + whether it wants `this`
-    /// seeded into its register 0) as independent processes, per `join`.
+    /// `fork`: spawn branch programs with their captured register values as
+    /// independent processes, per `join`.
     Fork {
-        children: Vec<(Rc<Program>, bool)>,
-        this_val: Value,
+        children: Vec<ForkChild>,
         join: ForkJoin,
     },
 }
@@ -79,6 +84,12 @@ pub struct IrProcess {
     ret_dst: Reg,
     /// Output/inout/ref formals copied back when the current frame returns.
     copy_out: Vec<(usize, Reg)>,
+    /// Number of leading formal registers supplied by the caller.
+    provided_args: usize,
+    /// Procedural-variable updates queued by the current activation for NBA.
+    pending_nba: Vec<(Reg, Value)>,
+    /// Apply `pending_nba` before executing the next instruction.
+    apply_pending_nba: bool,
     /// Suspended caller frames — empty unless inside a call.
     callers: Vec<Frame>,
     /// The design's shared linkage (functions + classes), indexed by
@@ -97,6 +108,9 @@ impl IrProcess {
             regs,
             ret_dst: 0,
             copy_out: Vec::new(),
+            provided_args: 0,
+            pending_nba: Vec::new(),
+            apply_pending_nba: false,
             callers: Vec::new(),
             linkage,
         }
@@ -106,9 +120,28 @@ impl IrProcess {
     /// runtime fault and prints an SV-level call stack ([`Self::sv_backtrace`])
     /// before letting the panic propagate.
     fn run(&mut self, k: &mut Kernel) -> Wait {
+        if std::mem::take(&mut self.apply_pending_nba) {
+            for (dst, value) in self.pending_nba.drain(..) {
+                self.regs[dst as usize] = value;
+            }
+            k.notify_runtime_change();
+        }
         loop {
-            match run_frame(&self.prog, &mut self.pc, &mut self.regs, &self.linkage, k) {
-                Step::Wait(w) => return w,
+            match run_frame(
+                &self.prog,
+                &mut self.pc,
+                &mut self.regs,
+                self.provided_args,
+                &mut self.pending_nba,
+                &self.linkage,
+                k,
+            ) {
+                Step::Wait(w) => {
+                    if matches!(w, Wait::Nba) {
+                        self.apply_pending_nba = true;
+                    }
+                    return w;
+                }
                 Step::Call {
                     func,
                     vals,
@@ -116,6 +149,7 @@ impl IrProcess {
                     ret_dst,
                 } => {
                     let callee = self.linkage.funcs[func as usize].clone();
+                    let provided_args = vals.len();
                     if trace_on() {
                         let a0 = vals.first().map(vsum).unwrap_or_default();
                         eprintln!(
@@ -149,6 +183,8 @@ impl IrProcess {
                         regs: std::mem::replace(&mut self.regs, regs),
                         ret_dst: std::mem::replace(&mut self.ret_dst, ret_dst),
                         copy_out: std::mem::replace(&mut self.copy_out, copy_out),
+                        provided_args: std::mem::replace(&mut self.provided_args, provided_args),
+                        pending_nba: std::mem::take(&mut self.pending_nba),
                     };
                     self.callers.push(prev);
                 }
@@ -175,22 +211,20 @@ impl IrProcess {
                             self.regs = caller.regs;
                             self.ret_dst = caller.ret_dst;
                             self.copy_out = caller.copy_out;
+                            self.provided_args = caller.provided_args;
+                            self.pending_nba = caller.pending_nba;
                         }
                         // Returned past the bottom frame — the process is done.
                         None => return Wait::Finished,
                     }
                 }
-                Step::Fork {
-                    children,
-                    this_val,
-                    join,
-                } => {
+                Step::Fork { children, join } => {
                     let children: Vec<Box<dyn Process>> = children
                         .into_iter()
-                        .map(|(prog, wants_this)| {
+                        .map(|(prog, captures)| {
                             let mut p = IrProcess::new(prog, self.linkage.clone());
-                            if wants_this {
-                                p.regs[0] = this_val.clone();
+                            for (child_reg, value) in captures {
+                                p.regs[child_reg as usize] = value;
                             }
                             Box::new(p) as Box<dyn Process>
                         })
@@ -257,6 +291,12 @@ fn trace_on() -> bool {
     *ON.get_or_init(|| std::env::var("EEVEE_TRACE").is_ok())
 }
 
+fn cast_trace_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EEVEE_TRACE_CAST").is_ok())
+}
+
 /// One-line summary of a value for traces.
 fn vsum(v: &Value) -> String {
     match v {
@@ -267,6 +307,7 @@ fn vsum(v: &Value) -> String {
         Value::Real(r) => r.to_string(),
         Value::Queue(rc) => format!("queue[{}]", rc.borrow().len()),
         Value::Assoc(rc) => format!("assoc[{}]", rc.borrow().len()),
+        Value::Event(id) => format!("event#{id}"),
     }
 }
 
@@ -290,7 +331,27 @@ fn new_instance(class: crate::inst::ClassId, linkage: &Linkage) -> Value {
     for &(slot, struct_cid) in def.struct_fields.iter() {
         fields[slot as usize] = new_instance(struct_cid, linkage);
     }
+    for &slot in def.event_fields.iter() {
+        fields[slot as usize] = Value::new_event();
+    }
     Value::Obj(Rc::new(RefCell::new(ObjData { class, fields })))
+}
+
+fn class_is_a(
+    mut actual: crate::inst::ClassId,
+    target: crate::inst::ClassId,
+    linkage: &Linkage,
+) -> bool {
+    for _ in 0..linkage.classes.len() {
+        if actual == target {
+            return true;
+        }
+        let Some(base) = linkage.classes[actual as usize].base else {
+            return false;
+        };
+        actual = base;
+    }
+    false
 }
 
 /// Run one frame from `*pc` until it transitions (suspends, calls, or returns),
@@ -299,6 +360,8 @@ fn run_frame(
     prog: &Program,
     pc: &mut usize,
     regs: &mut [Value],
+    provided_args: usize,
+    pending_nba: &mut Vec<(Reg, Value)>,
     linkage: &Linkage,
     k: &mut Kernel,
 ) -> Step {
@@ -314,6 +377,20 @@ fn run_frame(
             }
             Inst::Mov { dst, src } => {
                 regs[dst as usize] = regs[src as usize].clone();
+            }
+            Inst::Assign { dst, src } => {
+                regs[dst as usize] = regs[src as usize].assignment_copy();
+            }
+            Inst::NbaAssign { dst, src } => {
+                let value = regs[src as usize].assignment_copy();
+                if let Some((_, pending)) = pending_nba
+                    .iter_mut()
+                    .find(|(pending_dst, _)| *pending_dst == dst)
+                {
+                    *pending = value;
+                } else {
+                    pending_nba.push((dst, value));
+                }
             }
             Inst::NetRead { dst, net } => {
                 regs[dst as usize] = Value::Logic(k.net_value(net).clone());
@@ -427,6 +504,17 @@ fn run_frame(
             Inst::WaitCond { nets } => {
                 return Step::Wait(Wait::Cond(prog.netlists[nets as usize].to_vec()));
             }
+            Inst::WaitRuntime => return Step::Wait(Wait::RuntimeCond),
+            Inst::WaitChange { value } => {
+                if pending_nba.iter().any(|(dst, _)| *dst == value) {
+                    return Step::Wait(Wait::Nba);
+                }
+                return Step::Wait(Wait::RuntimeCond);
+            }
+            Inst::WaitEvent { event } => match regs[event as usize] {
+                Value::Event(id) => return Step::Wait(Wait::NamedEvent(id)),
+                ref value => panic!("event control on non-event value {value:?}"),
+            },
             Inst::Jump { target } => *pc = target as usize,
             Inst::BranchFalse { cond, target } => {
                 let c = &regs[cond as usize];
@@ -442,6 +530,11 @@ fn run_frame(
                     *pc = target as usize;
                 }
             }
+            Inst::BranchArgProvided { arg, target } => {
+                if (arg as usize) < provided_args {
+                    *pc = target as usize;
+                }
+            }
             Inst::Display { fmt, args } => {
                 let f = match &prog.consts[fmt as usize] {
                     Value::Str(s) => s.clone(),
@@ -449,6 +542,22 @@ fn run_frame(
                 };
                 let line = format_display(&f, &prog.arglists[args as usize], regs);
                 k.display(line);
+            }
+            Inst::DpiCall { dst, name, args } => {
+                let name = match &prog.consts[name as usize] {
+                    Value::Str(name) => name.clone(),
+                    value => panic!("DPI symbol name is not a string: {value:?}"),
+                };
+                let arg_regs = &prog.arglists[args as usize];
+                let mut values: Vec<Value> = arg_regs
+                    .iter()
+                    .map(|arg| regs[*arg as usize].clone())
+                    .collect();
+                let result = linkage.dpi.call(&name, &mut values);
+                for (arg, value) in arg_regs.iter().zip(values) {
+                    regs[*arg as usize] = value;
+                }
+                regs[dst as usize] = result;
             }
             Inst::Call { func, args, ret } => {
                 let arglist = &prog.arglists[args as usize];
@@ -491,6 +600,43 @@ fn run_frame(
             Inst::New { dst, class } => {
                 regs[dst as usize] = new_instance(class, linkage);
             }
+            Inst::NewEvent { dst } => {
+                regs[dst as usize] = Value::new_event();
+            }
+            Inst::TriggerEvent { event } => match regs[event as usize] {
+                Value::Event(id) => k.trigger_event(id),
+                ref value => panic!("event trigger on non-event value {value:?}"),
+            },
+            Inst::ClassCast { dst, src, class } => {
+                let actual = match &regs[src as usize] {
+                    Value::Obj(obj) => Some(obj.borrow().class),
+                    _ => None,
+                };
+                let succeeds = match actual {
+                    None => matches!(regs[src as usize], Value::Null),
+                    Some(actual) => class_is_a(actual, class, linkage),
+                };
+                if cast_trace_on() {
+                    let actual_name = actual
+                        .map(|id| linkage.classes[id as usize].name.as_str())
+                        .unwrap_or("<non-object>");
+                    let fields = match &regs[src as usize] {
+                        Value::Obj(obj) => obj
+                            .borrow()
+                            .fields
+                            .iter()
+                            .map(vsum)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        _ => String::new(),
+                    };
+                    eprintln!(
+                        "class cast {actual_name} -> {}: {succeeds}; fields=[{fields}]",
+                        linkage.classes[class as usize].name,
+                    );
+                }
+                regs[dst as usize] = Value::Logic(LogicVec::from_u64(succeeds as u64, 1));
+            }
             Inst::GetField { dst, obj, slot } => {
                 let v = match &regs[obj as usize] {
                     Value::Obj(rc) => rc.borrow().fields[slot as usize].clone(),
@@ -499,9 +645,10 @@ fn run_frame(
                 regs[dst as usize] = v;
             }
             Inst::SetField { obj, slot, src } => {
-                let v = regs[src as usize].clone();
+                let v = regs[src as usize].assignment_copy();
                 if let Value::Obj(rc) = &regs[obj as usize] {
                     rc.borrow_mut().fields[slot as usize] = v;
+                    k.notify_runtime_change();
                 }
             }
             Inst::StaticGet { dst, id } => {
@@ -512,11 +659,12 @@ fn run_frame(
                 regs[dst as usize] = v;
             }
             Inst::StaticSet { id, src } => {
-                let v = regs[src as usize].clone();
+                let v = regs[src as usize].assignment_copy();
                 if trace_on() {
                     eprintln!("      sset static#{id} <- {} [{}]", vsum(&v), prog.label);
                 }
                 *linkage.statics[id as usize].borrow_mut() = v;
+                k.notify_runtime_change();
             }
             Inst::NewQueue { dst } => {
                 regs[dst as usize] = Value::new_queue();
@@ -526,6 +674,10 @@ fn run_frame(
             }
             Inst::IndexGet { dst, base, idx } => {
                 let v = match &regs[base as usize] {
+                    Value::Logic(value) => {
+                        let i = regs[idx as usize].as_logic().to_u64() as u32;
+                        Value::Logic(LogicVec::from_bit(value.get_bit(i)))
+                    }
                     Value::Queue(rc) => {
                         let i = regs[idx as usize].as_logic().to_u64() as usize;
                         rc.borrow().get(i).cloned().unwrap_or(Value::Null)
@@ -538,22 +690,55 @@ fn run_frame(
                 };
                 regs[dst as usize] = v;
             }
+            Inst::PartSelect {
+                dst,
+                base,
+                left,
+                right,
+            } => {
+                let value = regs[base as usize].as_logic();
+                let left = regs[left as usize].as_logic().to_u64() as u32;
+                let right = regs[right as usize].as_logic().to_u64() as u32;
+                let selected = if left >= right {
+                    value.slice(left, right)
+                } else {
+                    let width = right - left + 1;
+                    let mut selected = LogicVec::zero(width);
+                    for offset in 0..width {
+                        selected.set_bit(offset, value.get_bit(right - offset));
+                    }
+                    selected
+                };
+                regs[dst as usize] = Value::Logic(selected);
+            }
             Inst::IndexSet { base, idx, src } => {
-                let v = regs[src as usize].clone();
-                match &regs[base as usize] {
+                let v = regs[src as usize].assignment_copy();
+                let key = value_to_key(&regs[idx as usize]);
+                let i = match &key {
+                    AssocKey::Int(value) => *value as usize,
+                    _ => 0,
+                };
+                let changed = match &mut regs[base as usize] {
+                    Value::Logic(value) => {
+                        value.set_bit(i as u32, v.as_logic().get_bit(0));
+                        true
+                    }
                     Value::Queue(rc) => {
-                        let i = regs[idx as usize].as_logic().to_u64() as usize;
                         let mut q = rc.borrow_mut();
                         if i >= q.len() {
                             q.resize(i + 1, Value::Null);
                         }
                         q[i] = v;
+                        true
                     }
                     Value::Assoc(rc) => {
-                        let key = value_to_key(&regs[idx as usize]);
                         rc.borrow_mut().insert(key, v);
+                        true
                     }
-                    _ => {}
+                    _ => false,
+                };
+                if changed {
+                    k.notify_runtime_change();
                 }
             }
             Inst::CollMethod {
@@ -566,14 +751,37 @@ fn run_frame(
                 let base_value = regs[base as usize].clone();
                 let result = eval_coll_method(&base_value, op, arglist, regs);
                 regs[dst as usize] = result;
-            }
-            Inst::ConcatStr { dst, args } => {
-                let arglist = &prog.arglists[args as usize];
-                let mut s = String::new();
-                for r in arglist.iter() {
-                    s.push_str(&value_to_str(&regs[*r as usize]));
+                if matches!(
+                    op,
+                    CollOp::PushBack
+                        | CollOp::PushFront
+                        | CollOp::PopBack
+                        | CollOp::PopFront
+                        | CollOp::Insert
+                        | CollOp::Delete
+                ) {
+                    k.notify_runtime_change();
                 }
-                regs[dst as usize] = Value::Str(Rc::from(s.as_str()));
+            }
+            Inst::Concat { dst, args } => {
+                let arglist = &prog.arglists[args as usize];
+                if arglist
+                    .iter()
+                    .any(|reg| matches!(regs[*reg as usize], Value::Str(_)))
+                {
+                    let mut s = String::new();
+                    for r in arglist.iter() {
+                        s.push_str(&value_to_str(&regs[*r as usize]));
+                    }
+                    regs[dst as usize] = Value::Str(Rc::from(s.as_str()));
+                } else {
+                    let mut values = arglist.iter().map(|reg| regs[*reg as usize].as_logic());
+                    let value = match values.next() {
+                        Some(first) => values.fold(first.clone(), |value, part| value.concat(part)),
+                        None => LogicVec::zero(1),
+                    };
+                    regs[dst as usize] = Value::Logic(value);
+                }
             }
             Inst::SimTime { dst } => {
                 let t = k.time().0;
@@ -647,25 +855,17 @@ fn run_frame(
             }
             Inst::Finish => return Step::Wait(Wait::Finished),
             Inst::Fork { group, join } => {
-                // `this` (reg 0, by the reg0-is-this convention `gen_callable`
-                // establishes for every method) is captured now and seeded
-                // into any branch that was compiled in the same class
-                // context, so a forked method call sees the same object.
-                let this_val = regs.first().cloned().unwrap_or(Value::Null);
-                let children: Vec<(Rc<Program>, bool)> = prog.fork_groups[group as usize]
+                let children: Vec<ForkChild> = prog.fork_groups[group as usize]
                     .iter()
                     .map(|&i| {
-                        (
-                            prog.forks[i as usize].clone(),
-                            prog.forks_want_this[i as usize],
-                        )
+                        let captures = prog.fork_captures[i as usize]
+                            .iter()
+                            .map(|&(child, parent)| (child, regs[parent as usize].clone()))
+                            .collect();
+                        (prog.forks[i as usize].clone(), captures)
                     })
                     .collect();
-                return Step::Fork {
-                    children,
-                    this_val,
-                    join,
-                };
+                return Step::Fork { children, join };
             }
         }
     }
@@ -755,7 +955,7 @@ fn value_to_str(v: &Value) -> String {
 fn value_truthy(v: &Value) -> bool {
     match v {
         Value::Logic(l) => l.is_true(),
-        Value::Obj(_) | Value::Queue(_) | Value::Assoc(_) => true,
+        Value::Obj(_) | Value::Queue(_) | Value::Assoc(_) | Value::Event(_) => true,
         Value::Null => false,
         Value::Str(s) => !s.is_empty(),
         Value::Real(r) => *r != 0.0,
@@ -774,8 +974,11 @@ fn eval_eq(a: &Value, b: &Value) -> LogicVec {
         (Value::Queue(x), Value::Queue(y)) => one(Rc::ptr_eq(x, y)),
         (Value::Assoc(x), Value::Assoc(y)) => one(Rc::ptr_eq(x, y)),
         (Value::Str(x), Value::Str(y)) => one(x == y),
-        (Value::Obj(_) | Value::Queue(_) | Value::Assoc(_), Value::Null)
-        | (Value::Null, Value::Obj(_) | Value::Queue(_) | Value::Assoc(_)) => one(false),
+        (Value::Event(x), Value::Event(y)) => one(x == y),
+        (Value::Obj(_) | Value::Queue(_) | Value::Assoc(_) | Value::Event(_), Value::Null)
+        | (Value::Null, Value::Obj(_) | Value::Queue(_) | Value::Assoc(_) | Value::Event(_)) => {
+            one(false)
+        }
         _ => one(false),
     }
 }
@@ -788,7 +991,7 @@ fn value_to_key(v: &Value) -> AssocKey {
         Value::Obj(obj) => AssocKey::Obj(obj.clone()),
         Value::Null => AssocKey::Null,
         Value::Real(value) => AssocKey::Int(*value as i64),
-        Value::Queue(_) | Value::Assoc(_) => AssocKey::Null,
+        Value::Queue(_) | Value::Assoc(_) | Value::Event(_) => AssocKey::Null,
     }
 }
 

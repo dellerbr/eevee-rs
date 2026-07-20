@@ -148,6 +148,48 @@ fn inheritance_super_and_virtual_dispatch() {
 }
 
 #[test]
+fn inherited_virtual_method_stays_virtual_when_overridden() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Base;\n\
+        virtual function int val();\n\
+          return 1;\n\
+        endfunction\n\
+      endclass\n\
+      class Derived extends Base;\n\
+        function int val();\n\
+          return 2;\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Base value;\n\
+        Derived derived = new();\n\
+        value = derived;\n\
+        r = value.val();\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 2);
+}
+
+#[test]
+fn class_property_initializer_runs_before_constructor() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Counter;\n\
+        int value = 41;\n\
+        function new();\n\
+          value++;\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Counter counter = new();\n\
+        r = counter.value;\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 42);
+}
+
+#[test]
 fn base_handle_calls_base_when_not_overridden_instance() {
     // A genuine Base instance dispatches to Base::val.
     let src = "module top;\n\
@@ -173,6 +215,79 @@ fn base_handle_calls_base_when_not_overridden_instance() {
       end\n\
     endmodule\n";
     assert_eq!(net(&run(src), "r"), 7);
+}
+
+#[test]
+fn class_cast_checks_runtime_inheritance() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Object;\n\
+      endclass\n\
+      class Component extends Object;\n\
+      endclass\n\
+      class Phase extends Object;\n\
+      endclass\n\
+      initial begin\n\
+        Object obj;\n\
+        Component comp = new();\n\
+        Phase phase = new();\n\
+        obj = comp;\n\
+        if ($cast(comp, obj)) r = r | 1;\n\
+        obj = phase;\n\
+        if (!$cast(comp, obj)) r = r | 2;\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 3);
+}
+
+#[test]
+fn method_defaults_distinguish_omitted_and_explicit_arguments() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Object;\n\
+      endclass\n\
+      class Checker;\n\
+        function int check(Object obj = null, int value = 40);\n\
+          if (obj == null) return value + 2;\n\
+          return value;\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Object obj = new();\n\
+        Checker probe = new();\n\
+        r = probe.check() + probe.check(obj, 5);\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 47);
+}
+
+#[test]
+fn while_walks_object_chain_until_field_matches() {
+    let src = "module top;\n\
+      logic [31:0] r = 0;\n\
+      class Node;\n\
+        int kind;\n\
+        Node parent;\n\
+        function new(int value, Node up);\n\
+          kind = value;\n\
+          parent = up;\n\
+        endfunction\n\
+        function int find_kind(int wanted);\n\
+          Node node = this;\n\
+          while (node != null && node.kind != wanted) begin\n\
+            node = node.parent;\n\
+          end\n\
+          if (node == null) return 0;\n\
+          return node.kind;\n\
+        endfunction\n\
+      endclass\n\
+      initial begin\n\
+        Node root = new(4, null);\n\
+        Node leaf = new(1, root);\n\
+        r = leaf.find_kind(4);\n\
+      end\n\
+    endmodule\n";
+    assert_eq!(net(&run(src), "r"), 4);
 }
 
 #[test]

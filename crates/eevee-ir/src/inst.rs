@@ -18,7 +18,8 @@
 //! suspension points: the interpreter returns the matching
 //! [`eevee_sched::Wait`] with the PC saved just past them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use eevee_core::LogicVec;
@@ -66,6 +67,10 @@ pub enum Inst {
     LoadConst { dst: Reg, k: ConstId },
     /// `dst = src`.
     Mov { dst: Reg, src: Reg },
+    /// `dst = src` at an SV assignment boundary (arrays copy by value).
+    Assign { dst: Reg, src: Reg },
+    /// Queue `dst <= src` for the procedural-variable NBA region.
+    NbaAssign { dst: Reg, src: Reg },
 
     /// `dst = <value of net>` (read the net's current value).
     NetRead { dst: Reg, net: NetId },
@@ -131,6 +136,14 @@ pub enum Inst {
     /// The producing code re-evaluates the condition after the wakeup (a
     /// backward branch), so this is event-driven, never polled.
     WaitCond { nets: NetListId },
+    /// Suspend until runtime state changes, then re-evaluate a previously
+    /// emitted `wait(cond)` condition. Used for class fields, statics, and
+    /// collections whose mutation sources are not kernel nets.
+    WaitRuntime,
+    /// `@(value)` for a non-net expression.
+    WaitChange { value: Reg },
+    /// Suspend until the named-event value in `event` is triggered.
+    WaitEvent { event: Reg },
 
     // --- control flow ---
     /// Unconditional jump.
@@ -139,10 +152,20 @@ pub enum Inst {
     BranchFalse { cond: Reg, target: CodeAddr },
     /// Jump if `cond` is truthy.
     BranchTrue { cond: Reg, target: CodeAddr },
+    /// Jump when the caller supplied formal register `arg`. This lets a
+    /// callable evaluate a default expression only for an omitted argument;
+    /// an explicitly supplied `null` remains distinguishable from omission.
+    BranchArgProvided { arg: Reg, target: CodeAddr },
 
     /// `$display(fmt, args...)`: format `consts[fmt]` (a string) with the
     /// register values in `arglists[args]` and emit a line to the kernel.
     Display { fmt: ConstId, args: ArgListId },
+    /// Call an imported DPI-C host function named by `consts[name]`.
+    DpiCall {
+        dst: Reg,
+        name: ConstId,
+        args: ArgListId,
+    },
 
     /// Call function `func` (an index into the process's function table) with
     /// the register values in `arglists[args]`, placing the returned value
@@ -168,6 +191,14 @@ pub enum Inst {
     /// Allocate a class instance of `class` (fields default-initialized) and
     /// store the handle in `dst`.
     New { dst: Reg, class: ClassId },
+    /// Allocate a fresh IEEE named-event identity.
+    NewEvent { dst: Reg },
+    /// Trigger the named event held in `event`.
+    TriggerEvent { event: Reg },
+    /// `dst = $cast(<target class>, src)`: report whether `src` is null or its
+    /// runtime class derives from `class`. Destination assignment is emitted
+    /// separately so a failed cast leaves the original handle unchanged.
+    ClassCast { dst: Reg, src: Reg, class: ClassId },
     /// `dst = obj.fields[slot]` (object field read).
     GetField { dst: Reg, obj: Reg, slot: u32 },
     /// `obj.fields[slot] = src` (object field write).
@@ -183,8 +214,15 @@ pub enum Inst {
     /// `dst = ` a fresh empty associative array.
     NewAssoc { dst: Reg },
     /// `dst = base[idx]` — element read of a queue/array (int index) or an
-    /// associative array (int/string key).
+    /// associative array (int/string key), or a packed bit-select.
     IndexGet { dst: Reg, base: Reg, idx: Reg },
+    /// `dst = base[left:right]` — packed part-select.
+    PartSelect {
+        dst: Reg,
+        base: Reg,
+        left: Reg,
+        right: Reg,
+    },
     /// `base[idx] = src` — element write (auto-grows a queue/array).
     IndexSet { base: Reg, idx: Reg, src: Reg },
     /// A built-in queue/array/assoc method call (`push_back`, `size`,
@@ -196,9 +234,8 @@ pub enum Inst {
         args: ArgListId,
     },
 
-    /// `dst = {a, b, c}` — string concatenation of `arglists[args]` (each
-    /// operand stringified). The report path builds messages this way.
-    ConcatStr { dst: Reg, args: ArgListId },
+    /// `dst = {a, b, c}` — packed concatenation unless an operand is a string.
+    Concat { dst: Reg, args: ArgListId },
     /// `dst = ` the current simulation time as a 64-bit value (`$time`/
     /// `$realtime`).
     SimTime { dst: Reg },
@@ -278,10 +315,10 @@ pub struct Program {
     pub arglists: Vec<Box<[Reg]>>,
     /// Programs compiled for `fork` branches, referenced by `fork_groups`.
     pub forks: Vec<Rc<Program>>,
-    /// Whether `forks[i]` expects register 0 seeded with the enclosing
-    /// frame's `this` at spawn time (it was compiled inside the same class
-    /// context and reserved reg0 for `this`, exactly like a method).
-    pub forks_want_this: Vec<bool>,
+    /// Per-branch lexical captures as `(child register, enclosing register)`.
+    /// Values are sampled when the fork executes; object and collection
+    /// handles retain their shared identity in the child process.
+    pub fork_captures: Vec<Box<[(Reg, Reg)]>>,
     /// Groups of branch indices (into `forks`), one group per `fork`
     /// statement, referenced by `Inst::Fork::group`.
     pub fork_groups: Vec<Box<[u32]>>,
@@ -300,11 +337,16 @@ pub struct Program {
 #[derive(Debug)]
 pub struct ClassDef {
     pub name: String,
+    /// Immediate base class, used for runtime assignment compatibility and
+    /// dynamic `$cast` checks.
+    pub base: Option<ClassId>,
     pub field_defaults: Box<[Value]>,
     pub vtable: Box<[FuncId]>,
     /// Collection-typed fields `(slot, is_assoc)` — initialized to a *fresh*
     /// queue/assoc on every [`Inst::New`] so instances never share storage.
     pub coll_fields: Box<[(u32, bool)]>,
+    /// Event-typed field slots, initialized to a fresh identity per instance.
+    pub event_fields: Box<[u32]>,
     /// Struct-typed fields `(slot, struct_class_id)` — an unpacked
     /// `typedef struct {...}` field (modeled as a no-method class, see
     /// `ClassId`/`is_struct` on the elaborator side) is fully default-
@@ -312,6 +354,54 @@ pub struct ClassDef {
     /// [`ClassId`] instance, rather than staying a null handle awaiting an
     /// explicit `new()` the way a real class-typed field does.
     pub struct_fields: Box<[(u32, ClassId)]>,
+}
+
+type DpiFunction = dyn Fn(&mut [Value]) -> Value;
+
+/// Host bindings for imported DPI-C functions.
+#[derive(Default)]
+pub struct DpiRegistry {
+    functions: HashMap<String, Rc<DpiFunction>>,
+}
+
+impl DpiRegistry {
+    pub fn register(
+        &mut self,
+        name: impl Into<String>,
+        function: impl Fn(&mut [Value]) -> Value + 'static,
+    ) {
+        self.functions.insert(name.into(), Rc::new(function));
+    }
+
+    pub fn call(&self, name: &str, args: &mut [Value]) -> Value {
+        self.functions
+            .get(name)
+            .unwrap_or_else(|| panic!("unbound DPI-C function '{name}'"))(args)
+    }
+
+    /// Simulator services used by the Accellera UVM DPI wrapper.
+    pub fn simulator_defaults() -> DpiRegistry {
+        let mut registry = DpiRegistry::default();
+        let argv: Rc<[String]> = std::env::args().collect::<Vec<_>>().into();
+        let arg_index = Rc::new(Cell::new(0usize));
+        registry.register("uvm_dpi_get_next_arg_c", move |args| {
+            let reset = args.first().is_some_and(|arg| arg.as_logic().is_true());
+            if reset {
+                arg_index.set(0);
+            }
+            let current = arg_index.get();
+            let value = argv.get(current).map(String::as_str).unwrap_or("");
+            if current < argv.len() {
+                arg_index.set(current + 1);
+            }
+            Value::Str(Rc::from(value))
+        });
+        registry.register("uvm_dpi_get_tool_name_c", |_| Value::Str(Rc::from("Eevee")));
+        registry.register("uvm_dpi_get_tool_version_c", |_| {
+            Value::Str(Rc::from(env!("CARGO_PKG_VERSION")))
+        });
+        registry
+    }
 }
 
 /// The design's shared linkage tables: every callable function/task and every
@@ -326,6 +416,8 @@ pub struct Linkage {
     pub statics: Vec<RefCell<Value>>,
     /// Enum value->name tables, indexed by the id baked into [`Inst::EnumName`].
     pub enum_tables: Vec<std::collections::HashMap<i64, Rc<str>>>,
+    /// Host functions available to imported DPI-C callables.
+    pub dpi: DpiRegistry,
 }
 
 impl Linkage {
@@ -349,7 +441,7 @@ pub struct ProgramBuilder {
     netlists: Vec<Box<[NetId]>>,
     arglists: Vec<Box<[Reg]>>,
     forks: Vec<Rc<Program>>,
-    forks_want_this: Vec<bool>,
+    fork_captures: Vec<Box<[(Reg, Reg)]>>,
     fork_groups: Vec<Box<[u32]>>,
     n_regs: u32,
     arg_modes: Vec<ArgMode>,
@@ -369,7 +461,7 @@ impl ProgramBuilder {
             netlists: Vec::new(),
             arglists: Vec::new(),
             forks: Vec::new(),
-            forks_want_this: Vec::new(),
+            fork_captures: Vec::new(),
             fork_groups: Vec::new(),
             n_regs: 0,
             arg_modes: Vec::new(),
@@ -419,14 +511,13 @@ impl ProgramBuilder {
     }
 
     /// Register a compiled `fork` branch program, returning its index into
-    /// `forks` (used to build a [`Self::fork_group`]). `wants_this` records
-    /// whether the branch was compiled inside the same class context as its
-    /// enclosing callable (so it needs register 0 seeded with `this` at
-    /// spawn time).
-    pub fn add_fork_branch(&mut self, prog: Rc<Program>, wants_this: bool) -> u32 {
+    /// `forks` (used to build a [`Self::fork_group`]). Each capture maps a
+    /// child register to its source register in the enclosing program.
+    pub fn add_fork_branch(&mut self, prog: Rc<Program>, captures: &[(Reg, Reg)]) -> u32 {
         let id = self.forks.len() as u32;
         self.forks.push(prog);
-        self.forks_want_this.push(wants_this);
+        self.fork_captures
+            .push(captures.to_vec().into_boxed_slice());
         id
     }
 
@@ -455,7 +546,10 @@ impl ProgramBuilder {
         debug_assert!(
             !matches!(
                 inst,
-                Inst::Jump { .. } | Inst::BranchFalse { .. } | Inst::BranchTrue { .. }
+                Inst::Jump { .. }
+                    | Inst::BranchFalse { .. }
+                    | Inst::BranchTrue { .. }
+                    | Inst::BranchArgProvided { .. }
             ),
             "use jump/branch_false/branch_true for control flow so labels are patched"
         );
@@ -480,6 +574,12 @@ impl ProgramBuilder {
         self.code.push(Inst::BranchTrue { cond, target: 0 });
     }
 
+    /// Jump to `l` if the caller supplied the formal register `arg`.
+    pub fn branch_arg_provided(&mut self, arg: Reg, l: Label) {
+        self.patches.push((self.code.len(), l.0));
+        self.code.push(Inst::BranchArgProvided { arg, target: 0 });
+    }
+
     /// Resolve labels and produce the immutable [`Program`].
     pub fn build(mut self) -> Program {
         for (ci, lid) in &self.patches {
@@ -491,7 +591,8 @@ impl ProgramBuilder {
             match &mut self.code[*ci] {
                 Inst::Jump { target: t }
                 | Inst::BranchFalse { target: t, .. }
-                | Inst::BranchTrue { target: t, .. } => *t = target,
+                | Inst::BranchTrue { target: t, .. }
+                | Inst::BranchArgProvided { target: t, .. } => *t = target,
                 _ => unreachable!("patch points only at jump/branch instructions"),
             }
         }
@@ -501,7 +602,7 @@ impl ProgramBuilder {
             netlists: self.netlists,
             arglists: self.arglists,
             forks: self.forks,
-            forks_want_this: self.forks_want_this,
+            fork_captures: self.fork_captures,
             fork_groups: self.fork_groups,
             n_regs: self.n_regs,
             arg_modes: self.arg_modes.into_boxed_slice(),

@@ -105,3 +105,115 @@ fn fork_branches_share_this_object() {
     let sim = run(src);
     assert_eq!(sim.kernel_ref().output(), ["count=2"]);
 }
+
+#[test]
+fn fork_branch_captures_enclosing_formal_and_local() {
+    let src = "class Runner;\n\
+      task go(int value);\n\
+        int offset = 2;\n\
+        fork\n\
+          begin #1; $display(\"captured=%0d\", value + offset); end\n\
+        join\n\
+      endtask\n\
+    endclass\n\
+    module top;\n\
+      initial begin\n\
+        Runner runner = new();\n\
+        runner.go(40);\n\
+      end\n\
+    endmodule\n";
+    let sim = run(src);
+    assert_eq!(sim.kernel_ref().output(), ["captured=42"]);
+}
+
+#[test]
+fn wait_on_object_field_wakes_after_assignment() {
+    let src = "class State;\n\
+      int ready;\n\
+    endclass\n\
+    module top;\n\
+      initial begin\n\
+        State state = new();\n\
+        fork\n\
+          begin wait (state.ready != 0); $display(\"ready\"); end\n\
+          begin #5; $display(\"set\"); state.ready = 1; end\n\
+        join\n\
+      end\n\
+    endmodule\n";
+    let sim = run(src);
+    assert_eq!(sim.kernel_ref().output(), ["set", "ready"]);
+}
+
+#[test]
+fn case_selected_named_event_wakes_on_trigger() {
+    let src = "class Gate;\n\
+      event raised;\n\
+      event dropped;\n\
+      task wait_for(int which);\n\
+        case (which)\n\
+          1: @(raised);\n\
+          2: @(dropped);\n\
+        endcase\n\
+        $display(\"woke\");\n\
+      endtask\n\
+      function void signal();\n\
+        ->raised;\n\
+      endfunction\n\
+    endclass\n\
+    module top;\n\
+      initial begin\n\
+        Gate gate = new();\n\
+        fork\n\
+          gate.wait_for(1);\n\
+          begin #5; $display(\"trigger\"); gate.signal(); end\n\
+        join\n\
+      end\n\
+    endmodule\n";
+    let sim = run(src);
+    assert_eq!(sim.kernel_ref().output(), ["trigger", "woke"]);
+}
+
+#[test]
+fn detached_forever_worker_handles_event_then_rearms() {
+    let src = "class Worker;\n\
+      event work;\n\
+      task run();\n\
+        fork\n\
+          forever begin\n\
+            @(work);\n\
+            $display(\"handled\");\n\
+          end\n\
+        join_none\n\
+        #5;\n\
+        $display(\"trigger\");\n\
+        ->work;\n\
+      endtask\n\
+    endclass\n\
+    module top;\n\
+      initial begin\n\
+        Worker worker = new();\n\
+        worker.run();\n\
+      end\n\
+    endmodule\n";
+    let sim = run(src);
+    assert_eq!(sim.kernel_ref().output(), ["trigger", "handled"]);
+}
+
+#[test]
+fn fork_scoped_automatic_declaration_is_captured_by_branch() {
+    let src = "class Phase;\n\
+      int id;\n\
+    endclass\n\
+    module top;\n\
+      initial begin\n\
+        Phase ph = new();\n\
+        ph.id = 42;\n\
+        fork\n\
+          automatic Phase phase = ph;\n\
+          begin #1; $display(\"phase=%0d\", phase.id); end\n\
+        join\n\
+      end\n\
+    endmodule\n";
+    let sim = run(src);
+    assert_eq!(sim.kernel_ref().output(), ["phase=42"]);
+}

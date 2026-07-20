@@ -18,12 +18,12 @@
 //! push to the active queue without allocating.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use eevee_core::{LogicVec, Region, SimTime, Timescale};
 
 use crate::net::{detect_edge, Net, Waiter};
-use crate::process::{EdgeKind, ForkJoin, NetId, ProcId, Process, Wait};
+use crate::process::{EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};
 
 /// A parent process blocked on `join`/`join_any` for a set of forked children.
 struct JoinWatch {
@@ -87,6 +87,7 @@ pub struct Kernel {
     inactive: VecDeque<ProcId>,
     // Pending non-blocking updates, applied at the NBA region.
     nba: Vec<(NetId, LogicVec)>,
+    nba_waiters: VecDeque<ProcId>,
 
     // Future events.
     timed: BinaryHeap<Reverse<TimedEvent>>,
@@ -102,6 +103,12 @@ pub struct Kernel {
 
     // `fork ... join`/`join_any` parents currently blocked on their children.
     join_watches: Vec<JoinWatch>,
+
+    // Processes waiting for a class/static/collection value to change.
+    runtime_waiters: Vec<ProcId>,
+
+    // Processes parked on IEEE named events.
+    event_waiters: HashMap<EventId, Vec<ProcId>>,
 }
 
 impl Kernel {
@@ -113,6 +120,7 @@ impl Kernel {
             active: VecDeque::new(),
             inactive: VecDeque::new(),
             nba: Vec::new(),
+            nba_waiters: VecDeque::new(),
             timed: BinaryHeap::new(),
             seq: 0,
             stop: false,
@@ -120,6 +128,8 @@ impl Kernel {
             out: Vec::new(),
             echo: true,
             join_watches: Vec::new(),
+            runtime_waiters: Vec::new(),
+            event_waiters: HashMap::new(),
         }
     }
 
@@ -178,6 +188,7 @@ impl Kernel {
         let Kernel {
             nets,
             active,
+            runtime_waiters,
             stats,
             ..
         } = self;
@@ -185,6 +196,9 @@ impl Kernel {
         let old = std::mem::replace(&mut n.value, val);
         let edges = detect_edge(&old, &n.value);
         stats.net_writes += 1;
+        if edges.changed {
+            active.extend(runtime_waiters.drain(..));
+        }
         if edges.changed && !n.waiters.is_empty() {
             let mut i = 0;
             while i < n.waiters.len() {
@@ -206,9 +220,6 @@ impl Kernel {
     }
 
     fn drain_nba(&mut self) {
-        if self.nba.is_empty() {
-            return;
-        }
         // Take the batch; applying it may wake processes and even queue more
         // NBAs, which belong to the *next* NBA pass — standard semantics.
         let batch = std::mem::take(&mut self.nba);
@@ -216,6 +227,7 @@ impl Kernel {
             self.stats.nba_applies += 1;
             self.write_net(net, val);
         }
+        self.active.extend(self.nba_waiters.drain(..));
     }
 
     // ---- Time / control -------------------------------------------------
@@ -236,6 +248,19 @@ impl Kernel {
     #[inline]
     pub fn request_stop(&mut self) {
         self.stop = true;
+    }
+
+    /// Wake processes parked on non-net `wait(cond)` state. Conditions are
+    /// re-evaluated by their interpreter frames after being re-queued.
+    pub fn notify_runtime_change(&mut self) {
+        self.active.extend(self.runtime_waiters.drain(..));
+    }
+
+    /// Trigger a named event and wake every process currently waiting on it.
+    pub fn trigger_event(&mut self, event: EventId) {
+        if let Some(waiters) = self.event_waiters.remove(&event) {
+            self.active.extend(waiters);
+        }
     }
 
     /// Accumulated statistics.
@@ -286,6 +311,9 @@ impl Kernel {
                     });
                 }
             }
+            Wait::RuntimeCond => self.runtime_waiters.push(pid),
+            Wait::Nba => self.nba_waiters.push_back(pid),
+            Wait::NamedEvent(event) => self.event_waiters.entry(event).or_default().push(pid),
             Wait::Fork { .. } => unreachable!(
                 "Wait::Fork must be intercepted by Sim::drain_active (spawning \
                  needs the process table, which Kernel does not own) before \
@@ -392,7 +420,7 @@ impl Sim {
                     }
                     continue;
                 }
-                if !self.kernel.nba.is_empty() {
+                if !self.kernel.nba.is_empty() || !self.kernel.nba_waiters.is_empty() {
                     self.kernel.drain_nba();
                     continue;
                 }
