@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use eevee_ast::{
-    ClassDecl, Expr, FuncDecl, Item, Lvalue, Module, ModuleItem, SourceFile, Stmt, TimingControl,
-    VarDecl,
+    BinOp, ClassDecl, Expr, FuncDecl, Item, Lvalue, Module, ModuleItem, PortDir, SourceFile, Stmt,
+    TimingControl, UnaryOp, VarDecl,
 };
 
 use crate::ElabError;
@@ -38,6 +38,8 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
         }
         validate_module_scope(module)?;
         validate_module_parameters(module)?;
+        validate_continuous_assignments(module)?;
+        validate_procedural_net_writes(module)?;
     }
 
     for module in modules.values() {
@@ -98,6 +100,15 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
                         instance.name, port.name, actual, actual_width, port.width
                     ));
                 }
+                if port.is_net
+                    && matches!(port.dir, PortDir::Output | PortDir::Inout)
+                    && !module_signal_is_net(module, actual)
+                {
+                    return unsupported(format!(
+                        "net port '{}.{}' must connect to a parent net",
+                        instance.name, port.name
+                    ));
+                }
             }
         }
     }
@@ -108,6 +119,246 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
         visit_module(name, &modules, &mut marks, &mut stack)?;
     }
     Ok(())
+}
+
+fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
+    let drivable: HashSet<&str> = module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::Net(net) => Some(net.name.as_str()),
+            _ => None,
+        })
+        .chain(module.ports.iter().filter_map(|port| {
+            (port.is_net && matches!(port.dir, PortDir::Output | PortDir::Inout))
+                .then_some(port.name.as_str())
+        }))
+        .collect();
+    for item in &module.items {
+        let ModuleItem::ContinuousAssign { lhs, rhs } = item else {
+            continue;
+        };
+        if lhs.receiver.is_some()
+            || lhs.index.is_some()
+            || lhs.scope.is_some()
+            || !drivable.contains(lhs.name.as_str())
+        {
+            return unsupported(format!(
+                "continuous assignment target '{}.{}' is not a whole net",
+                module.name, lhs.name
+            ));
+        }
+        if module_signal_signed(module, &lhs.name) {
+            return unsupported(format!(
+                "signed continuous assignment target '{}.{}' is unsupported",
+                module.name, lhs.name
+            ));
+        }
+        validate_continuous_expr(module, rhs)?;
+        let target_width = module_signal_width(module, &lhs.name).expect("validated net target");
+        let Some(rhs_width) = continuous_expr_width(module, rhs) else {
+            return unsupported(format!(
+                "continuous assignment expression width is not statically known in module '{}'",
+                module.name
+            ));
+        };
+        if rhs_width != target_width {
+            return unsupported(format!(
+                "continuous assignment width conversion is unsupported for '{}.{}': RHS is {} bits, target is {} bits",
+                module.name, lhs.name, rhs_width, target_width
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn continuous_expr_width(module: &Module, expr: &Expr) -> Option<u32> {
+    match expr {
+        Expr::Literal(value) => Some(value.width()),
+        Expr::Ref(name) => module_signal_width(module, name),
+        Expr::Unary { op, operand } => match op {
+            UnaryOp::LogNot | UnaryOp::ReduceAnd | UnaryOp::ReduceOr | UnaryOp::ReduceXor => {
+                Some(1)
+            }
+            UnaryOp::BitNot | UnaryOp::Neg | UnaryOp::Plus => {
+                continuous_expr_width(module, operand)
+            }
+        },
+        Expr::Binary { op, lhs, rhs } => {
+            let left = continuous_expr_width(module, lhs)?;
+            let right = continuous_expr_width(module, rhs)?;
+            Some(match op {
+                BinOp::Eq
+                | BinOp::Neq
+                | BinOp::Lt
+                | BinOp::Gt
+                | BinOp::Le
+                | BinOp::Ge
+                | BinOp::LogAnd
+                | BinOp::LogOr => 1,
+                BinOp::Shl | BinOp::Shr => left,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor => {
+                    left.max(right)
+                }
+            })
+        }
+        Expr::Index { .. } => Some(1),
+        Expr::PartSelect { left, right, .. } => {
+            let Expr::Literal(left) = left.as_ref() else {
+                return None;
+            };
+            let Expr::Literal(right) = right.as_ref() else {
+                return None;
+            };
+            if !left.is_known() || !right.is_known() {
+                return None;
+            }
+            Some(left.to_u64().abs_diff(right.to_u64()) as u32 + 1)
+        }
+        Expr::Concat(parts) => parts.iter().try_fold(0u32, |width, part| {
+            width.checked_add(continuous_expr_width(module, part)?)
+        }),
+        _ => None,
+    }
+}
+
+fn validate_continuous_expr(module: &Module, expr: &Expr) -> Result<(), ElabError> {
+    match expr {
+        Expr::Literal(_) => Ok(()),
+        Expr::Ref(name)
+            if module_signal_width(module, name).is_some()
+                && !module_signal_signed(module, name) =>
+        {
+            Ok(())
+        }
+        Expr::Unary { operand, .. } => validate_continuous_expr(module, operand),
+        Expr::Binary { lhs, rhs, .. } => {
+            validate_continuous_expr(module, lhs)?;
+            validate_continuous_expr(module, rhs)
+        }
+        Expr::Index { base, index } => {
+            validate_continuous_expr(module, base)?;
+            let Expr::Literal(index) = index.as_ref() else {
+                return unsupported(format!(
+                    "continuous packed index must be a constant in module '{}'",
+                    module.name
+                ));
+            };
+            let width = continuous_expr_width(module, base).unwrap_or(0);
+            if !index.is_known() || index.to_u64() >= u64::from(width) {
+                return unsupported(format!(
+                    "continuous packed index is out of range in module '{}'",
+                    module.name
+                ));
+            }
+            Ok(())
+        }
+        Expr::PartSelect { base, left, right } => {
+            validate_continuous_expr(module, base)?;
+            let (Expr::Literal(left), Expr::Literal(right)) = (left.as_ref(), right.as_ref())
+            else {
+                return unsupported(format!(
+                    "continuous part-select bounds must be constant in module '{}'",
+                    module.name
+                ));
+            };
+            let width = continuous_expr_width(module, base).unwrap_or(0);
+            if !left.is_known()
+                || !right.is_known()
+                || left.to_u64() >= u64::from(width)
+                || right.to_u64() >= u64::from(width)
+            {
+                return unsupported(format!(
+                    "continuous part-select is out of range in module '{}'",
+                    module.name
+                ));
+            }
+            Ok(())
+        }
+        Expr::Concat(parts) => {
+            for part in parts {
+                validate_continuous_expr(module, part)?;
+            }
+            Ok(())
+        }
+        _ => unsupported(format!(
+            "unsupported continuous assignment expression in module '{}': {expr:?}",
+            module.name
+        )),
+    }
+}
+
+fn validate_procedural_net_writes(module: &Module) -> Result<(), ElabError> {
+    let nets: HashSet<&str> = module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::Net(net) => Some(net.name.as_str()),
+            _ => None,
+        })
+        .chain(
+            module
+                .ports
+                .iter()
+                .filter(|port| port.is_net)
+                .map(|port| port.name.as_str()),
+        )
+        .collect();
+    for item in &module.items {
+        let body = match item {
+            ModuleItem::Always(always) => Some(&always.body),
+            ModuleItem::Initial(body) => Some(body),
+            ModuleItem::Func(function) => Some(&function.body),
+            _ => None,
+        };
+        if let Some(name) = body.and_then(|body| procedural_net_write(body, &nets)) {
+            return unsupported(format!(
+                "procedural assignment to net '{}.{}' is unsupported",
+                module.name, name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn procedural_net_write<'a>(stmt: &'a Stmt, nets: &HashSet<&str>) -> Option<&'a str> {
+    match stmt {
+        Stmt::Block(statements) => statements
+            .iter()
+            .find_map(|statement| procedural_net_write(statement, nets)),
+        Stmt::Timed { body, .. }
+        | Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Foreach { body, .. } => procedural_net_write(body, nets),
+        Stmt::Blocking { lhs, .. } | Stmt::Nonblocking { lhs, .. }
+            if lhs.receiver.is_none()
+                && lhs.scope.is_none()
+                && nets.contains(lhs.name.as_str()) =>
+        {
+            Some(lhs.name.as_str())
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => procedural_net_write(then_branch, nets).or_else(|| {
+            else_branch
+                .as_deref()
+                .and_then(|branch| procedural_net_write(branch, nets))
+        }),
+        Stmt::Case { items, default, .. } => items
+            .iter()
+            .find_map(|(_, body)| procedural_net_write(body, nets))
+            .or_else(|| {
+                default
+                    .as_deref()
+                    .and_then(|body| procedural_net_write(body, nets))
+            }),
+        Stmt::Fork { branches, .. } => branches
+            .iter()
+            .find_map(|branch| procedural_net_write(branch, nets)),
+        _ => None,
+    }
 }
 
 fn validate_module_parameters(module: &Module) -> Result<(), ElabError> {
@@ -198,9 +449,37 @@ fn module_signal_width(module: &Module, name: &str) -> Option<u32> {
         .or_else(|| {
             module.items.iter().find_map(|item| match item {
                 ModuleItem::Var(var) if var.name == name => Some(var.width),
+                ModuleItem::Net(net) if net.name == name => Some(net.width),
                 _ => None,
             })
         })
+}
+
+fn module_signal_is_net(module: &Module, name: &str) -> bool {
+    module
+        .ports
+        .iter()
+        .any(|port| port.name == name && port.is_net)
+        || module
+            .items
+            .iter()
+            .any(|item| matches!(item, ModuleItem::Net(net) if net.name == name))
+}
+
+fn module_signal_signed(module: &Module, name: &str) -> bool {
+    module
+        .ports
+        .iter()
+        .find(|port| port.name == name)
+        .map(|port| port.signed)
+        .or_else(|| {
+            module.items.iter().find_map(|item| match item {
+                ModuleItem::Var(var) if var.name == name => Some(var.signed),
+                ModuleItem::Net(net) if net.name == name => Some(net.signed),
+                _ => None,
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn validate_module_scope(module: &Module) -> Result<(), ElabError> {
@@ -224,6 +503,7 @@ fn validate_module_scope(module: &Module) -> Result<(), ElabError> {
     for item in &module.items {
         let name = match item {
             ModuleItem::Var(var) => Some(var.name.as_str()),
+            ModuleItem::Net(net) => Some(net.name.as_str()),
             ModuleItem::Instance(instance) => Some(instance.name.as_str()),
             _ => None,
         };
@@ -276,6 +556,7 @@ fn validate_items(
     for item in items {
         match item {
             ModuleItem::Var(var) => validate_static_var(var, module_parameters)?,
+            ModuleItem::Net(_) => {}
             ModuleItem::Instance(instance) => {
                 for connection in &instance.connections {
                     if !matches!(connection.expr, Expr::Ref(_)) {
@@ -286,6 +567,10 @@ fn validate_items(
                         ));
                     }
                 }
+            }
+            ModuleItem::ContinuousAssign { lhs, rhs } => {
+                validate_lvalue(lhs)?;
+                validate_expr(rhs)?;
             }
             ModuleItem::Always(always) => validate_stmt(&always.body, module_parameters)?,
             ModuleItem::Initial(body) => validate_stmt(body, module_parameters)?,

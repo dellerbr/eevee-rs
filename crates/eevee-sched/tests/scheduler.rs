@@ -7,11 +7,34 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use eevee_core::{LogicVec, SimTime};
+use eevee_core::{Bit, LogicVec, SimTime};
 use eevee_sched::{EdgeKind, Kernel, NetId, Process, Sim, Wait};
 
 fn lv(v: u64, w: u32) -> LogicVec {
     LogicVec::from_u64(v, w)
+}
+
+#[test]
+fn continuous_drivers_resolve_four_state_values() {
+    let mut sim = Sim::with_default_timescale();
+    let net = sim.kernel().new_net("resolved", LogicVec::z(1));
+    let left = sim.kernel().new_driver(net);
+    let right = sim.kernel().new_driver(net);
+
+    sim.kernel().drive_net(left, lv(0, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Zero);
+
+    sim.kernel().drive_net(right, lv(1, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::X);
+
+    sim.kernel().drive_net(left, lv(1, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+
+    sim.kernel().drive_net(right, LogicVec::z(1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+
+    sim.kernel().drive_net(left, LogicVec::x(1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::X);
 }
 
 // ---------------------------------------------------------------------------

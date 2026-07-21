@@ -2,7 +2,7 @@
 //! → IR → run on the event-driven kernel. This is the P2 milestone: a real
 //! `.sv` design (not hand-built IR) producing correct behavior.
 
-use eevee_core::SimTime;
+use eevee_core::{Bit, SimTime};
 use eevee_elab::{elaborate, elaborate_conformant, ElabError};
 use eevee_fe::{parse_source, parse_source_conformant};
 use eevee_ir::Interp;
@@ -75,6 +75,89 @@ fn child_instances_propagate_named_and_positional_ports() {
 
     assert_eq!(sim.kernel().net_value(named).to_u64(), 42);
     assert_eq!(sim.kernel().net_value(positional).to_u64(), 42);
+}
+
+#[test]
+fn continuous_assignments_propagate_and_resolve_drivers() {
+    let src = "module child(input logic [7:0] source, output wire [7:0] result);\n\
+      assign result = source + 8'd1;\n\
+    endmodule\n\
+    module top;\n\
+      logic [7:0] source = 1;\n\
+      logic left = 0;\n\
+      logic right = 1;\n\
+      wire [7:0] result;\n\
+      wire [3:0] selected;\n\
+      wire resolved;\n\
+      child dut(.source(source), .result(result));\n\
+      assign selected = {source[0], source[3:1]};\n\
+      assign resolved = left;\n\
+      assign resolved = right;\n\
+      initial begin\n\
+        #1 right = 0;\n\
+        #1 source = 41;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+
+    let result = sim.kernel().find_net("result").expect("result net");
+    let selected = sim.kernel().find_net("selected").expect("selected net");
+    let resolved = sim.kernel().find_net("resolved").expect("resolved net");
+
+    sim.run_until(Some(SimTime::ZERO));
+    assert_eq!(sim.kernel().net_value(result).to_u64(), 2);
+    assert_eq!(sim.kernel().net_value(selected).to_u64(), 8);
+    assert_eq!(sim.kernel().net_value(resolved).get_bit(0), Bit::X);
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    assert_eq!(sim.kernel().net_value(resolved).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    assert_eq!(sim.kernel().net_value(result).to_u64(), 42);
+    assert_eq!(sim.kernel().net_value(selected).to_u64(), 12);
+}
+
+#[test]
+fn conformance_mode_rejects_invalid_continuous_drivers() {
+    let cases = [
+        (
+            "module top; logic source, result; assign result = source; endmodule",
+            "not a whole net",
+        ),
+        (
+            "module top; wire result; initial result = 1; endmodule",
+            "procedural assignment to net",
+        ),
+        (
+            "module top; wire result; assign result = missing; endmodule",
+            "unsupported continuous assignment expression",
+        ),
+        (
+            "module top; logic signed source; wire [7:0] result; assign result = source; endmodule",
+            "unsupported continuous assignment expression",
+        ),
+        (
+            "module top; logic source; wire [7:0] result; assign result = source; endmodule",
+            "width conversion is unsupported",
+        ),
+        (
+            "module top; logic [3:0] source; wire result; assign result = source[4]; endmodule",
+            "packed index is out of range",
+        ),
+    ];
+    for (source, expected) in cases {
+        let file = parse_source_conformant(source).expect("continuous syntax parses");
+        let error = match elaborate_conformant(&file, &Interp) {
+            Ok(_) => panic!("invalid continuous driver must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+          error,
+          ElabError::UnsupportedSemantic { ref message } if message.contains(expected)
+        ));
+    }
 }
 
 #[test]

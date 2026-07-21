@@ -20,10 +20,16 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 
-use eevee_core::{LogicVec, Region, SimTime, Timescale};
+use eevee_core::{Bit, LogicVec, Region, SimTime, Timescale};
 
 use crate::net::{detect_edge, Net, Waiter};
-use crate::process::{EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};
+use crate::process::{DriverId, EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};
+
+#[derive(Clone, Copy)]
+struct DriverTarget {
+    net: NetId,
+    slot: usize,
+}
 
 /// A parent process blocked on `join`/`join_any` for a set of forked children.
 struct JoinWatch {
@@ -81,6 +87,7 @@ pub struct Kernel {
     time: SimTime,
     timescale: Timescale,
     nets: Vec<Net>,
+    drivers: Vec<DriverTarget>,
 
     // Current-time-slot region queues of process wakeups.
     active: VecDeque<ProcId>,
@@ -117,6 +124,7 @@ impl Kernel {
             time: SimTime::ZERO,
             timescale,
             nets: Vec::new(),
+            drivers: Vec::new(),
             active: VecDeque::new(),
             inactive: VecDeque::new(),
             nba: Vec::new(),
@@ -157,6 +165,25 @@ impl Kernel {
     /// hot path). Returns the first match.
     pub fn find_net(&self, name: &str) -> Option<NetId> {
         self.nets.iter().position(|n| n.name() == name).map(NetId)
+    }
+
+    /// Register a continuous driver on `net`. Until first driven its value is Z.
+    pub fn new_driver(&mut self, net: NetId) -> DriverId {
+        let width = self.nets[net.0].value.width();
+        let slot = self.nets[net.0].driver_values.len();
+        self.nets[net.0].driver_values.push(LogicVec::z(width));
+        let id = DriverId(self.drivers.len());
+        self.drivers.push(DriverTarget { net, slot });
+        id
+    }
+
+    /// Update one continuous driver and write the net's resolved four-state value.
+    pub fn drive_net(&mut self, driver: DriverId, value: LogicVec) {
+        let target = self.drivers[driver.0];
+        let width = self.nets[target.net.0].value.width();
+        self.nets[target.net.0].driver_values[target.slot] = value.resize(width, false);
+        let resolved = resolve_drivers(&self.nets[target.net.0].driver_values, width);
+        self.write_net(target.net, resolved);
     }
 
     // ---- Display / output ----------------------------------------------
@@ -354,6 +381,24 @@ impl Kernel {
             }
         }
     }
+}
+
+fn resolve_drivers(drivers: &[LogicVec], width: u32) -> LogicVec {
+    let mut resolved = LogicVec::z(width);
+    for bit in 0..width {
+        let mut value = Bit::Z;
+        for driver in drivers {
+            value = match (value, driver.get_bit(bit)) {
+                (current, Bit::Z) => current,
+                (Bit::Z, driven) => driven,
+                (Bit::X, _) | (_, Bit::X) => Bit::X,
+                (Bit::Zero, Bit::One) | (Bit::One, Bit::Zero) => Bit::X,
+                (current, _) => current,
+            };
+        }
+        resolved.set_bit(bit, value);
+    }
+    resolved
 }
 
 /// The top-level simulation driver: owns the process table and the [`Kernel`].

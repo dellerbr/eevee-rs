@@ -499,6 +499,10 @@ fn run_frame(
                 let v = regs[src as usize].as_logic().clone();
                 k.schedule_nba(net, v);
             }
+            Inst::DriveNet { driver, src } => {
+                let value = regs[src as usize].as_logic().clone();
+                k.drive_net(driver, value);
+            }
             Inst::Delay { fs } => return Step::Wait(Wait::Delay(fs)),
             Inst::WaitEdge { net, edge } => return Step::Wait(Wait::Edge(net, edge)),
             Inst::WaitCond { nets } => {

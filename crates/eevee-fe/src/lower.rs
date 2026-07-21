@@ -57,8 +57,14 @@ fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
                 out.push(ModuleItem::Instance(instance));
             }
         }
+        "kNetDeclaration" => {
+            for net in lower_net_decl(item) {
+                out.push(ModuleItem::Net(net));
+            }
+        }
         "kAlwaysStatement" => out.push(ModuleItem::Always(lower_always(item))),
         "kInitialStatement" => out.push(ModuleItem::Initial(lower_initial(item))),
+        "kContinuousAssignmentStatement" => lower_continuous_assignments(item, out),
         "kFunctionDeclaration" | "kTaskDeclaration" => {
             out.push(ModuleItem::Func(lower_function(item)))
         }
@@ -89,6 +95,20 @@ fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
             }
         }
         _ => {} // unsupported item — skipped for this subset
+    }
+}
+
+fn lower_continuous_assignments(n: &Value, out: &mut Vec<ModuleItem>) {
+    let Some(assignments) = find(n, "kAssignmentList") else {
+        return;
+    };
+    for assignment in kids(assignments) {
+        if tag(assignment) == "kNetVariableAssignment" {
+            out.push(ModuleItem::ContinuousAssign {
+                lhs: lower_lvalue(assignment),
+                rhs: lower_rhs(assignment),
+            });
+        }
     }
 }
 
@@ -329,7 +349,29 @@ fn lower_module_ports(n: &Value) -> Vec<Port> {
                 dir,
                 width: dtype.map(packed_width).unwrap_or(1),
                 signed: find_deep(declaration, "signed").is_some(),
+                is_net: kids(declaration).any(|child| tag(child) == "wire"),
             }
+        })
+        .collect()
+}
+
+fn lower_net_decl(n: &Value) -> Vec<NetDecl> {
+    let dtype = find(n, "kDataTypeImplicitIdDimensions")
+        .and_then(|dimensions| find(dimensions, "kDataType"));
+    let width = dtype.map(packed_width).unwrap_or(1);
+    let signed = find_deep(n, "signed").is_some();
+    let Some(declarations) = find(n, "kNetVariableDeclarationAssign") else {
+        return Vec::new();
+    };
+    kids(declarations)
+        .filter(|declaration| tag(declaration) == "kNetVariable")
+        .filter_map(|declaration| {
+            let name = find(declaration, "SymbolIdentifier").map(text)?.to_string();
+            Some(NetDecl {
+                name,
+                width,
+                signed,
+            })
         })
         .collect()
 }
@@ -365,6 +407,7 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
     let is_string = dtype.map(is_string_type).unwrap_or(false);
     let is_event = dtype.is_some_and(|value| find_deep(value, "event").is_some());
     let width = dtype.map(packed_width).unwrap_or(1);
+    let signed = dtype.is_some_and(|value| find_deep(value, "signed").is_some());
     // A `static` qualifier sits in a kQualifierList directly under the decl.
     let is_static = find(n, "kQualifierList")
         .map(|q| kids(q).any(|c| tag(c) == "static"))
@@ -407,7 +450,7 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
             out.push(VarDecl {
                 name,
                 width,
-                signed: false,
+                signed,
                 class_name: class_name.clone(),
                 type_scope: type_scope.clone(),
                 type_args: type_args.clone(),

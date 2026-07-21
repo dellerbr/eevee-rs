@@ -34,8 +34,10 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                 if !matches!(
                     tag(child),
                     "kDataDeclaration"
+                        | "kNetDeclaration"
                         | "kAlwaysStatement"
                         | "kInitialStatement"
+                        | "kContinuousAssignmentStatement"
                         | "kFunctionDeclaration"
                         | "kTaskDeclaration"
                         | "kDPIImportItem"
@@ -57,6 +59,60 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
         "kDataDeclaration" if find_deep(node, "kGateInstance").is_some() => {
             if let Some(parameters) = find_deep(node, "kActualParameterList") {
                 validate_module_parameter_actuals(parameters, source)?;
+            }
+        }
+        "kContinuousAssignmentStatement" => {
+            if let Some(delay) = find(node, "kDelay") {
+                return unsupported(delay, source);
+            }
+            if let Some(strength) = find(node, "kDriveStrength") {
+                return unsupported(strength, source);
+            }
+            let Some(assignments) = find(node, "kAssignmentList") else {
+                return unsupported(node, source);
+            };
+            validate_separated_list(assignments, "kNetVariableAssignment", source)?;
+        }
+        "kNetDeclaration" => {
+            let is_wire = find(node, "kDataType")
+                .is_some_and(|data_type| kids(data_type).any(|child| tag(child) == "wire"));
+            if !is_wire {
+                return unsupported(node, source);
+            }
+            if let Some(delay) = find_deep(node, "kDelay") {
+                return unsupported(delay, source);
+            }
+            if let Some(strength) = find_deep(node, "kDriveStrength") {
+                return unsupported(strength, source);
+            }
+            if let Some(initializer) = find_deep(node, "kNetDeclarationAssignment") {
+                return unsupported(initializer, source);
+            }
+            let Some(declarations) = find(node, "kNetVariableDeclarationAssign") else {
+                return unsupported(node, source);
+            };
+            validate_separated_list(declarations, "kNetVariable", source)?;
+            for declaration in kids(declarations).filter(|child| tag(child) == "kNetVariable") {
+                if find(declaration, "SymbolIdentifier").is_none()
+                    || find(declaration, "kUnpackedDimensions")
+                        .is_some_and(|dimensions| kids(dimensions).next().is_some())
+                {
+                    return unsupported(declaration, source);
+                }
+            }
+        }
+        "kNetVariableAssignment" => {
+            let Some(lhs) = find(node, "kLPValue") else {
+                return unsupported(node, source);
+            };
+            if find_deep(lhs, "kDimensionScalar").is_some()
+                || find_deep(lhs, "kDimensionRange").is_some()
+                || find_deep(lhs, "kDimensionSlice").is_some()
+                || find_deep(lhs, "kHierarchyExtension").is_some()
+                || find_deep(lhs, "kQualifiedId").is_some()
+                || find_deep(lhs, "SymbolIdentifier").is_none()
+            {
+                return unsupported(lhs, source);
             }
         }
         "kPackedDimensions" => validate_literal_packed_dimensions(node, source)?,

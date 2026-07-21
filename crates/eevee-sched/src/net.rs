@@ -19,6 +19,7 @@ pub(crate) struct Waiter {
 /// A 4-state net with an attached sensitivity list.
 pub struct Net {
     pub(crate) value: LogicVec,
+    pub(crate) driver_values: Vec<LogicVec>,
     pub(crate) waiters: Vec<Waiter>,
     pub(crate) name: String,
 }
@@ -27,6 +28,7 @@ impl Net {
     pub(crate) fn new(name: impl Into<String>, value: LogicVec) -> Net {
         Net {
             value,
+            driver_values: Vec::new(),
             waiters: Vec::new(),
             name: name.into(),
         }

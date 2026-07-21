@@ -28,7 +28,7 @@ use eevee_ir::{
     ArgMode, ClassDef, CollOp, DpiRegistry, ExecBackend, Inst, Label, Linkage, Program,
     ProgramBuilder, Reg, Value,
 };
-use eevee_sched::{EdgeKind, ForkJoin, NetId, Sim};
+use eevee_sched::{DriverId, EdgeKind, ForkJoin, NetId, Sim};
 
 /// Statistics from a global elaboration pass (how much UVM we ingested).
 #[derive(Debug, Default, Clone)]
@@ -1281,14 +1281,30 @@ fn elaborate_module_instance(
 ) {
     let consts = bind_module_parameters(m, parameter_overrides, parent_consts, &g.consts);
     let mut scope: HashMap<String, (NetId, u32)> = HashMap::new();
+    let mut drivable = HashSet::new();
     for port in &m.ports {
         if let Some(&(net, _)) = port_bindings.get(&port.name) {
             scope.insert(port.name.clone(), (net, port.width));
         } else {
-            let net = sim
-                .kernel()
-                .new_net(scoped_name(path, &port.name), LogicVec::zero(port.width));
+            let initial = if port.is_net {
+                LogicVec::z(port.width)
+            } else {
+                LogicVec::zero(port.width)
+            };
+            let net = sim.kernel().new_net(scoped_name(path, &port.name), initial);
             scope.insert(port.name.clone(), (net, port.width));
+        }
+        if port.is_net && matches!(port.dir, PortDir::Output | PortDir::Inout) {
+            drivable.insert(port.name.clone());
+        }
+    }
+    for item in &m.items {
+        if let ModuleItem::Net(net) = item {
+            let id = sim
+                .kernel()
+                .new_net(scoped_name(path, &net.name), LogicVec::z(net.width));
+            scope.insert(net.name.clone(), (id, net.width));
+            drivable.insert(net.name.clone());
         }
     }
     for it in &m.items {
@@ -1349,7 +1365,31 @@ fn elaborate_module_instance(
                 .gen_initial(body);
                 sim.add_process(backend.instantiate(Rc::new(prog), g.linkage.clone()));
             }
+            ModuleItem::ContinuousAssign { lhs, rhs } => {
+                if lhs.receiver.is_some() || lhs.index.is_some() || lhs.scope.is_some() {
+                    panic!("continuous assignment requires a whole module net");
+                }
+                if !drivable.contains(&lhs.name) {
+                    panic!("continuous assignment target '{}' is not a net", lhs.name);
+                }
+                let &(net, _) = scope.get(&lhs.name).unwrap_or_else(|| {
+                    panic!("continuous assignment target '{}' is unknown", lhs.name)
+                });
+                let driver = sim.kernel().new_driver(net);
+                let prog = CodeGen::new(
+                    &scope,
+                    &g.func_ids,
+                    &g.class_ids,
+                    &g.class_infos,
+                    &consts,
+                    &gv,
+                    ts,
+                )
+                .gen_continuous(rhs, driver);
+                sim.add_process(backend.instantiate(Rc::new(prog), g.linkage.clone()));
+            }
             ModuleItem::Var(_)
+            | ModuleItem::Net(_)
             | ModuleItem::Instance(_)
             | ModuleItem::Func(_)
             | ModuleItem::Class(_)
@@ -1645,6 +1685,19 @@ impl<'a> CodeGen<'a> {
         let mut pb = ProgramBuilder::new("initial");
         self.gen_stmt(body, &mut pb);
         pb.emit(Inst::Finish);
+        pb.build()
+    }
+
+    /// A continuous assignment is an implicit process that drives once at
+    /// time zero, then re-evaluates after signal/runtime activity.
+    fn gen_continuous(&mut self, rhs: &Expr, driver: DriverId) -> Program {
+        let mut pb = ProgramBuilder::new("continuous assign");
+        let evaluate = pb.new_label();
+        pb.bind(evaluate);
+        let value = self.gen_expr(rhs, &mut pb);
+        pb.emit(Inst::DriveNet { driver, src: value });
+        pb.emit(Inst::WaitRuntime);
+        pb.jump(evaluate);
         pb.build()
     }
 

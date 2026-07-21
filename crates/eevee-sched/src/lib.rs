@@ -20,4 +20,4 @@ pub mod process;
 
 pub use kernel::{Kernel, Sim, Stats};
 pub use net::Net;
-pub use process::{EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};
+pub use process::{DriverId, EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};

@@ -24,6 +24,10 @@ pub struct ProcId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NetId(pub usize);
 
+/// Handle to one continuous driver owned by the [`Kernel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DriverId(pub usize);
+
 /// Identity of an IEEE named `event` value.
 pub type EventId = u64;
 

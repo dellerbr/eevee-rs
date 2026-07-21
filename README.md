@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 21, 2026:
 
-- 145 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 149 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -71,9 +71,13 @@ Validated on July 21, 2026:
 - ANSI packed/scalar ports and recursive child module instances elaborate with
   named or positional whole-signal connectivity. A strict end-to-end test
   validates delayed parent-to-child-to-parent propagation through both forms.
-- Explicit/inherited bare 32-bit `int` module value parameters support declaration-order
-  defaults plus named and positional instance overrides. Per-instance values
-  drive constant initializers, `initial`/`always` expressions, and delays.
+- Explicit/inherited bare 32-bit `int` module value parameters support
+  declaration-order defaults plus named and positional instance overrides.
+  Per-instance values drive constant initializers, `initial`/`always`
+  expressions, and delays.
+- Plain `wire` declarations and undelayed, strengthless whole-net continuous
+  assignments execute as reactive processes. Scheduler-owned drivers resolve
+  Z, X, and conflicting unsigned values across hierarchy.
 
 ## Implemented Language Surface
 
@@ -108,8 +112,10 @@ The current implementation includes:
   `input`/`output`/`inout` value transfer.
 - ANSI module port metadata, root-module discovery, recursively scoped child
   instances, and named/positional whole-signal port binding.
-- Explicit/inherited bare `int` module parameter defaults and named/positional value
-  overrides with per-instance constant scopes.
+- Explicit/inherited bare `int` module parameter defaults and named/positional
+  value overrides with per-instance constant scopes.
+- Plain `wire` nets, reactive continuous assignment processes, and strengthless
+  four-state multiple-driver resolution.
 - Fail-closed `parse_source_conformant` and `elaborate_conformant` APIs. The
   legacy APIs remain permissive for coverage exploration.
 - UVM-oriented report formatting primitives including enum names, string
@@ -221,8 +227,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-     continuous assignments and driver resolution, hierarchical references,
-     and generate `if`/`case`/`for`.
+  delayed/strength-aware drivers, source-specific sensitivity, hierarchical
+  references, and generate `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -279,8 +285,14 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 - The current hierarchy slice supports ANSI packed/scalar ports and simple
   whole-signal named/positional connections. Ports alias a scheduler net;
   complete directionality, net/variable distinctions, width conversion,
-  drivers/resolution, expression actuals, continuous assignments, hierarchy
-  references, and generate remain unsupported.
+  expression actuals, hierarchy references, and generate remain unsupported.
+- Continuous assignment support is limited to plain unsigned `wire` nets,
+  whole-net LHS targets, exact-width represented unsigned signal/literal RHS
+  expressions, and immediate strengthless drivers. Net declaration
+  assignments, procedural net writes, implicit width conversion, signed
+  operands/targets, other net types, drive strengths, assignment delays,
+  dynamic/out-of-range RHS selects, partial/hierarchical targets, and driver
+  release remain unsupported in conformance mode.
 - Module parameter support is limited to explicit or inherited bare 32-bit
   `int` value parameters in the module header, each with a default. Type
   parameters, non-`int` types, module-body parameter/localparam declarations,

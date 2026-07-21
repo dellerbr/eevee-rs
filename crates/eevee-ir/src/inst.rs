@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use eevee_core::LogicVec;
-use eevee_sched::{EdgeKind, ForkJoin, NetId};
+use eevee_sched::{DriverId, EdgeKind, ForkJoin, NetId};
 
 use crate::value::Value;
 
@@ -126,6 +126,8 @@ pub enum Inst {
     BlockingWrite { net: NetId, src: Reg },
     /// Non-blocking assign: schedule the net update for the NBA region.
     NbaWrite { net: NetId, src: Reg },
+    /// Update one continuous driver; the scheduler resolves all drivers.
+    DriveNet { driver: DriverId, src: Reg },
 
     // --- timing controls = process suspension points ---
     /// `#fs` — suspend for `fs` femtoseconds.

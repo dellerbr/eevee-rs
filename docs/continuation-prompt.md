@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 145 tests.
+- `cargo test --workspace` passes all 149 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -48,10 +48,10 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
 - Real UVM phase traversal, delayed `run_phase`, and objection completion.
 - The normative target and narrow feature statuses are tracked in
   `docs/conformance.md`; no whole-standard percentage is claimed.
-- `parse_source_conformant` rejects unsupported CST, continuous assignments,
-  unknown system calls, incomplete port actuals, and non-signal connection
-  expressions, as well as Verible parser-recovery trees, with
-  preprocessed-source line/column diagnostics.
+- `parse_source_conformant` rejects unsupported CST, unsupported continuous
+  assignment/net forms, unknown system calls, incomplete port actuals, and
+  non-signal connection expressions, as well as Verible parser-recovery trees,
+  with preprocessed-source line/column diagnostics.
 - `elaborate_conformant` rejects semantic preflight failures, elaboration
   panics, and every resilient callable stub. `ElabStats::callable_stubs` retains
   qualified names and reasons; permissive APIs remain UVM exploration tools.
@@ -62,25 +62,34 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   test validates delayed propagation through both forms.
 - Constant initialization evaluates every unary/binary operator represented by
   the current AST instead of returning an operand for unsupported cases.
-- Explicit/inherited bare 32-bit `int` module value parameters now support ordered
-  defaults and named/positional overrides. Parent-parameter expressions feed
-  child overrides; per-instance constants drive net initialization,
-  `initial`/`always` expressions, and delays.
+- Explicit/inherited bare 32-bit `int` module value parameters now support
+  ordered defaults and named/positional overrides. Parent-parameter
+  expressions feed child overrides; per-instance constants drive net
+  initialization, `initial`/`always` expressions, and delays.
 - Strict parsing/elaboration reject type or non-`int` module parameters,
   header/body localparams, module-body parameters,
   nonliteral/parameter-dependent packed widths,
   unknown/duplicate/excess overrides, and unresolved/nonconstant parameter
   expressions.
+- Plain `wire` declarations and undelayed, strengthless whole-net continuous
+  assignments now execute as reactive IR processes. Scheduler-owned driver
+  slots resolve Z, X, and conflicting 0/1 values; child output nets alias and
+  drive parent nets.
+- Strict mode rejects net declaration assignments, procedural or signed net
+  drives, implicit width conversion, non-wire net types, strengths, assignment
+  delays, dynamic/out-of-range RHS selects, partial targets, unknown RHS names,
+  and unsupported RHS calls.
 
 The module connectivity model currently aliases a scheduler net. Full port
-directionality, net/variable distinctions, width conversion, drivers, and
-resolution are not claimed.
+directionality, complete net/variable port semantics, and width-converting or
+expression connections are not claimed.
 
 ## Next Priorities
 
-1. Add continuous assignments and generic driver propagation, with strict
-  positive and source-located negative tests. Then extend module parameters
-  into parameter-dependent packed widths and complete value typing/coercion.
+1. Extend continuous drivers with source-specific sensitivity, assignment/net
+  delays, strengths, additional net types, and driver release. Then extend
+  module parameters into parameter-dependent packed widths and complete value
+  typing/coercion.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime

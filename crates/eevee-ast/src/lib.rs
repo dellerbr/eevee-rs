@@ -66,6 +66,7 @@ pub struct Port {
     pub dir: PortDir,
     pub width: u32,
     pub signed: bool,
+    pub is_net: bool,
 }
 
 /// Port direction.
@@ -81,7 +82,12 @@ pub enum PortDir {
 #[derive(Debug, Clone)]
 pub enum ModuleItem {
     Var(VarDecl),
+    Net(NetDecl),
     Instance(ModuleInstance),
+    ContinuousAssign {
+        lhs: Lvalue,
+        rhs: Expr,
+    },
     Always(AlwaysBlock),
     Initial(Stmt),
     Func(FuncDecl),
@@ -100,7 +106,15 @@ pub enum ModuleItem {
     },
     /// A package/module-scope `typedef <Type>[#(...)] <alias>;`.
     TypeAlias(TypeAlias),
-    // ContinuousAssign, Generate, ... (later)
+    // Generate, ... (later)
+}
+
+/// A module net declaration (`wire [W-1:0] name;`).
+#[derive(Debug, Clone)]
+pub struct NetDecl {
+    pub name: String,
+    pub width: u32,
+    pub signed: bool,
 }
 
 /// One instance in a module-instantiation declaration.

@@ -205,6 +205,51 @@ fn parses_module_ports_and_instances() {
 }
 
 #[test]
+fn parses_continuous_assignments() {
+    let src = "module top;\n\
+      logic a, b;\n\
+      wire y, z;\n\
+      assign y = a & b;\n\
+      assign z = a, y = b;\n\
+    endmodule\n";
+    let file = parse_source(src).expect("verible parse");
+    let continuous: Vec<(&Lvalue, &Expr)> = module(&file)
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::ContinuousAssign { lhs, rhs } => Some((lhs, rhs)),
+            _ => None,
+        })
+        .collect();
+    let nets: Vec<&NetDecl> = module(&file)
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::Net(net) => Some(net),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nets.len(), 2);
+    assert_eq!(nets[0].name, "y");
+    assert_eq!(nets[1].name, "z");
+    assert_eq!(continuous.len(), 3);
+    assert_eq!(continuous[0].0.name, "y");
+    assert!(matches!(
+        continuous[0].1,
+        Expr::Binary {
+            op: BinOp::And,
+            lhs,
+            rhs,
+        } if matches!(&**lhs, Expr::Ref(name) if name == "a")
+            && matches!(&**rhs, Expr::Ref(name) if name == "b")
+    ));
+    assert_eq!(continuous[1].0.name, "z");
+    assert!(matches!(continuous[1].1, Expr::Ref(name) if name == "a"));
+    assert_eq!(continuous[2].0.name, "y");
+    assert!(matches!(continuous[2].1, Expr::Ref(name) if name == "b"));
+}
+
+#[test]
 fn parses_module_parameter_defaults_and_overrides() {
     let src = "module child #(parameter int VALUE = 3, DELAY = 5) ();\n\
       endmodule\n\
@@ -282,16 +327,33 @@ fn parses_module_parameter_defaults_and_overrides() {
 }
 
 #[test]
-fn conformance_mode_rejects_skipped_module_items_with_location() {
-    let src = "module top;\n  logic source, result;\n  assign result = source;\nendmodule\n";
-    let error = parse_source_conformant(src).expect_err("continuous assign is unsupported");
+fn conformance_mode_accepts_simple_and_rejects_delayed_continuous_assignments() {
+    let simple =
+        "module top;\n  logic source; wire result;\n  assign result = source;\nendmodule\n";
+    parse_source_conformant(simple).expect("simple continuous assignment is supported");
+
+    let delayed =
+        "module top;\n  logic source; wire result;\n  assign #2 result = source;\nendmodule\n";
+    let error = parse_source_conformant(delayed).expect_err("assignment delay is unsupported");
     assert!(matches!(
         error,
         FeError::UnsupportedSyntax {
             ref construct,
             line: 3,
-            column: 3,
-        } if construct == "kContinuousAssignmentStatement"
+            column: 10,
+        } if construct == "kDelay"
+    ));
+
+    let declaration_assign = "module top;\n  logic source;\n  wire result = source;\nendmodule\n";
+    let error = parse_source_conformant(declaration_assign)
+        .expect_err("net declaration assignments are unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax {
+            ref construct,
+            line: 3,
+            column: 8,
+        } if construct == "kNetDeclarationAssignment"
     ));
 }
 
