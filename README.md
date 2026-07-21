@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 21, 2026:
 
-- 138 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 145 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -71,6 +71,9 @@ Validated on July 21, 2026:
 - ANSI packed/scalar ports and recursive child module instances elaborate with
   named or positional whole-signal connectivity. A strict end-to-end test
   validates delayed parent-to-child-to-parent propagation through both forms.
+- Explicit/inherited bare 32-bit `int` module value parameters support declaration-order
+  defaults plus named and positional instance overrides. Per-instance values
+  drive constant initializers, `initial`/`always` expressions, and delays.
 
 ## Implemented Language Surface
 
@@ -105,6 +108,8 @@ The current implementation includes:
   `input`/`output`/`inout` value transfer.
 - ANSI module port metadata, root-module discovery, recursively scoped child
   instances, and named/positional whole-signal port binding.
+- Explicit/inherited bare `int` module parameter defaults and named/positional value
+  overrides with per-instance constant scopes.
 - Fail-closed `parse_source_conformant` and `elaborate_conformant` APIs. The
   legacy APIs remain permissive for coverage exploration.
 - UVM-oriented report formatting primitives including enum names, string
@@ -215,9 +220,9 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
      machine-readable evidence without publishing a whole-standard percentage.
 
 2. **Core elaboration and hierarchy**
-   - Build on the minimal ANSI-port/child-instance slice with module parameters
-     and overrides, continuous assignments and driver resolution, hierarchical
-     references, and generate `if`/`case`/`for`.
+   - Build on the ANSI-port/child-instance/integral-parameter slice with
+     continuous assignments and driver resolution, hierarchical references,
+     and generate `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -274,8 +279,14 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 - The current hierarchy slice supports ANSI packed/scalar ports and simple
   whole-signal named/positional connections. Ports alias a scheduler net;
   complete directionality, net/variable distinctions, width conversion,
-  drivers/resolution, expression actuals, module parameters, continuous
-  assignments, hierarchy references, and generate remain unsupported.
+  drivers/resolution, expression actuals, continuous assignments, hierarchy
+  references, and generate remain unsupported.
+- Module parameter support is limited to explicit or inherited bare 32-bit
+  `int` value parameters in the module header, each with a default. Type
+  parameters, non-`int` types, module-body parameter/localparam declarations,
+  header localparams, omitted actuals, `defparam`, nonliteral packed declaration
+  bounds, and parameter-dependent packed widths remain unsupported in
+  conformance mode.
 - The passing phase probe constructs `uvm_test_top` directly and calls
   `run_test("")`; named test selection and plusarg-driven factory registration
   are not yet complete.

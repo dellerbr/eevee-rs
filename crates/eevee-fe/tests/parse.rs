@@ -205,6 +205,83 @@ fn parses_module_ports_and_instances() {
 }
 
 #[test]
+fn parses_module_parameter_defaults_and_overrides() {
+    let src = "module child #(parameter int VALUE = 3, DELAY = 5) ();\n\
+      endmodule\n\
+      module top;\n\
+        child default_child();\n\
+        child #(.VALUE(9), .DELAY(2)) named_child();\n\
+        child #(11, 1) positional_child();\n\
+      endmodule\n";
+    let file = parse_source(src).expect("verible parse");
+    let Item::Module(child) = &file.items[0] else {
+        panic!("expected child module, got {:?}", file.items[0]);
+    };
+    assert!(matches!(
+        child.parameters.as_slice(),
+        [
+            ModuleParameter {
+                name: value,
+                width: 32,
+                signed: true,
+                default: Expr::Literal(value_default),
+            },
+            ModuleParameter {
+                name: delay,
+                width: 32,
+                signed: true,
+                default: Expr::Literal(delay_default),
+            }
+        ] if value == "VALUE"
+            && value_default.to_u64() == 3
+            && delay == "DELAY"
+            && delay_default.to_u64() == 5
+    ));
+
+    let Item::Module(top) = &file.items[1] else {
+        panic!("expected top module, got {:?}", file.items[1]);
+    };
+    let instances: Vec<&ModuleInstance> = top
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::Instance(instance) => Some(instance),
+            _ => None,
+        })
+        .collect();
+    assert!(instances[0].parameters.is_empty());
+    assert!(matches!(
+        instances[1].parameters.as_slice(),
+        [
+            ParameterOverride {
+                parameter: Some(value),
+                value: Expr::Literal(value_override),
+            },
+            ParameterOverride {
+                parameter: Some(delay),
+                value: Expr::Literal(delay_override),
+            }
+        ] if value == "VALUE"
+            && value_override.to_u64() == 9
+            && delay == "DELAY"
+            && delay_override.to_u64() == 2
+    ));
+    assert!(matches!(
+        instances[2].parameters.as_slice(),
+        [
+            ParameterOverride {
+                parameter: None,
+                value: Expr::Literal(value_override),
+            },
+            ParameterOverride {
+                parameter: None,
+                value: Expr::Literal(delay_override),
+            }
+        ] if value_override.to_u64() == 11 && delay_override.to_u64() == 1
+    ));
+}
+
+#[test]
 fn conformance_mode_rejects_skipped_module_items_with_location() {
     let src = "module top;\n  logic source, result;\n  assign result = source;\nendmodule\n";
     let error = parse_source_conformant(src).expect_err("continuous assign is unsupported");
@@ -274,18 +351,89 @@ fn conformance_mode_rejects_operator_and_cast_approximations() {
         error,
         FeError::UnsupportedSyntax { ref construct, .. } if construct == "kCast"
     ));
+
+    let time_literal = "module top; initial #1ns $display(\"done\"); endmodule";
+    let error = parse_source_conformant(time_literal)
+        .expect_err("explicit-unit procedural delays are unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "TK_TimeLiteral"
+    ));
 }
 
 #[test]
-fn conformance_mode_rejects_module_parameterization() {
+fn conformance_mode_accepts_integral_module_parameterization() {
     let src = "module child #(parameter int WIDTH = 8) (); endmodule\n\
             module top; child #(.WIDTH(16)) dut(); endmodule\n";
-    let error = parse_source_conformant(src).expect_err("module parameters are unsupported");
+    parse_source_conformant(src).expect("integral value parameters are supported");
+}
+
+#[test]
+fn conformance_mode_rejects_type_module_parameters() {
+    let src = "module child #(parameter type T = int) (); endmodule\n\
+            module top; child #(logic) dut(); endmodule\n";
+    let error = parse_source_conformant(src).expect_err("type parameters are unsupported");
     assert!(matches!(
         error,
         FeError::UnsupportedSyntax { ref construct, .. }
-            if construct == "kFormalParameterList"
+            if construct == "kTypeAssignment"
     ));
+
+    let type_actual = "module child #(parameter int VALUE = 1) (); endmodule\n\
+            module top; child #(logic) dut(); endmodule\n";
+    let error = parse_source_conformant(type_actual)
+        .expect_err("type-valued module parameter actuals are unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. }
+            if construct == "kActualParameterPositionalList"
+    ));
+}
+
+#[test]
+fn conformance_mode_rejects_unimplemented_parameter_types_and_widths() {
+    let non_int = "module child #(parameter byte VALUE = 1) (); endmodule";
+    let error =
+        parse_source_conformant(non_int).expect_err("byte parameter coercion is unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "byte"
+    ));
+
+    let symbolic_width = "module child #(parameter int WIDTH = 8)\n\
+                                (input logic [WIDTH-1:0] value);\n\
+                          endmodule\n";
+    let error = parse_source_conformant(symbolic_width)
+        .expect_err("parameter-dependent packed widths are unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. }
+            if construct == "kDimensionRange"
+    ));
+
+    let localparam = "module child #(localparam int LOCKED = 1) (); endmodule";
+    let error = parse_source_conformant(localparam)
+        .expect_err("module parameter-port localparams are unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "localparam"
+    ));
+
+    let body_parameter = "module child; parameter int VALUE = 1; endmodule";
+    let error = parse_source_conformant(body_parameter)
+        .expect_err("module-body parameters are not per-instance yet");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. }
+            if construct == "kParamDeclaration"
+    ));
+}
+
+#[test]
+fn conformance_mode_keeps_class_type_parameters_separate() {
+    let src = "class box #(type T = int); endclass\n\
+            module top; box #(int) value; endmodule\n";
+    parse_source_conformant(src).expect("class type parameters remain supported syntax");
 }
 
 #[test]

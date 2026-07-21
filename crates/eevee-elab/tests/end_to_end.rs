@@ -78,6 +78,127 @@ fn child_instances_propagate_named_and_positional_ports() {
 }
 
 #[test]
+fn child_instances_apply_default_named_and_positional_parameters() {
+    let src = "module child #(parameter int VALUE = 3,\n\
+                                parameter int BIAS = VALUE + 1)\n\
+               (output logic [7:0] result);\n\
+      logic [7:0] configured = VALUE + BIAS;\n\
+      initial result = configured;\n\
+    endmodule\n\
+      module top #(parameter int BASE = 7);\n\
+      logic [7:0] default_result = 0;\n\
+      logic [7:0] named_result = 0;\n\
+      logic [7:0] positional_result = 0;\n\
+      child default_child(.result(default_result));\n\
+        child #(.VALUE(BASE + 2)) named_child(.result(named_result));\n\
+        child #(11, 1) positional_child(.result(positional_result));\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    sim.run();
+
+    let default = sim
+        .kernel()
+        .find_net("default_result")
+        .expect("default result net");
+    let named = sim
+        .kernel()
+        .find_net("named_result")
+        .expect("named result net");
+    let positional = sim
+        .kernel()
+        .find_net("positional_result")
+        .expect("positional result net");
+    assert_eq!(sim.kernel().net_value(default).to_u64(), 7);
+    assert_eq!(sim.kernel().net_value(named).to_u64(), 19);
+    assert_eq!(sim.kernel().net_value(positional).to_u64(), 12);
+}
+
+#[test]
+fn module_parameter_values_control_instance_delays() {
+    let src = "module child #(parameter int VALUE = 3,\n\
+                  parameter int DELAY = 5)\n\
+               (output logic [7:0] result);\n\
+      initial #(DELAY + 1) result = VALUE;\n\
+    endmodule\n\
+    module top;\n\
+      logic [7:0] default_result = 0;\n\
+      logic [7:0] named_result = 0;\n\
+      logic [7:0] positional_result = 0;\n\
+      child default_child(.result(default_result));\n\
+      child #(.VALUE(9), .DELAY(2)) named_child(.result(named_result));\n\
+      child #(11, 1) positional_child(.result(positional_result));\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+
+    let default = sim
+        .kernel()
+        .find_net("default_result")
+        .expect("default result net");
+    let named = sim
+        .kernel()
+        .find_net("named_result")
+        .expect("named result net");
+    let positional = sim
+        .kernel()
+        .find_net("positional_result")
+        .expect("positional result net");
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    assert_eq!(sim.kernel().net_value(default).to_u64(), 0);
+    assert_eq!(sim.kernel().net_value(named).to_u64(), 0);
+    assert_eq!(sim.kernel().net_value(positional).to_u64(), 11);
+
+    sim.run_until(Some(SimTime::from_fs(3_000_000)));
+    assert_eq!(sim.kernel().net_value(default).to_u64(), 0);
+    assert_eq!(sim.kernel().net_value(named).to_u64(), 9);
+
+    sim.run_until(Some(SimTime::from_fs(6_000_000)));
+    assert_eq!(sim.kernel().net_value(default).to_u64(), 3);
+}
+
+#[test]
+fn conformance_mode_rejects_invalid_module_parameter_overrides() {
+    let cases = [
+        (
+            "module child #(parameter int VALUE = 1) (); endmodule\n\
+         module top; child #(.MISSING(2)) dut(); endmodule\n",
+            "no parameter 'MISSING'",
+        ),
+        (
+            "module child #(parameter int VALUE = 1) (); endmodule\n\
+         module top; child #(.VALUE(2), .VALUE(3)) dut(); endmodule\n",
+            "overrides parameter 'VALUE' more than once",
+        ),
+        (
+            "module child #(parameter int VALUE = 1) (); endmodule\n\
+         module top; child #(2, 3) dut(); endmodule\n",
+            "more positional parameter overrides",
+        ),
+        (
+            "module child #(parameter int VALUE = 1) (); endmodule\n\
+         module top; child #(.VALUE(MISSING)) dut(); endmodule\n",
+            "not a constant expression",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let file = parse_source_conformant(source).expect("parameter syntax parses");
+        let error = match elaborate_conformant(&file, &Interp) {
+            Ok(_) => panic!("invalid parameter override must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+          error,
+          ElabError::UnsupportedSemantic { ref message } if message.contains(expected)
+        ));
+    }
+}
+
+#[test]
 fn conformance_mode_rejects_resilient_callable_stubs() {
     let src = "class broken;\n\
       function int value();\n\

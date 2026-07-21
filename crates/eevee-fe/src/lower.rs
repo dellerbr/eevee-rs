@@ -232,9 +232,71 @@ fn lower_module(n: &Value) -> Module {
 
     Module {
         name,
+        parameters: lower_module_parameters(n),
         ports: lower_module_ports(n),
         items,
     }
+}
+
+fn lower_module_parameters(n: &Value) -> Vec<ModuleParameter> {
+    let Some(list) = find(n, "kModuleHeader")
+        .and_then(|header| find(header, "kFormalParameterListDeclaration"))
+        .and_then(|declaration| find_deep(declaration, "kFormalParameterList"))
+    else {
+        return Vec::new();
+    };
+    let mut parameters = Vec::new();
+    let mut inherited_type = None;
+    for parameter in kids(list).filter(|parameter| tag(parameter) == "kParamDeclaration") {
+        let Some(param_type) = find(parameter, "kParamType") else {
+            continue;
+        };
+        if let Some(parameter_type) = module_parameter_type(param_type) {
+            inherited_type = Some(parameter_type);
+        }
+        let (width, signed) = inherited_type.unwrap_or((32, false));
+        let Some(name) = find(param_type, "SymbolIdentifier")
+            .or_else(|| find_deep(param_type, "SymbolIdentifier"))
+            .map(text)
+        else {
+            continue;
+        };
+        let Some(default) = find(parameter, "kTrailingAssign")
+            .and_then(|assign| find(assign, "kExpression"))
+            .map(lower_expr)
+        else {
+            continue;
+        };
+        parameters.push(ModuleParameter {
+            name: name.to_string(),
+            width,
+            signed,
+            default,
+        });
+    }
+    parameters
+}
+
+fn module_parameter_type(param_type: &Value) -> Option<(u32, bool)> {
+    let primitive = find(param_type, "kTypeInfo")
+        .and_then(|type_info| kids(type_info).next())
+        .map(tag)?;
+    let natural_width = match primitive {
+        "byte" => 8,
+        "shortint" => 16,
+        "int" | "integer" => 32,
+        "longint" | "time" => 64,
+        _ => 1,
+    };
+    let width = find(param_type, "kPackedDimensions")
+        .filter(|dimensions| kids(dimensions).next().is_some())
+        .map(|_| packed_width(param_type))
+        .unwrap_or(natural_width);
+    let signed = matches!(
+        primitive,
+        "byte" | "shortint" | "int" | "integer" | "longint"
+    ) && find_deep(param_type, "unsigned").is_none();
+    Some((width, signed))
 }
 
 fn lower_module_ports(n: &Value) -> Vec<Port> {
@@ -389,10 +451,43 @@ fn lower_module_instances(n: &Value) -> Vec<ModuleInstance> {
             ModuleInstance {
                 module_name: module_name.clone(),
                 name,
+                parameters: lower_parameter_overrides(base),
                 connections,
             }
         })
         .collect()
+}
+
+fn lower_parameter_overrides(n: &Value) -> Vec<ParameterOverride> {
+    let Some(actuals) = find_deep(n, "kActualParameterList") else {
+        return Vec::new();
+    };
+    if let Some(named) = find_deep(actuals, "kActualParameterByNameList") {
+        return kids(named)
+            .filter(|parameter| tag(parameter) == "kParamByName")
+            .filter_map(|parameter| {
+                let name = find(parameter, "SymbolIdentifier").map(text)?.to_string();
+                let value = find(parameter, "kParenGroup")
+                    .and_then(|group| find(group, "kExpression"))
+                    .map(lower_expr)?;
+                Some(ParameterOverride {
+                    parameter: Some(name),
+                    value,
+                })
+            })
+            .collect();
+    }
+    find_deep(actuals, "kActualParameterPositionalList")
+        .map(|positional| {
+            kids(positional)
+                .filter(|value| tag(value) == "kExpression")
+                .map(|value| ParameterOverride {
+                    parameter: None,
+                    value: lower_expr(value),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn lower_port_connections(n: &Value) -> Vec<PortConnection> {
@@ -1414,10 +1509,16 @@ fn lower_sys_call(n: &Value) -> Stmt {
 
 fn lower_timing_control(n: &Value) -> TimingControl {
     match tag(n) {
-        "kDelay" => {
-            let amt = find(n, "kDelayValue").and_then(const_int).unwrap_or(0);
-            TimingControl::Delay(Expr::Literal(LogicVec::from_u64(amt as u64, 32)))
-        }
+        "kDelay" => TimingControl::Delay(
+            find(n, "kDelayValue")
+                .or_else(|| find(n, "kParenGroup"))
+                .map(|value| {
+                    find(value, "kExpression")
+                        .map(lower_expr)
+                        .unwrap_or_else(|| lower_expr(value))
+                })
+                .unwrap_or_else(|| Expr::Literal(LogicVec::zero(32))),
+        ),
         "kEventControl" => {
             let mut events = Vec::new();
             if let Some(list) = find_deep(n, "kEventExpressionList") {

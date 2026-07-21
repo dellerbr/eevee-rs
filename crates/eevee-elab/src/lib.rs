@@ -305,6 +305,8 @@ pub fn elaborate_with_stats_and_dpi(
             module,
             "",
             &HashMap::new(),
+            &[],
+            &global.consts,
             &modules,
             &global,
             &mut sim,
@@ -1270,11 +1272,14 @@ fn elaborate_module_instance(
     m: &Module,
     path: &str,
     port_bindings: &HashMap<String, (NetId, u32)>,
+    parameter_overrides: &[ParameterOverride],
+    parent_consts: &HashMap<String, LogicVec>,
     modules: &HashMap<&str, &Module>,
     g: &Global,
     sim: &mut Sim,
     backend: &dyn ExecBackend,
 ) {
+    let consts = bind_module_parameters(m, parameter_overrides, parent_consts, &g.consts);
     let mut scope: HashMap<String, (NetId, u32)> = HashMap::new();
     for port in &m.ports {
         if let Some(&(net, _)) = port_bindings.get(&port.name) {
@@ -1289,7 +1294,16 @@ fn elaborate_module_instance(
     for it in &m.items {
         if let ModuleItem::Var(v) = it {
             let init = match &v.init {
-                Some(e) => const_eval(e).resize(v.width, v.signed),
+                Some(e) => try_const_eval_with(e, &consts)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "module variable '{}{}{}' initializer is not a constant expression",
+                            path,
+                            if path.is_empty() { "" } else { "." },
+                            v.name
+                        )
+                    })
+                    .resize(v.width, v.signed),
                 None => LogicVec::zero(v.width),
             };
             let net = sim.kernel().new_net(scoped_name(path, &v.name), init);
@@ -1315,7 +1329,7 @@ fn elaborate_module_instance(
                     &g.func_ids,
                     &g.class_ids,
                     &g.class_infos,
-                    &g.consts,
+                    &consts,
                     &gv,
                     ts,
                 )
@@ -1328,7 +1342,7 @@ fn elaborate_module_instance(
                     &g.func_ids,
                     &g.class_ids,
                     &g.class_infos,
-                    &g.consts,
+                    &consts,
                     &gv,
                     ts,
                 )
@@ -1362,12 +1376,72 @@ fn elaborate_module_instance(
             child,
             &scoped_name(path, &instance.name),
             &bindings,
+            &instance.parameters,
+            &consts,
             modules,
             g,
             sim,
             backend,
         );
     }
+}
+
+fn bind_module_parameters(
+    module: &Module,
+    overrides: &[ParameterOverride],
+    parent_consts: &HashMap<String, LogicVec>,
+    global_consts: &HashMap<String, LogicVec>,
+) -> HashMap<String, LogicVec> {
+    let mut resolved_overrides = HashMap::new();
+    for (position, parameter_override) in overrides.iter().enumerate() {
+        let parameter = match &parameter_override.parameter {
+            Some(name) => module
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == *name)
+                .unwrap_or_else(|| panic!("module '{}' has no parameter '{}'", module.name, name)),
+            None => module.parameters.get(position).unwrap_or_else(|| {
+                panic!(
+                    "module '{}' has fewer parameters than positional override {}",
+                    module.name,
+                    position + 1
+                )
+            }),
+        };
+        let value =
+            try_const_eval_with(&parameter_override.value, parent_consts).unwrap_or_else(|| {
+                panic!(
+                    "module parameter override '{}.{}' is not a constant expression",
+                    module.name, parameter.name
+                )
+            });
+        if resolved_overrides
+            .insert(parameter.name.clone(), value)
+            .is_some()
+        {
+            panic!(
+                "module parameter '{}.{}' is overridden more than once",
+                module.name, parameter.name
+            );
+        }
+    }
+
+    let mut consts = global_consts.clone();
+    for parameter in &module.parameters {
+        let value = resolved_overrides
+            .remove(&parameter.name)
+            .unwrap_or_else(|| {
+                try_const_eval_with(&parameter.default, &consts).unwrap_or_else(|| {
+                    panic!(
+                        "default value for module parameter '{}.{}' is not a constant expression",
+                        module.name, parameter.name
+                    )
+                })
+            })
+            .resize(parameter.width, parameter.signed);
+        consts.insert(parameter.name.clone(), value);
+    }
+    consts
 }
 
 fn bind_instance_ports(
@@ -1476,7 +1550,7 @@ fn default_value(fld: &VarDecl, consts: &HashMap<String, LogicVec>) -> Value {
             _ => Value::Str(Rc::from("")),
         }
     } else if let Some(init) = &fld.init {
-        Value::Logic(const_eval_with(init, Some(consts)).resize(fld.width.max(1), fld.signed))
+        Value::Logic(const_eval_with(init, consts).resize(fld.width.max(1), fld.signed))
     } else {
         Value::Logic(LogicVec::zero(fld.width.max(1)))
     }
@@ -2105,7 +2179,8 @@ impl<'a> CodeGen<'a> {
     fn gen_timing(&mut self, c: &TimingControl, pb: &mut ProgramBuilder) {
         match c {
             TimingControl::Delay(e) => {
-                let fs = self.ts.delay_to_fs(const_eval(e).to_u64() as f64);
+                let delay = const_eval_with(e, self.consts);
+                let fs = self.ts.delay_to_fs(delay.to_u64() as f64);
                 pb.emit(Inst::Delay { fs });
             }
             TimingControl::Event(evs) => {
@@ -3236,52 +3311,50 @@ fn coll_op(method: &str) -> Option<CollOp> {
     })
 }
 
-/// Constant-fold an expression (for init values and `#delay` amounts).
-fn const_eval(e: &Expr) -> LogicVec {
-    const_eval_with(e, None)
+fn const_eval_with(e: &Expr, consts: &HashMap<String, LogicVec>) -> LogicVec {
+    try_const_eval_with(e, consts).unwrap_or_else(|| LogicVec::zero(32))
 }
 
-fn const_eval_with(e: &Expr, consts: Option<&HashMap<String, LogicVec>>) -> LogicVec {
+fn try_const_eval_with(e: &Expr, consts: &HashMap<String, LogicVec>) -> Option<LogicVec> {
     match e {
-        Expr::Literal(lv) => lv.clone(),
-        Expr::Str(_) => LogicVec::zero(32),
-        Expr::Ref(name) => consts
-            .and_then(|values| values.get(name))
-            .cloned()
-            .unwrap_or_else(|| LogicVec::zero(32)),
-        Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Field { .. } | Expr::New { .. } => {
-            LogicVec::zero(32)
-        }
-        Expr::StaticCall { .. } => LogicVec::zero(32),
-        Expr::StaticRef { .. } => LogicVec::zero(32),
-        Expr::Index { .. } => LogicVec::zero(32),
+        Expr::Literal(lv) => Some(lv.clone()),
+        Expr::Ref(name) => consts.get(name).cloned(),
+        Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Field { .. } | Expr::New { .. } => None,
+        Expr::Str(_)
+        | Expr::StaticCall { .. }
+        | Expr::StaticRef { .. }
+        | Expr::Index { .. }
+        | Expr::Null
+        | Expr::SysCall { .. } => None,
         Expr::PartSelect { base, left, right } => {
-            let value = const_eval_with(base, consts);
-            let left = const_eval_with(left, consts).to_u64() as u32;
-            let right = const_eval_with(right, consts).to_u64() as u32;
+            let value = try_const_eval_with(base, consts)?;
+            let left = try_const_eval_with(left, consts)?.to_u64() as u32;
+            let right = try_const_eval_with(right, consts)?.to_u64() as u32;
             if left >= right {
-                value.slice(left, right)
+                Some(value.slice(left, right))
             } else {
                 let width = right - left + 1;
                 let mut selected = LogicVec::zero(width);
                 for offset in 0..width {
                     selected.set_bit(offset, value.get_bit(right - offset));
                 }
-                selected
+                Some(selected)
             }
         }
-        Expr::Null => LogicVec::zero(32),
         Expr::Concat(parts) => {
-            let mut parts = parts.iter().map(|part| const_eval_with(part, consts));
+            let mut parts = parts.iter().map(|part| try_const_eval_with(part, consts));
             let Some(first) = parts.next() else {
-                return LogicVec::zero(1);
+                return Some(LogicVec::zero(1));
             };
-            parts.fold(first, |value, part| value.concat(&part))
+            let mut value = first?;
+            for part in parts {
+                value = value.concat(&part?);
+            }
+            Some(value)
         }
-        Expr::SysCall { .. } => LogicVec::zero(32),
         Expr::Unary { op, operand } => {
-            let v = const_eval_with(operand, consts);
-            match op {
+            let v = try_const_eval_with(operand, consts)?;
+            Some(match op {
                 UnaryOp::BitNot => v.bitnot(),
                 UnaryOp::LogNot => v.lognot(),
                 UnaryOp::Neg => v.neg(),
@@ -3289,12 +3362,12 @@ fn const_eval_with(e: &Expr, consts: Option<&HashMap<String, LogicVec>>) -> Logi
                 UnaryOp::ReduceAnd => LogicVec::from_bit(v.reduce_and()),
                 UnaryOp::ReduceOr => LogicVec::from_bit(v.reduce_or()),
                 UnaryOp::ReduceXor => LogicVec::from_bit(v.reduce_xor()),
-            }
+            })
         }
         Expr::Binary { op, lhs, rhs } => {
-            let l = const_eval_with(lhs, consts);
-            let r = const_eval_with(rhs, consts);
-            match op {
+            let l = try_const_eval_with(lhs, consts)?;
+            let r = try_const_eval_with(rhs, consts)?;
+            Some(match op {
                 BinOp::Add => l.add(&r),
                 BinOp::Sub => l.sub(&r),
                 BinOp::Mul => l.mul(&r),
@@ -3311,7 +3384,7 @@ fn const_eval_with(e: &Expr, consts: Option<&HashMap<String, LogicVec>>) -> Logi
                 BinOp::Shr => l.shr(r.to_u64() as u32),
                 BinOp::LogAnd => LogicVec::from_u64((l.is_true() && r.is_true()) as u64, 1),
                 BinOp::LogOr => LogicVec::from_u64((l.is_true() || r.is_true()) as u64, 1),
-            }
+            })
         }
     }
 }

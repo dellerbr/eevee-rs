@@ -28,6 +28,9 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
         }
         "kModuleItemList" | "kPackageItemList" => {
             for child in kids(node) {
+                if tag(node) == "kModuleItemList" && tag(child) == "kParamDeclaration" {
+                    return unsupported(child, source);
+                }
                 if !matches!(
                     tag(child),
                     "kDataDeclaration"
@@ -46,21 +49,17 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                 }
             }
         }
-        "kModuleHeader" if find_deep(node, "kFormalParameterList").is_some() => {
-            return unsupported(
-                find_deep(node, "kFormalParameterList").expect("checked above"),
-                source,
-            );
+        "kModuleHeader" => {
+            if let Some(parameters) = find_deep(node, "kFormalParameterList") {
+                validate_module_parameter_list(parameters, source)?;
+            }
         }
-        "kDataDeclaration"
-            if find_deep(node, "kGateInstance").is_some()
-                && find_deep(node, "kActualParameterList").is_some() =>
-        {
-            return unsupported(
-                find_deep(node, "kActualParameterList").expect("checked above"),
-                source,
-            );
+        "kDataDeclaration" if find_deep(node, "kGateInstance").is_some() => {
+            if let Some(parameters) = find_deep(node, "kActualParameterList") {
+                validate_module_parameter_actuals(parameters, source)?;
+            }
         }
+        "kPackedDimensions" => validate_literal_packed_dimensions(node, source)?,
         "kSystemTFCall" => {
             let identifier = find_deep(node, "SystemTFIdentifier")
                 .expect("Verible system call without an identifier");
@@ -104,6 +103,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
             }
         }
         "kCast" | "kIncrementDecrementExpression" => return unsupported(node, source),
+        "TK_TimeLiteral" => return unsupported(node, source),
         "kBinaryExpression" => {
             let children: Vec<_> = kids(node).collect();
             for operator in children.iter().skip(1).step_by(2) {
@@ -209,6 +209,111 @@ fn supported_statement(tag: &str) -> bool {
             | "kStatement"
             | "kNullStatement"
     )
+}
+
+fn validate_separated_list(node: &Value, item_tag: &str, source: &str) -> Result<(), FeError> {
+    let children: Vec<_> = kids(node).collect();
+    if children.is_empty()
+        || children.iter().enumerate().any(|(index, child)| {
+            if index % 2 == 0 {
+                tag(child) != item_tag
+            } else {
+                tag(child) != ","
+            }
+        })
+    {
+        return unsupported(node, source);
+    }
+    Ok(())
+}
+
+fn validate_module_parameter_list(node: &Value, source: &str) -> Result<(), FeError> {
+    validate_separated_list(node, "kParamDeclaration", source)?;
+    let mut inherited_int = false;
+    for parameter in kids(node).filter(|child| tag(child) == "kParamDeclaration") {
+        if let Some(localparam) = kids(parameter).find(|child| tag(child) == "localparam") {
+            return unsupported(localparam, source);
+        }
+        if let Some(type_assignment) = find(parameter, "kTypeAssignment") {
+            return unsupported(type_assignment, source);
+        }
+        let Some(param_type) = find(parameter, "kParamType") else {
+            return unsupported(parameter, source);
+        };
+        let type_tokens: Vec<_> = find(param_type, "kTypeInfo")
+            .map(kids)
+            .into_iter()
+            .flatten()
+            .collect();
+        if let Some(token) = type_tokens.first() {
+            if type_tokens.len() != 1 || tag(token) != "int" {
+                return unsupported(token, source);
+            }
+            inherited_int = true;
+        } else if !inherited_int {
+            return unsupported(param_type, source);
+        }
+        if let Some(dimensions) = find(param_type, "kPackedDimensions") {
+            if kids(dimensions).next().is_some() {
+                return unsupported(dimensions, source);
+            }
+        }
+        if let Some(dimensions) = find(param_type, "kUnpackedDimensions") {
+            if kids(dimensions).next().is_some() {
+                return unsupported(dimensions, source);
+            }
+        }
+        let Some(default) =
+            find(parameter, "kTrailingAssign").and_then(|assign| find(assign, "kExpression"))
+        else {
+            return unsupported(parameter, source);
+        };
+        validate_node(default, source)?;
+    }
+    Ok(())
+}
+
+fn validate_literal_packed_dimensions(node: &Value, source: &str) -> Result<(), FeError> {
+    for child in kids(node) {
+        if tag(child) == "kDimensionRange" {
+            let expressions: Vec<_> = kids(child)
+                .filter(|candidate| tag(candidate) == "kExpression")
+                .collect();
+            if expressions.len() != 2
+                || expressions
+                    .iter()
+                    .any(|expression| kids(expression).next().map(tag) != Some("kNumber"))
+            {
+                return unsupported(child, source);
+            }
+        } else {
+            validate_literal_packed_dimensions(child, source)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_module_parameter_actuals(node: &Value, source: &str) -> Result<(), FeError> {
+    if let Some(named) = find_deep(node, "kActualParameterByNameList") {
+        validate_separated_list(named, "kParamByName", source)?;
+        for parameter in kids(named).filter(|child| tag(child) == "kParamByName") {
+            let Some(expression) =
+                find(parameter, "kParenGroup").and_then(|group| find(group, "kExpression"))
+            else {
+                return unsupported(parameter, source);
+            };
+            validate_node(expression, source)?;
+        }
+        return Ok(());
+    }
+    let Some(positional) = find_deep(node, "kActualParameterPositionalList") else {
+        return unsupported(node, source);
+    };
+    validate_separated_list(positional, "kExpression", source)?;
+    for expression in kids(positional).filter(|child| tag(child) == "kExpression") {
+        validate_node(expression, source)?;
+    }
+    Ok(())
 }
 
 fn unsupported<T>(node: &Value, source: &str) -> Result<T, FeError> {

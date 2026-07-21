@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 138 tests.
+- `cargo test --workspace` passes all 145 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -62,6 +62,15 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   test validates delayed propagation through both forms.
 - Constant initialization evaluates every unary/binary operator represented by
   the current AST instead of returning an operand for unsupported cases.
+- Explicit/inherited bare 32-bit `int` module value parameters now support ordered
+  defaults and named/positional overrides. Parent-parameter expressions feed
+  child overrides; per-instance constants drive net initialization,
+  `initial`/`always` expressions, and delays.
+- Strict parsing/elaboration reject type or non-`int` module parameters,
+  header/body localparams, module-body parameters,
+  nonliteral/parameter-dependent packed widths,
+  unknown/duplicate/excess overrides, and unresolved/nonconstant parameter
+  expressions.
 
 The module connectivity model currently aliases a scheduler net. Full port
 directionality, net/variable distinctions, width conversion, drivers, and
@@ -69,9 +78,9 @@ resolution are not claimed.
 
 ## Next Priorities
 
-1. Add module parameters/defaults/instance overrides, then continuous
-  assignments and generic driver propagation. Add strict positive and
-  source-located negative tests for each slice.
+1. Add continuous assignments and generic driver propagation, with strict
+  positive and source-located negative tests. Then extend module parameters
+  into parameter-dependent packed widths and complete value typing/coercion.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime

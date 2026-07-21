@@ -11,10 +11,17 @@ pub(crate) fn validate(file: &SourceFile) -> Result<(), ElabError> {
     validate_hierarchy(file)?;
     for item in &file.items {
         match item {
-            Item::Module(module) => validate_items(&module.items)?,
-            Item::Package(package) => validate_items(&package.items)?,
+            Item::Module(module) => {
+                let parameters: HashSet<&str> = module
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.name.as_str())
+                    .collect();
+                validate_items(&module.items, Some(&parameters))?;
+            }
+            Item::Package(package) => validate_items(&package.items, None)?,
             Item::Class(class) => validate_class(class)?,
-            Item::Func(function) => validate_function(function)?,
+            Item::Func(function) => validate_function(function, None)?,
         }
     }
     Ok(())
@@ -30,6 +37,7 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
             return unsupported(format!("duplicate module declaration '{}'", module.name));
         }
         validate_module_scope(module)?;
+        validate_module_parameters(module)?;
     }
 
     for module in modules.values() {
@@ -43,6 +51,7 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
                     instance.module_name, module.name, instance.name
                 ));
             };
+            validate_parameter_overrides(module, child, instance)?;
             let mut named = HashSet::new();
             for (position, connection) in instance.connections.iter().enumerate() {
                 let port = match &connection.port {
@@ -101,6 +110,85 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
     Ok(())
 }
 
+fn validate_module_parameters(module: &Module) -> Result<(), ElabError> {
+    let mut visible = HashSet::new();
+    for parameter in &module.parameters {
+        if !is_parameter_constant_expr(&parameter.default, &visible) {
+            return unsupported(format!(
+                "default value for module parameter '{}.{}' is not a constant expression",
+                module.name, parameter.name
+            ));
+        }
+        validate_expr(&parameter.default)?;
+        visible.insert(parameter.name.as_str());
+    }
+    Ok(())
+}
+
+fn validate_parameter_overrides(
+    parent: &Module,
+    child: &Module,
+    instance: &eevee_ast::ModuleInstance,
+) -> Result<(), ElabError> {
+    let named = instance
+        .parameters
+        .first()
+        .is_some_and(|parameter| parameter.parameter.is_some());
+    if instance
+        .parameters
+        .iter()
+        .any(|parameter| parameter.parameter.is_some() != named)
+    {
+        return unsupported(format!(
+            "instance '{}.{}' mixes named and positional parameter overrides",
+            parent.name, instance.name
+        ));
+    }
+
+    let mut overridden = HashSet::new();
+    let parent_parameters: HashSet<&str> = parent
+        .parameters
+        .iter()
+        .map(|parameter| parameter.name.as_str())
+        .collect();
+    for (position, parameter_override) in instance.parameters.iter().enumerate() {
+        let parameter = match &parameter_override.parameter {
+            Some(name) => child
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == *name)
+                .ok_or_else(|| ElabError::UnsupportedSemantic {
+                    message: format!(
+                        "module '{}' has no parameter '{}' overridden by '{}.{}'",
+                        child.name, name, parent.name, instance.name
+                    ),
+                })?,
+            None => child.parameters.get(position).ok_or_else(|| {
+                ElabError::UnsupportedSemantic {
+                    message: format!(
+                        "instance '{}.{}' has more positional parameter overrides than module '{}' has parameters",
+                        parent.name, instance.name, child.name
+                    ),
+                }
+            })?,
+        };
+        if !overridden.insert(parameter.name.as_str()) {
+            return unsupported(format!(
+                "instance '{}.{}' overrides parameter '{}' more than once",
+                parent.name, instance.name, parameter.name
+            ));
+        }
+        if !is_parameter_constant_expr(&parameter_override.value, &parent_parameters) {
+            return unsupported(format!(
+                "override for module parameter '{}.{}' is not a constant expression",
+                child.name, parameter.name
+            ));
+        }
+        validate_expr(&parameter_override.value)?;
+    }
+    Ok(())
+}
+
 fn module_signal_width(module: &Module, name: &str) -> Option<u32> {
     module
         .ports
@@ -117,6 +205,14 @@ fn module_signal_width(module: &Module, name: &str) -> Option<u32> {
 
 fn validate_module_scope(module: &Module) -> Result<(), ElabError> {
     let mut names = HashSet::new();
+    for parameter in &module.parameters {
+        if !names.insert(parameter.name.as_str()) {
+            return unsupported(format!(
+                "duplicate declaration '{}' in module '{}'",
+                parameter.name, module.name
+            ));
+        }
+    }
     for port in &module.ports {
         if !names.insert(port.name.as_str()) {
             return unsupported(format!(
@@ -173,10 +269,13 @@ fn visit_module<'a>(
     Ok(())
 }
 
-fn validate_items(items: &[ModuleItem]) -> Result<(), ElabError> {
+fn validate_items(
+    items: &[ModuleItem],
+    module_parameters: Option<&HashSet<&str>>,
+) -> Result<(), ElabError> {
     for item in items {
         match item {
-            ModuleItem::Var(var) => validate_static_var(var)?,
+            ModuleItem::Var(var) => validate_static_var(var, module_parameters)?,
             ModuleItem::Instance(instance) => {
                 for connection in &instance.connections {
                     if !matches!(connection.expr, Expr::Ref(_)) {
@@ -188,9 +287,9 @@ fn validate_items(items: &[ModuleItem]) -> Result<(), ElabError> {
                     }
                 }
             }
-            ModuleItem::Always(always) => validate_stmt(&always.body)?,
-            ModuleItem::Initial(body) => validate_stmt(body)?,
-            ModuleItem::Func(function) => validate_function(function)?,
+            ModuleItem::Always(always) => validate_stmt(&always.body, module_parameters)?,
+            ModuleItem::Initial(body) => validate_stmt(body, module_parameters)?,
+            ModuleItem::Func(function) => validate_function(function, module_parameters)?,
             ModuleItem::Class(class) => validate_class(class)?,
             ModuleItem::EnumConst { .. }
             | ModuleItem::EnumType { .. }
@@ -200,7 +299,10 @@ fn validate_items(items: &[ModuleItem]) -> Result<(), ElabError> {
     Ok(())
 }
 
-fn validate_static_var(var: &VarDecl) -> Result<(), ElabError> {
+fn validate_static_var(
+    var: &VarDecl,
+    module_parameters: Option<&HashSet<&str>>,
+) -> Result<(), ElabError> {
     validate_type(var.class_name.as_deref())?;
     let Some(init) = &var.init else {
         return Ok(());
@@ -210,7 +312,7 @@ fn validate_static_var(var: &VarDecl) -> Result<(), ElabError> {
     } else if var.is_string {
         matches!(init, Expr::Str(_))
     } else {
-        is_constant_expr(init)
+        is_constant_expr(init, module_parameters)
     };
     if !supported {
         return unsupported(format!(
@@ -224,18 +326,21 @@ fn validate_static_var(var: &VarDecl) -> Result<(), ElabError> {
 fn validate_class(class: &ClassDecl) -> Result<(), ElabError> {
     validate_type(class.base.as_deref())?;
     for field in &class.fields {
-        validate_static_var(field)?;
+        validate_static_var(field, None)?;
     }
     for method in &class.methods {
-        validate_function(method)?;
+        validate_function(method, None)?;
     }
     if let Some(constructor) = &class.constructor {
-        validate_function(constructor)?;
+        validate_function(constructor, None)?;
     }
     Ok(())
 }
 
-fn validate_function(function: &FuncDecl) -> Result<(), ElabError> {
+fn validate_function(
+    function: &FuncDecl,
+    module_parameters: Option<&HashSet<&str>>,
+) -> Result<(), ElabError> {
     validate_type(function.ret_class.as_deref())?;
     for parameter in &function.params {
         validate_type(parameter.class_name.as_deref())?;
@@ -243,14 +348,14 @@ fn validate_function(function: &FuncDecl) -> Result<(), ElabError> {
             validate_expr(default)?;
         }
     }
-    validate_stmt(&function.body)
+    validate_stmt(&function.body, module_parameters)
 }
 
-fn validate_stmt(stmt: &Stmt) -> Result<(), ElabError> {
+fn validate_stmt(stmt: &Stmt, module_parameters: Option<&HashSet<&str>>) -> Result<(), ElabError> {
     match stmt {
         Stmt::Block(statements) => {
             for statement in statements {
-                validate_stmt(statement)?;
+                validate_stmt(statement, module_parameters)?;
             }
         }
         Stmt::VarDecl(var) => {
@@ -261,7 +366,7 @@ fn validate_stmt(stmt: &Stmt) -> Result<(), ElabError> {
         Stmt::Timed { control, body } => {
             match control {
                 TimingControl::Delay(expr) => {
-                    if !is_constant_expr(expr) {
+                    if !is_constant_expr(expr, module_parameters) {
                         return unsupported(
                             "nonconstant procedural delays are not implemented".to_string(),
                         );
@@ -278,7 +383,7 @@ fn validate_stmt(stmt: &Stmt) -> Result<(), ElabError> {
                 }
                 TimingControl::Wait(expr) => validate_expr(expr)?,
             }
-            validate_stmt(body)?;
+            validate_stmt(body, module_parameters)?;
         }
         Stmt::Blocking { lhs, rhs } | Stmt::Nonblocking { lhs, rhs } => {
             validate_lvalue(lhs)?;
@@ -290,14 +395,14 @@ fn validate_stmt(stmt: &Stmt) -> Result<(), ElabError> {
             else_branch,
         } => {
             validate_expr(cond)?;
-            validate_stmt(then_branch)?;
+            validate_stmt(then_branch, module_parameters)?;
             if let Some(branch) = else_branch {
-                validate_stmt(branch)?;
+                validate_stmt(branch, module_parameters)?;
             }
         }
         Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
             validate_expr(cond)?;
-            validate_stmt(body)?;
+            validate_stmt(body, module_parameters)?;
         }
         Stmt::Case {
             expr,
@@ -309,17 +414,17 @@ fn validate_stmt(stmt: &Stmt) -> Result<(), ElabError> {
                 for value in values {
                     validate_expr(value)?;
                 }
-                validate_stmt(body)?;
+                validate_stmt(body, module_parameters)?;
             }
             if let Some(body) = default {
-                validate_stmt(body)?;
+                validate_stmt(body, module_parameters)?;
             }
         }
         Stmt::Foreach {
             collection, body, ..
         } => {
             validate_expr(collection)?;
-            validate_stmt(body)?;
+            validate_stmt(body, module_parameters)?;
         }
         Stmt::SysCall { name, args } => {
             let supported = match name.as_str() {
@@ -343,7 +448,7 @@ fn validate_stmt(stmt: &Stmt) -> Result<(), ElabError> {
         }
         Stmt::Fork { branches, .. } => {
             for branch in branches {
-                validate_stmt(branch)?;
+                validate_stmt(branch, module_parameters)?;
             }
         }
         Stmt::Break | Stmt::Continue | Stmt::Null => {}
@@ -416,15 +521,44 @@ fn validate_exprs(expressions: &[Expr]) -> Result<(), ElabError> {
     Ok(())
 }
 
-fn is_constant_expr(expr: &Expr) -> bool {
+fn is_constant_expr(expr: &Expr, module_parameters: Option<&HashSet<&str>>) -> bool {
     match expr {
         Expr::Literal(_) => true,
-        Expr::Unary { operand, .. } => is_constant_expr(operand),
-        Expr::Binary { lhs, rhs, .. } => is_constant_expr(lhs) && is_constant_expr(rhs),
-        Expr::PartSelect { base, left, right } => {
-            is_constant_expr(base) && is_constant_expr(left) && is_constant_expr(right)
+        Expr::Ref(name) => {
+            module_parameters.is_some_and(|parameters| parameters.contains(name.as_str()))
         }
-        Expr::Concat(parts) => parts.iter().all(is_constant_expr),
+        Expr::Unary { operand, .. } => is_constant_expr(operand, module_parameters),
+        Expr::Binary { lhs, rhs, .. } => {
+            is_constant_expr(lhs, module_parameters) && is_constant_expr(rhs, module_parameters)
+        }
+        Expr::PartSelect { base, left, right } => {
+            is_constant_expr(base, module_parameters)
+                && is_constant_expr(left, module_parameters)
+                && is_constant_expr(right, module_parameters)
+        }
+        Expr::Concat(parts) => parts
+            .iter()
+            .all(|part| is_constant_expr(part, module_parameters)),
+        _ => false,
+    }
+}
+
+fn is_parameter_constant_expr(expr: &Expr, visible: &HashSet<&str>) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Ref(name) => visible.contains(name.as_str()),
+        Expr::Unary { operand, .. } => is_parameter_constant_expr(operand, visible),
+        Expr::Binary { lhs, rhs, .. } => {
+            is_parameter_constant_expr(lhs, visible) && is_parameter_constant_expr(rhs, visible)
+        }
+        Expr::PartSelect { base, left, right } => {
+            is_parameter_constant_expr(base, visible)
+                && is_parameter_constant_expr(left, visible)
+                && is_parameter_constant_expr(right, visible)
+        }
+        Expr::Concat(parts) => parts
+            .iter()
+            .all(|part| is_parameter_constant_expr(part, visible)),
         _ => false,
     }
 }

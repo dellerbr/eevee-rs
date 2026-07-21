@@ -45,8 +45,18 @@ pub struct Package {
 #[derive(Debug, Clone)]
 pub struct Module {
     pub name: String,
+    pub parameters: Vec<ModuleParameter>,
     pub ports: Vec<Port>,
     pub items: Vec<ModuleItem>,
+}
+
+/// An integral value parameter declared in a module header.
+#[derive(Debug, Clone)]
+pub struct ModuleParameter {
+    pub name: String,
+    pub width: u32,
+    pub signed: bool,
+    pub default: Expr,
 }
 
 /// A module port.
@@ -98,7 +108,16 @@ pub enum ModuleItem {
 pub struct ModuleInstance {
     pub module_name: String,
     pub name: String,
+    pub parameters: Vec<ParameterOverride>,
     pub connections: Vec<PortConnection>,
+}
+
+/// A named (`.PARAM(expr)`) or positional module-parameter override.
+#[derive(Debug, Clone)]
+pub struct ParameterOverride {
+    /// `None` for positional overrides.
+    pub parameter: Option<String>,
+    pub value: Expr,
 }
 
 /// A named (`.port(expr)`) or positional module-port connection.
