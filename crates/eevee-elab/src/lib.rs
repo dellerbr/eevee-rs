@@ -9,11 +9,13 @@
 //!    [`ExecBackend`] (interpreter today, JIT later).
 //!
 //! Names are resolved to `NetId`s / registers *here*, once — the running IR
-//! never does name lookup. This is the P2 vertical slice (RTL subset); classes,
-//! ports/instances, generate, and full type inference build on this spine.
+//! never does name lookup. This is the P2 vertical slice (RTL subset); module
+//! parameters, generate, continuous assignments, and full type inference build
+//! on this spine.
 
 #![forbid(unsafe_code)]
 
+mod conformance;
 mod mono;
 
 use std::cell::RefCell;
@@ -39,7 +41,42 @@ pub struct ElabStats {
     pub callables_stubbed: usize,
     /// Why callables were stubbed: (reason, count), highest first.
     pub stub_reasons: Vec<(String, usize)>,
+    /// Every resilient compile fallback with its qualified callable name.
+    pub callable_stubs: Vec<CallableStub>,
 }
+
+/// One callable body replaced by a resilient default-return program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableStub {
+    pub callable: String,
+    pub reason: String,
+}
+
+/// A fail-closed elaboration error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElabError {
+    UnsupportedSemantic { message: String },
+    CallableStubs { stubs: Vec<CallableStub> },
+}
+
+impl std::fmt::Display for ElabError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ElabError::UnsupportedSemantic { message } => {
+                write!(f, "unsupported SystemVerilog semantics: {message}")
+            }
+            ElabError::CallableStubs { stubs } => {
+                write!(f, "{} callable bodies require resilient stubs", stubs.len())?;
+                if let Some(first) = stubs.first() {
+                    write!(f, ": {} ({})", first.callable, first.reason)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ElabError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CollInfo {
@@ -76,6 +113,36 @@ struct Global {
 /// Elaborate a parsed source file into a runnable simulation.
 pub fn elaborate(file: &SourceFile, backend: &dyn ExecBackend) -> Sim {
     elaborate_with_stats(file, backend).0
+}
+
+/// Elaborate in fail-closed conformance mode. Unlike [`elaborate`], this never
+/// accepts resilient callable stubs or an elaboration panic as a successful
+/// simulation.
+pub fn elaborate_conformant(
+    file: &SourceFile,
+    backend: &dyn ExecBackend,
+) -> Result<Sim, ElabError> {
+    elaborate_with_stats_conformant(file, backend).map(|(sim, _)| sim)
+}
+
+/// Conformant elaboration with ingestion statistics.
+pub fn elaborate_with_stats_conformant(
+    file: &SourceFile,
+    backend: &dyn ExecBackend,
+) -> Result<(Sim, ElabStats), ElabError> {
+    conformance::validate(file)?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        elaborate_with_stats(file, backend)
+    }));
+    let (sim, stats) = result.map_err(|payload| ElabError::UnsupportedSemantic {
+        message: panic_message(payload.as_ref()),
+    })?;
+    if !stats.callable_stubs.is_empty() {
+        return Err(ElabError::CallableStubs {
+            stubs: stats.callable_stubs,
+        });
+    }
+    Ok((sim, stats))
 }
 
 /// Elaborate with caller-provided DPI-C host bindings.
@@ -211,12 +278,38 @@ pub fn elaborate_with_stats_and_dpi(
     );
     let stats = global.stats.clone();
 
-    // Each module contributes nets + processes, compiled against the global
-    // class/function tables.
-    for item in &file.items {
-        if let Item::Module(m) = item {
-            elaborate_module_processes(m, &global, &mut sim, backend);
-        }
+    // Elaborate only root modules. Child modules are recursively instantiated
+    // from their declarations so each instance gets independent local nets and
+    // processes while connected ports share their parent's scheduler NetIds.
+    let modules: HashMap<&str, &Module> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Module(module) => Some((module.name.as_str(), module)),
+            _ => None,
+        })
+        .collect();
+    let instantiated: HashSet<&str> = modules
+        .values()
+        .flat_map(|module| module.items.iter())
+        .filter_map(|item| match item {
+            ModuleItem::Instance(instance) => Some(instance.module_name.as_str()),
+            _ => None,
+        })
+        .collect();
+    for module in modules
+        .values()
+        .filter(|module| !instantiated.contains(module.name.as_str()))
+    {
+        elaborate_module_instance(
+            module,
+            "",
+            &HashMap::new(),
+            &modules,
+            &global,
+            &mut sim,
+            backend,
+        );
     }
     (sim, stats)
 }
@@ -713,6 +806,7 @@ fn build_global(
     let mut funcs: Vec<Rc<Program>> = Vec::with_capacity(jobs.len());
     let mut stubbed = 0usize;
     let mut reasons: HashMap<String, usize> = HashMap::new();
+    let mut callable_stubs = Vec::new();
     // Optional per-function stub diagnostics. Set EEVEE_DUMP_STUBS=1 to list
     // every stubbed callable and its panic category; set it to a substring to
     // filter (e.g. EEVEE_DUMP_STUBS=uvm_init).
@@ -742,16 +836,20 @@ fn build_global(
             Err(payload) => {
                 stubbed += 1;
                 let reason = panic_category(payload.as_ref());
+                let qual = match cc {
+                    Some(cid) => format!("{}::{}", class_infos[cid as usize].name, f.name),
+                    None => f.name.clone(),
+                };
                 if let Some(filt) = &dump_stubs {
-                    let qual = match cc {
-                        Some(cid) => format!("{}::{}", class_infos[cid as usize].name, f.name),
-                        None => f.name.clone(),
-                    };
                     if filt == "1" || qual.contains(filt.as_str()) {
                         eprintln!("STUB {qual}  <-  {reason}");
                     }
                 }
-                *reasons.entry(reason).or_insert(0) += 1;
+                *reasons.entry(reason.clone()).or_insert(0) += 1;
+                callable_stubs.push(CallableStub {
+                    callable: qual,
+                    reason,
+                });
                 funcs.push(Rc::new(stub_program(f, cc.is_some())));
             }
         }
@@ -818,6 +916,7 @@ fn build_global(
         callables: jobs.len(),
         callables_stubbed: stubbed,
         stub_reasons,
+        callable_stubs,
     };
     let linkage = Rc::new(Linkage {
         funcs,
@@ -1062,13 +1161,7 @@ fn build_class_info(
 /// Extract a coarse category from a panic payload, so similar failures group
 /// together in the stub-reason histogram (the text before the first `:`).
 fn panic_category(payload: &(dyn std::any::Any + Send)) -> String {
-    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<non-string panic>".to_string()
-    };
+    let msg = panic_message(payload);
     let head = msg.split(':').next().unwrap_or(&msg).trim();
     // Keep the full message for the "unknown signal 'X'" bucket so the specific
     // names stay visible in the diagnostic histogram.
@@ -1081,6 +1174,16 @@ fn panic_category(payload: &(dyn std::any::Any + Send)) -> String {
         cat = "<empty>".to_string();
     }
     cat
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic>".to_string()
+    }
 }
 
 /// A synthesized default constructor: `function new(); super.new(); endfunction`.
@@ -1160,17 +1263,36 @@ fn arg_mode(dir: PortDir) -> ArgMode {
     }
 }
 
-/// Build a module's nets and compile its `always`/`initial` processes against
-/// the global class/function tables, instantiating them with the shared linkage.
-fn elaborate_module_processes(m: &Module, g: &Global, sim: &mut Sim, backend: &dyn ExecBackend) {
+/// Build one module instance's nets and processes, then recursively elaborate
+/// its child instances. Connected ports alias parent nets by `NetId`.
+#[allow(clippy::too_many_arguments)]
+fn elaborate_module_instance(
+    m: &Module,
+    path: &str,
+    port_bindings: &HashMap<String, (NetId, u32)>,
+    modules: &HashMap<&str, &Module>,
+    g: &Global,
+    sim: &mut Sim,
+    backend: &dyn ExecBackend,
+) {
     let mut scope: HashMap<String, (NetId, u32)> = HashMap::new();
+    for port in &m.ports {
+        if let Some(&(net, _)) = port_bindings.get(&port.name) {
+            scope.insert(port.name.clone(), (net, port.width));
+        } else {
+            let net = sim
+                .kernel()
+                .new_net(scoped_name(path, &port.name), LogicVec::zero(port.width));
+            scope.insert(port.name.clone(), (net, port.width));
+        }
+    }
     for it in &m.items {
         if let ModuleItem::Var(v) = it {
             let init = match &v.init {
                 Some(e) => const_eval(e).resize(v.width, v.signed),
                 None => LogicVec::zero(v.width),
             };
-            let net = sim.kernel().new_net(v.name.clone(), init);
+            let net = sim.kernel().new_net(scoped_name(path, &v.name), init);
             scope.insert(v.name.clone(), (net, v.width));
         }
     }
@@ -1214,12 +1336,87 @@ fn elaborate_module_processes(m: &Module, g: &Global, sim: &mut Sim, backend: &d
                 sim.add_process(backend.instantiate(Rc::new(prog), g.linkage.clone()));
             }
             ModuleItem::Var(_)
+            | ModuleItem::Instance(_)
             | ModuleItem::Func(_)
             | ModuleItem::Class(_)
             | ModuleItem::TypeAlias(_)
             | ModuleItem::EnumType { .. }
             | ModuleItem::EnumConst { .. } => {}
         }
+    }
+
+    for item in &m.items {
+        let ModuleItem::Instance(instance) = item else {
+            continue;
+        };
+        let child = modules
+            .get(instance.module_name.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "unknown module '{}' instantiated as '{}'",
+                    instance.module_name, instance.name
+                )
+            });
+        let bindings = bind_instance_ports(instance, child, &scope);
+        elaborate_module_instance(
+            child,
+            &scoped_name(path, &instance.name),
+            &bindings,
+            modules,
+            g,
+            sim,
+            backend,
+        );
+    }
+}
+
+fn bind_instance_ports(
+    instance: &ModuleInstance,
+    child: &Module,
+    parent_scope: &HashMap<String, (NetId, u32)>,
+) -> HashMap<String, (NetId, u32)> {
+    let mut bindings = HashMap::new();
+    for (position, connection) in instance.connections.iter().enumerate() {
+        let port = match &connection.port {
+            Some(name) => child
+                .ports
+                .iter()
+                .find(|port| port.name == *name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "module '{}' has no port '{}' connected by instance '{}'",
+                        child.name, name, instance.name
+                    )
+                }),
+            None => child.ports.get(position).unwrap_or_else(|| {
+                panic!(
+                    "instance '{}' has more positional connections than module '{}' has ports",
+                    instance.name, child.name
+                )
+            }),
+        };
+        let Expr::Ref(actual) = &connection.expr else {
+            panic!(
+                "unsupported connection expression for '{}.{}': {:?}",
+                instance.name, port.name, connection.expr
+            );
+        };
+        let &(net, width) = parent_scope.get(actual).unwrap_or_else(|| {
+            panic!(
+                "unknown signal '{}' connected to '{}.{}'",
+                actual, instance.name, port.name
+            )
+        });
+        bindings.insert(port.name.clone(), (net, width));
+    }
+    bindings
+}
+
+fn scoped_name(path: &str, name: &str) -> String {
+    if path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{path}.{name}")
     }
 }
 
@@ -3086,8 +3283,12 @@ fn const_eval_with(e: &Expr, consts: Option<&HashMap<String, LogicVec>>) -> Logi
             let v = const_eval_with(operand, consts);
             match op {
                 UnaryOp::BitNot => v.bitnot(),
-                UnaryOp::Neg => LogicVec::zero(v.width()).sub(&v),
-                _ => v,
+                UnaryOp::LogNot => v.lognot(),
+                UnaryOp::Neg => v.neg(),
+                UnaryOp::Plus => v,
+                UnaryOp::ReduceAnd => LogicVec::from_bit(v.reduce_and()),
+                UnaryOp::ReduceOr => LogicVec::from_bit(v.reduce_or()),
+                UnaryOp::ReduceXor => LogicVec::from_bit(v.reduce_xor()),
             }
         }
         Expr::Binary { op, lhs, rhs } => {
@@ -3100,7 +3301,16 @@ fn const_eval_with(e: &Expr, consts: Option<&HashMap<String, LogicVec>>) -> Logi
                 BinOp::And => l.bitand(&r),
                 BinOp::Or => l.bitor(&r),
                 BinOp::Xor => l.bitxor(&r),
-                _ => l,
+                BinOp::Eq => l.eq_logical(&r),
+                BinOp::Neq => l.ne_logical(&r),
+                BinOp::Lt => l.ult(&r),
+                BinOp::Gt => l.ugt(&r),
+                BinOp::Le => l.ule(&r),
+                BinOp::Ge => l.uge(&r),
+                BinOp::Shl => l.shl(r.to_u64() as u32),
+                BinOp::Shr => l.shr(r.to_u64() as u32),
+                BinOp::LogAnd => LogicVec::from_u64((l.is_true() && r.is_true()) as u64, 1),
+                BinOp::LogOr => LogicVec::from_u64((l.is_true() || r.is_true()) as u64, 1),
             }
         }
     }

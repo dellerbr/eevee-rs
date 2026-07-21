@@ -71,6 +71,7 @@ pub enum PortDir {
 #[derive(Debug, Clone)]
 pub enum ModuleItem {
     Var(VarDecl),
+    Instance(ModuleInstance),
     Always(AlwaysBlock),
     Initial(Stmt),
     Func(FuncDecl),
@@ -89,7 +90,23 @@ pub enum ModuleItem {
     },
     /// A package/module-scope `typedef <Type>[#(...)] <alias>;`.
     TypeAlias(TypeAlias),
-    // ContinuousAssign, ModuleInstance, Generate, ... (later)
+    // ContinuousAssign, Generate, ... (later)
+}
+
+/// One instance in a module-instantiation declaration.
+#[derive(Debug, Clone)]
+pub struct ModuleInstance {
+    pub module_name: String,
+    pub name: String,
+    pub connections: Vec<PortConnection>,
+}
+
+/// A named (`.port(expr)`) or positional module-port connection.
+#[derive(Debug, Clone)]
+pub struct PortConnection {
+    /// `None` for positional connections.
+    pub port: Option<String>,
+    pub expr: Expr,
 }
 
 /// A (possibly parameterized) type reference, e.g. `int`, `uvm_root`, or

@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod conformance;
 pub mod cst;
 pub mod lower;
 pub mod preprocess;
@@ -18,9 +19,33 @@ pub use preprocess::Preprocessor;
 use eevee_ast::SourceFile;
 use std::path::{Path, PathBuf};
 
+/// Whether parsing may retain legacy best-effort fallbacks or must enforce the
+/// currently validated fail-closed subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseMode {
+    Permissive,
+    Conformance,
+}
+
 /// Parse a string of SystemVerilog into a [`SourceFile`] AST.
 pub fn parse_source(src: &str) -> Result<SourceFile, FeError> {
-    let tree = cst::parse_source(src)?;
+    parse_source_with_mode(src, ParseMode::Permissive)
+}
+
+/// Parse source in fail-closed conformance mode.
+pub fn parse_source_conformant(src: &str) -> Result<SourceFile, FeError> {
+    parse_source_with_mode(src, ParseMode::Conformance)
+}
+
+/// Parse source with an explicit fallback policy.
+pub fn parse_source_with_mode(src: &str, mode: ParseMode) -> Result<SourceFile, FeError> {
+    let tree = match mode {
+        ParseMode::Permissive => cst::parse_source(src)?,
+        ParseMode::Conformance => cst::parse_source_strict(src)?,
+    };
+    if mode == ParseMode::Conformance {
+        conformance::validate(&tree, src)?;
+    }
     Ok(lower::lower_file(&tree))
 }
 
@@ -28,9 +53,24 @@ pub fn parse_source(src: &str) -> Result<SourceFile, FeError> {
 /// include dirs) then parse a file into a [`SourceFile`] AST. This is the entry
 /// point for compiling real, macro-heavy sources such as UVM.
 pub fn parse_file(path: &Path, include_dirs: Vec<PathBuf>) -> Result<SourceFile, FeError> {
+    parse_file_with_mode(path, include_dirs, ParseMode::Permissive)
+}
+
+/// Preprocess and parse a file with an explicit fallback policy.
+pub fn parse_file_with_mode(
+    path: &Path,
+    include_dirs: Vec<PathBuf>,
+    mode: ParseMode,
+) -> Result<SourceFile, FeError> {
     let mut pp = Preprocessor::new(include_dirs);
     let text = pp.process_file(path).map_err(FeError::Io)?;
-    let tree = cst::parse_source(&text)?;
+    let tree = match mode {
+        ParseMode::Permissive => cst::parse_source(&text)?,
+        ParseMode::Conformance => cst::parse_source_strict(&text)?,
+    };
+    if mode == ParseMode::Conformance {
+        conformance::validate(&tree, &text)?;
+    }
     Ok(lower::lower_file(&tree))
 }
 
@@ -40,8 +80,24 @@ pub fn parse_source_with_includes(
     source_path: &str,
     include_dirs: Vec<PathBuf>,
 ) -> Result<SourceFile, FeError> {
+    parse_source_with_includes_and_mode(src, source_path, include_dirs, ParseMode::Permissive)
+}
+
+/// Preprocess and parse source with an explicit fallback policy.
+pub fn parse_source_with_includes_and_mode(
+    src: &str,
+    source_path: &str,
+    include_dirs: Vec<PathBuf>,
+    mode: ParseMode,
+) -> Result<SourceFile, FeError> {
     let mut pp = Preprocessor::new(include_dirs);
     let text = pp.process(src, source_path);
-    let tree = cst::parse_source(&text)?;
+    let tree = match mode {
+        ParseMode::Permissive => cst::parse_source(&text)?,
+        ParseMode::Conformance => cst::parse_source_strict(&text)?,
+    };
+    if mode == ParseMode::Conformance {
+        conformance::validate(&tree, &text)?;
+    }
     Ok(lower::lower_file(&tree))
 }

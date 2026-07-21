@@ -29,6 +29,19 @@ pub enum FeError {
     Json(serde_json::Error),
     /// Verible produced JSON without the expected `tree` node (syntax error).
     NoTree { stderr: String },
+    /// Verible recovered a tree after a lexical or parse error.
+    Syntax {
+        phase: String,
+        text: String,
+        line: usize,
+        column: usize,
+    },
+    /// Conformance mode encountered syntax outside the implemented subset.
+    UnsupportedSyntax {
+        construct: String,
+        line: usize,
+        column: usize,
+    },
 }
 
 impl std::fmt::Display for FeError {
@@ -43,6 +56,23 @@ impl std::fmt::Display for FeError {
             FeError::NoTree { stderr } => {
                 write!(f, "verible produced no syntax tree (parse error):\n{stderr}")
             }
+            FeError::Syntax {
+                phase,
+                text,
+                line,
+                column,
+            } => write!(
+                f,
+                "SystemVerilog {phase} error at {line}:{column} near '{text}'"
+            ),
+            FeError::UnsupportedSyntax {
+                construct,
+                line,
+                column,
+            } => write!(
+                f,
+                "unsupported SystemVerilog construct {construct} at {line}:{column}"
+            ),
         }
     }
 }
@@ -107,8 +137,22 @@ pub fn parse_source(src: &str) -> Result<Value, FeError> {
     parse_source_with(&exe, src)
 }
 
+/// Parse source and reject any Verible lexical/parser recovery diagnostics.
+pub(crate) fn parse_source_strict(src: &str) -> Result<Value, FeError> {
+    let exe = find_verible().ok_or(FeError::VeribleNotFound)?;
+    parse_source_with_policy(&exe, src, true)
+}
+
 /// Parse using an explicit Verible binary path.
 pub fn parse_source_with(exe: &std::path::Path, src: &str) -> Result<Value, FeError> {
+    parse_source_with_policy(exe, src, false)
+}
+
+fn parse_source_with_policy(
+    exe: &std::path::Path,
+    src: &str,
+    reject_recovery: bool,
+) -> Result<Value, FeError> {
     use std::io::Write;
 
     let mut child = Command::new(exe)
@@ -123,16 +167,45 @@ pub fn parse_source_with(exe: &std::path::Path, src: &str) -> Result<Value, FeEr
         .expect("stdin piped")
         .write_all(src.as_bytes())?;
     let out = child.wait_with_output()?;
+    let success = out.status.success();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
 
     let json: Value = deserialize_deep(out.stdout)?;
     // Output shape: { "<filename or '-'>": { "tree": <node> } }
-    let tree = json
-        .as_object()
-        .and_then(|o| o.values().next())
-        .and_then(|f| f.get("tree"))
-        .cloned();
+    let file = json.as_object().and_then(|object| object.values().next());
+    if reject_recovery {
+        if let Some(error) = file
+            .and_then(|value| value.get("errors"))
+            .and_then(first_error)
+        {
+            return Err(FeError::Syntax {
+                phase: error
+                    .get("phase")
+                    .and_then(Value::as_str)
+                    .unwrap_or("parse")
+                    .to_string(),
+                text: error
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                line: error.get("line").and_then(Value::as_u64).unwrap_or(0) as usize + 1,
+                column: error.get("column").and_then(Value::as_u64).unwrap_or(0) as usize + 1,
+            });
+        }
+        if !success {
+            return Err(FeError::NoTree { stderr });
+        }
+    }
+    let tree = file.and_then(|value| value.get("tree")).cloned();
     tree.ok_or(FeError::NoTree { stderr })
+}
+
+fn first_error(errors: &Value) -> Option<&Value> {
+    errors
+        .as_array()
+        .and_then(|values| values.first())
+        .or_else(|| errors.as_object().map(|_| errors))
 }
 
 /// Deserialize a (possibly very deeply nested) Verible CST JSON.

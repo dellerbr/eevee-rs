@@ -53,6 +53,9 @@ fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
             for v in lower_data_decl(item) {
                 out.push(ModuleItem::Var(v));
             }
+            for instance in lower_module_instances(item) {
+                out.push(ModuleItem::Instance(instance));
+            }
         }
         "kAlwaysStatement" => out.push(ModuleItem::Always(lower_always(item))),
         "kInitialStatement" => out.push(ModuleItem::Initial(lower_initial(item))),
@@ -229,9 +232,44 @@ fn lower_module(n: &Value) -> Module {
 
     Module {
         name,
-        ports: Vec::new(),
+        ports: lower_module_ports(n),
         items,
     }
+}
+
+fn lower_module_ports(n: &Value) -> Vec<Port> {
+    let Some(list) = find(n, "kModuleHeader")
+        .and_then(|header| find(header, "kParenGroup"))
+        .and_then(|group| find(group, "kPortDeclarationList"))
+    else {
+        return Vec::new();
+    };
+    kids(list)
+        .filter(|declaration| tag(declaration) == "kPortDeclaration")
+        .map(|declaration| {
+            let dtype = find(declaration, "kDataType");
+            let dir = if find_deep(declaration, "output").is_some() {
+                PortDir::Output
+            } else if find_deep(declaration, "inout").is_some() {
+                PortDir::Inout
+            } else if find_deep(declaration, "ref").is_some() {
+                PortDir::Ref
+            } else {
+                PortDir::Input
+            };
+            let name = find(declaration, "kUnqualifiedId")
+                .and_then(|id| find(id, "SymbolIdentifier"))
+                .map(text)
+                .unwrap_or_default()
+                .to_string();
+            Port {
+                name,
+                dir,
+                width: dtype.map(packed_width).unwrap_or(1),
+                signed: find_deep(declaration, "signed").is_some(),
+            }
+        })
+        .collect()
 }
 
 fn lower_package(n: &Value) -> Package {
@@ -321,6 +359,64 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
         }
     }
     out
+}
+
+fn lower_module_instances(n: &Value) -> Vec<ModuleInstance> {
+    let Some(base) = find(n, "kInstantiationBase") else {
+        return Vec::new();
+    };
+    let Some(dtype) = find(base, "kInstantiationType").and_then(|ty| find(ty, "kDataType")) else {
+        return Vec::new();
+    };
+    let Some(module_name) = class_type_name(dtype) else {
+        return Vec::new();
+    };
+    let Some(list) = find(base, "kGateInstanceRegisterVariableList") else {
+        return Vec::new();
+    };
+
+    kids(list)
+        .filter(|instance| tag(instance) == "kGateInstance")
+        .map(|instance| {
+            let name = find(instance, "SymbolIdentifier")
+                .map(text)
+                .unwrap_or_default()
+                .to_string();
+            let connections = find(instance, "kParenGroup")
+                .and_then(|group| find(group, "kPortActualList"))
+                .map(lower_port_connections)
+                .unwrap_or_default();
+            ModuleInstance {
+                module_name: module_name.clone(),
+                name,
+                connections,
+            }
+        })
+        .collect()
+}
+
+fn lower_port_connections(n: &Value) -> Vec<PortConnection> {
+    kids(n)
+        .filter_map(|connection| match tag(connection) {
+            "kActualNamedPort" => {
+                let port = find(connection, "SymbolIdentifier")?
+                    .get("text")?
+                    .as_str()?;
+                let expr = find(connection, "kParenGroup")
+                    .and_then(|group| find(group, "kExpression"))
+                    .map(lower_expr)?;
+                Some(PortConnection {
+                    port: Some(port.to_string()),
+                    expr,
+                })
+            }
+            "kActualPositionalPort" => find(connection, "kExpression").map(|expr| PortConnection {
+                port: None,
+                expr: lower_expr(expr),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The actual `#(...)` type arguments of a `kDataType` (the outermost

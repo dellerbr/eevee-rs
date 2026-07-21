@@ -1,7 +1,7 @@
 //! Front-end parse/lower tests against the real Verible binary.
 
 use eevee_ast::*;
-use eevee_fe::parse_source;
+use eevee_fe::{parse_source, parse_source_conformant, FeError};
 
 const COUNTER: &str = "module top;\n\
   logic clk = 0;\n\
@@ -139,6 +139,168 @@ fn init_values_present() {
             assert!(matches!(init, Expr::Literal(val) if val.to_u64() == 0));
         }
     }
+}
+
+#[test]
+fn parses_module_ports_and_instances() {
+    let src = "module child(input logic [3:0] a, output logic [3:0] y);\n\
+      initial y = a;\n\
+    endmodule\n\
+    module top;\n\
+      logic [3:0] source, named_y, positional_y;\n\
+      child named_child(.a(source), .y(named_y));\n\
+      child positional_child(source, positional_y);\n\
+    endmodule\n";
+    let file = parse_source(src).expect("verible parse");
+    let Item::Module(child) = &file.items[0] else {
+        panic!("expected child module, got {:?}", file.items[0]);
+    };
+    assert_eq!(child.ports.len(), 2);
+    assert_eq!(child.ports[0].name, "a");
+    assert_eq!(child.ports[0].dir, PortDir::Input);
+    assert_eq!(child.ports[0].width, 4);
+    assert_eq!(child.ports[1].name, "y");
+    assert_eq!(child.ports[1].dir, PortDir::Output);
+
+    let Item::Module(top) = &file.items[1] else {
+        panic!("expected top module, got {:?}", file.items[1]);
+    };
+    let instances: Vec<&ModuleInstance> = top
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::Instance(instance) => Some(instance),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(instances.len(), 2);
+    assert_eq!(instances[0].module_name, "child");
+    assert_eq!(instances[0].name, "named_child");
+    assert!(matches!(
+        instances[0].connections.as_slice(),
+        [
+            PortConnection {
+                port: Some(a),
+                expr: Expr::Ref(source)
+            },
+            PortConnection {
+                port: Some(y),
+                expr: Expr::Ref(named_y)
+            }
+        ] if a == "a" && source == "source" && y == "y" && named_y == "named_y"
+    ));
+    assert!(matches!(
+        instances[1].connections.as_slice(),
+        [
+            PortConnection {
+                port: None,
+                expr: Expr::Ref(source)
+            },
+            PortConnection {
+                port: None,
+                expr: Expr::Ref(positional_y)
+            }
+        ] if source == "source" && positional_y == "positional_y"
+    ));
+}
+
+#[test]
+fn conformance_mode_rejects_skipped_module_items_with_location() {
+    let src = "module top;\n  logic source, result;\n  assign result = source;\nendmodule\n";
+    let error = parse_source_conformant(src).expect_err("continuous assign is unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax {
+            ref construct,
+            line: 3,
+            column: 3,
+        } if construct == "kContinuousAssignmentStatement"
+    ));
+}
+
+#[test]
+fn conformance_mode_rejects_noop_system_tasks_with_location() {
+    let src = "module top;\n  initial $finish;\nendmodule\n";
+    let error = parse_source_conformant(src).expect_err("$finish is not implemented");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax {
+            ref construct,
+            line: 2,
+            column: 11,
+        } if construct == "SystemTFIdentifier"
+    ));
+}
+
+#[test]
+fn conformance_mode_rejects_unsupported_port_actuals() {
+    let expression = "module child(input logic a); endmodule\n\
+      module top; logic a, b; child c(.a(a | b)); endmodule\n";
+    let error = parse_source_conformant(expression).expect_err("expression actual is unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax {
+            ref construct,
+            line: 2,
+            ..
+        } if construct == "kExpression"
+    ));
+
+    let hole = "module child(input logic a, output logic y); endmodule\n\
+      module top; logic y; child c(, y); endmodule\n";
+    let error = parse_source_conformant(hole).expect_err("positional hole is unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax {
+            ref construct,
+            line: 2,
+            ..
+        } if construct == "kPortActualList"
+    ));
+}
+
+#[test]
+fn conformance_mode_rejects_operator_and_cast_approximations() {
+    let equality = "module top; logic result; initial result = (1 === 1); endmodule";
+    let error = parse_source_conformant(equality).expect_err("case equality is not represented");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "==="
+    ));
+
+    let cast = "module top; logic [7:0] result; initial result = 8'(1); endmodule";
+    let error = parse_source_conformant(cast).expect_err("sized cast is not implemented");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "kCast"
+    ));
+}
+
+#[test]
+fn conformance_mode_rejects_module_parameterization() {
+    let src = "module child #(parameter int WIDTH = 8) (); endmodule\n\
+            module top; child #(.WIDTH(16)) dut(); endmodule\n";
+    let error = parse_source_conformant(src).expect_err("module parameters are unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. }
+            if construct == "kFormalParameterList"
+    ));
+}
+
+#[test]
+fn conformance_mode_rejects_verible_recovery_trees() {
+    let src = "module child; endmodule module top; child instance(); endmodule";
+    let error = parse_source_conformant(src).expect_err("keyword identifier requires recovery");
+    assert!(matches!(
+        error,
+        FeError::Syntax {
+            ref phase,
+            ref text,
+            line: 1,
+            ..
+        } if phase == "parse" && text == "instance"
+    ));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 # eevee-rs
 
-A native Rust SystemVerilog simulator targeting IEEE 1800 semantics and
-unmodified Accellera UVM execution.
+A native Rust SystemVerilog simulator targeting IEEE Std 1800-2023 semantics
+and unmodified Accellera UVM execution.
 
 This is the active successor to the
 [reference-only Python `eevee` executable specification](https://github.com/intel-sandbox/Eevee).
@@ -16,8 +16,13 @@ archive setting is managed separately and is not changed by this repository.
 > source-to-execution pipeline works, real UVM source preprocesses and
 > elaborates, real UVM reporting runs, and the real registry/factory path now
 > creates objects. The real UVM phase graph now executes a user test's
-> `run_phase` through a delayed objection lifecycle. Full IEEE 1800 compliance
-> and broader UVM workflows remain in progress.
+> `run_phase` through a delayed objection lifecycle. A fail-closed conformance
+> mode and a minimal parent/child module hierarchy now work. Full IEEE 1800
+> compliance and broader UVM/RTL workflows remain in progress.
+
+The clause/domain-indexed [conformance matrix](docs/conformance.md) is the
+source of truth for standards claims. Callable compilation percentages and
+permissive UVM runs are progress telemetry, not conformance measurements.
 
 ## Non-Negotiable Rule
 
@@ -33,9 +38,9 @@ interpreter, or scheduler.
 
 ## Current Status
 
-Validated on July 20, 2026:
+Validated on July 21, 2026:
 
-- 125 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 138 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -59,6 +64,13 @@ Validated on July 20, 2026:
   callables. Real UVM traversal invokes `my_test::run_phase`, reports at time
   zero, resumes after `#10`, reports at 10,000,000 fs, drops its objection, and
   exits normally.
+- Conformance parsing rejects Verible recovery trees, known unsupported CST
+  paths, and unknown system calls with line/column diagnostics; conformant
+  elaboration rejects semantic fallbacks, hierarchy cycles/width conversion,
+  panics, placeholder builtins, and every resilient callable stub.
+- ANSI packed/scalar ports and recursive child module instances elaborate with
+  named or positional whole-signal connectivity. A strict end-to-end test
+  validates delayed parent-to-child-to-parent propagation through both forms.
 
 ## Implemented Language Surface
 
@@ -91,6 +103,10 @@ The current implementation includes:
 - `fork/join`, `join_any`, and `join_none` as real scheduler processes.
 - Imported DPI-C callables with injectable, per-simulation host bindings and
   `input`/`output`/`inout` value transfer.
+- ANSI module port metadata, root-module discovery, recursively scoped child
+  instances, and named/positional whole-signal port binding.
+- Fail-closed `parse_source_conformant` and `elaborate_conformant` APIs. The
+  legacy APIs remain permissive for coverage exploration.
 - UVM-oriented report formatting primitives including enum names, string
   concatenation, `$sformatf`, `$swrite`, `$cast`, and simulation time.
 
@@ -104,7 +120,7 @@ eevee-fe       preprocessing + Verible CST -> typed AST
         |
         v
 eevee-elab     global declarations, class specialization, names -> IDs,
-               procedural AST -> register bytecode
+               hierarchy, procedural AST -> register bytecode
         |
         v
 eevee-ir       register programs + resumable interpreter + future JIT seam
@@ -155,6 +171,20 @@ cargo run -q -p eevee-elab --example uvm_run
 cargo run -q -p eevee-elab --example uvm_run_test
 ```
 
+The strict in-process path is:
+
+```rust
+let ast = eevee_fe::parse_source_conformant(source)?;
+let sim = eevee_elab::elaborate_conformant(&ast, &eevee_ir::Interp)?;
+```
+
+Strict parsing rejects the enforced unsupported CST/fallback paths before
+best-effort lowering can drop them or substitute zero. Strict elaboration
+rejects unsupported semantic forms, module-elaboration panics, and resilient
+callable stubs. Diagnostics discovered after preprocessing currently refer to
+the preprocessed source; post-AST semantic errors do not yet retain source
+spans.
+
 Debugging controls:
 
 - `EEVEE_TRACE=1` prints interpreted SV calls/returns and selected state.
@@ -168,13 +198,30 @@ The repository currently vendors the Windows Verible syntax binary and the
 Accellera UVM source. Linux/macOS CI needs per-platform Verible binaries or an
 installation/download step before front-end tests can be portable.
 
-## Roadmap to IEEE 1800 Compliance
+## Roadmap to IEEE 1800-2023 Compliance
 
 The project advances by observable conformance slices: add a focused SV test,
 implement the owning language/runtime abstraction, run the full Rust suite,
 then rerun the real UVM frontier. UVM behavior is never substituted.
 
-1. **Complete UVM execution path**
+The [conformance matrix](docs/conformance.md) uses the explicit progression
+`unsupported -> parsed -> elaborated -> executed -> behaviorally validated`.
+Statuses apply only to the narrow feature in each row, never to a whole clause.
+
+1. **Standards-grade conformance spine**
+   - Extend source spans through preprocessing, AST, elaboration, and runtime
+     diagnostics; reject every remaining skip/zero/no-op path in strict mode.
+   - Add chapter-organized positive/negative tests, differential oracles, and
+     machine-readable evidence without publishing a whole-standard percentage.
+
+2. **Core elaboration and hierarchy**
+   - Build on the minimal ANSI-port/child-instance slice with module parameters
+     and overrides, continuous assignments and driver resolution, hierarchical
+     references, and generate `if`/`case`/`for`.
+   - Add explicit top selection, port direction/type semantics, width
+     conversion, nets versus variables, and instance arrays.
+
+3. **Complete UVM execution path**
    - Support named `run_test("my_test")`, `+UVM_TESTNAME`, and normal static
      registry discovery without manually constructing `uvm_test_top`.
    - Complete report-summary, phase-worker teardown, process handle/status,
@@ -182,14 +229,7 @@ then rerun the real UVM frontier. UVM behavior is never substituted.
    - Run representative UVM factory, TLM, sequence, config-db, and callback
      examples through unmodified source.
 
-2. **Core elaboration and hierarchy**
-   - Module/interface ports, instances, parameter overrides, generate
-     if/case/for, genvar scopes, hierarchy, bind, modports, clocking blocks,
-     virtual interfaces, and robust hierarchical references.
-   - Net types, continuous assignments, strengths/delays, primitives, UDPs,
-     and scheduling across all IEEE event regions.
-
-3. **Complete type and expression semantics**
+4. **Complete type and expression semantics**
    - Signedness and sizing/coercion rules, packed/unpacked arrays, structs,
      unions/tagged unions, enums, casts, streaming concatenation, assignment
      patterns, wildcard equality, inside/dist, and iterator/query methods.
@@ -197,29 +237,29 @@ then rerun the real UVM frontier. UVM behavior is never substituted.
      local members, interfaces/virtual classes, pure virtual methods, and
      nested classes.
 
-4. **Concurrency and runtime primitives**
+5. **Concurrency and runtime primitives**
    - Full process handles/status/control, disable fork/named blocks, event
      trigger variants, wait fork/order, semaphore/mailbox fairness, named
      events, force/release, procedural continuous assignment, and all scheduler
      regions including observed/reactive/postponed behavior.
 
-5. **Randomization and constraints**
+6. **Randomization and constraints**
    - `rand`/`randc`, deterministic process RNG state, inline/class constraints,
      solve-before, soft, dist, implication, foreach constraints, array sizing,
      and a solver backend with reproducible seeds.
 
-6. **Assertions and coverage**
+7. **Assertions and coverage**
    - Immediate and concurrent assertions, sampled-value functions, sequences,
      properties, local variables, repetition, multi-clock operation, assertion
      control, covergroups, bins, crosses, options, and coverage reporting.
 
-7. **DPI, files, waves, and tooling**
+8. **DPI, files, waves, and tooling**
    - ABI-correct native-library DPI-C import/export and open arrays,
      UVM regex/polling/HDL backdoor bindings, VPI/backdoor APIs,
      complete file/system tasks, VCD/FST waveforms, plusargs, diagnostics,
      source locations, lint-quality errors, and deterministic replay.
 
-8. **Conformance and performance closure**
+9. **Conformance and performance closure**
    - Run chapter-organized IEEE tests, sv-tests, UVM examples, and OpenTitan
      vertical slices with tracked pass rates.
    - Profile before optimizing; add opcode fusion/typed slots and optional
@@ -231,12 +271,18 @@ then rerun the real UVM frontier. UVM behavior is never substituted.
 
 - This is not yet a complete IEEE 1800 implementation or a production/signoff
   simulator.
+- The current hierarchy slice supports ANSI packed/scalar ports and simple
+  whole-signal named/positional connections. Ports alias a scheduler net;
+  complete directionality, net/variable distinctions, width conversion,
+  drivers/resolution, expression actuals, module parameters, continuous
+  assignments, hierarchy references, and generate remain unsupported.
 - The passing phase probe constructs `uvm_test_top` directly and calls
   `run_test("")`; named test selection and plusarg-driven factory registration
   are not yet complete.
 - Some UVM callables still use resilient compile stubs while missing language
-  features are implemented. Treat compile percentage as progress telemetry,
-  not proof of behavioral correctness.
+  features are implemented. Permissive mode retains them for exploration;
+  conformance mode rejects all of them. Treat compile percentage as progress
+  telemetry, not proof of behavioral correctness.
 - Default DPI bindings currently cover UVM argv iteration and tool identity.
   UVM regex, polling, and HDL backdoor imports remain unbound unless supplied
   through the host registry.
