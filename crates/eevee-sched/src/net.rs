@@ -10,6 +10,14 @@ use eevee_core::{Bit, LogicVec};
 
 use crate::process::{EdgeKind, ProcId};
 
+/// Built-in strengthless net resolution function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetResolution {
+    Wire,
+    Wand,
+    Wor,
+}
+
 /// A process parked on a net, with the edge it is waiting for.
 pub(crate) struct Waiter {
     pub proc: ProcId,
@@ -20,15 +28,21 @@ pub(crate) struct Waiter {
 /// A 4-state net with an attached sensitivity list.
 pub struct Net {
     pub(crate) value: LogicVec,
+    pub(crate) resolution: NetResolution,
     pub(crate) driver_values: Vec<LogicVec>,
     pub(crate) waiters: Vec<Waiter>,
     pub(crate) name: String,
 }
 
 impl Net {
-    pub(crate) fn new(name: impl Into<String>, value: LogicVec) -> Net {
+    pub(crate) fn with_resolution(
+        name: impl Into<String>,
+        value: LogicVec,
+        resolution: NetResolution,
+    ) -> Net {
         Net {
             value,
+            resolution,
             driver_values: Vec::new(),
             waiters: Vec::new(),
             name: name.into(),

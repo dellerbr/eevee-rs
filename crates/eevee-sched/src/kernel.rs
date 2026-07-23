@@ -22,7 +22,7 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use eevee_core::{Bit, LogicVec, Region, SimTime, Timescale};
 
-use crate::net::{detect_edge, Net, Waiter};
+use crate::net::{detect_edge, Net, NetResolution, Waiter};
 use crate::process::{DriverId, EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};
 
 #[derive(Clone, Copy)]
@@ -166,8 +166,19 @@ impl Kernel {
 
     /// Create a net with an initial value, returning its handle.
     pub fn new_net(&mut self, name: impl Into<String>, initial: LogicVec) -> NetId {
+        self.new_net_with_resolution(name, initial, NetResolution::Wire)
+    }
+
+    /// Create a net with an explicit built-in resolution function.
+    pub fn new_net_with_resolution(
+        &mut self,
+        name: impl Into<String>,
+        initial: LogicVec,
+        resolution: NetResolution,
+    ) -> NetId {
         let id = NetId(self.nets.len());
-        self.nets.push(Net::new(name, initial));
+        self.nets
+            .push(Net::with_resolution(name, initial, resolution));
         id
     }
 
@@ -248,7 +259,8 @@ impl Kernel {
         let target = self.drivers[driver.0];
         let width = self.nets[target.net.0].value.width();
         self.nets[target.net.0].driver_values[target.slot] = value.resize(width, false);
-        let resolved = resolve_drivers(&self.nets[target.net.0].driver_values, width);
+        let resolution = self.nets[target.net.0].resolution;
+        let resolved = resolve_drivers(&self.nets[target.net.0].driver_values, width, resolution);
         self.write_net(target.net, resolved);
     }
 
@@ -535,22 +547,57 @@ impl Kernel {
     }
 }
 
-fn resolve_drivers(drivers: &[LogicVec], width: u32) -> LogicVec {
+fn resolve_drivers(drivers: &[LogicVec], width: u32, resolution: NetResolution) -> LogicVec {
     let mut resolved = LogicVec::z(width);
     for bit in 0..width {
-        let mut value = Bit::Z;
-        for driver in drivers {
-            value = match (value, driver.get_bit(bit)) {
-                (current, Bit::Z) => current,
-                (Bit::Z, driven) => driven,
-                (Bit::X, _) | (_, Bit::X) => Bit::X,
-                (Bit::Zero, Bit::One) | (Bit::One, Bit::Zero) => Bit::X,
-                (current, _) => current,
-            };
-        }
+        let value = match resolution {
+            NetResolution::Wire => resolve_wire_bit(drivers, bit),
+            NetResolution::Wand => resolve_wand_bit(drivers, bit),
+            NetResolution::Wor => resolve_wor_bit(drivers, bit),
+        };
         resolved.set_bit(bit, value);
     }
     resolved
+}
+
+fn resolve_wire_bit(drivers: &[LogicVec], bit: u32) -> Bit {
+    drivers
+        .iter()
+        .fold(Bit::Z, |value, driver| match (value, driver.get_bit(bit)) {
+            (current, Bit::Z) => current,
+            (Bit::Z, driven) => driven,
+            (Bit::X, _) | (_, Bit::X) => Bit::X,
+            (Bit::Zero, Bit::One) | (Bit::One, Bit::Zero) => Bit::X,
+            (current, _) => current,
+        })
+}
+
+fn resolve_wand_bit(drivers: &[LogicVec], bit: u32) -> Bit {
+    let mut value = Bit::Z;
+    for driver in drivers {
+        match driver.get_bit(bit) {
+            Bit::Z => {}
+            Bit::Zero => return Bit::Zero,
+            Bit::X => value = Bit::X,
+            Bit::One if value == Bit::Z => value = Bit::One,
+            Bit::One => {}
+        }
+    }
+    value
+}
+
+fn resolve_wor_bit(drivers: &[LogicVec], bit: u32) -> Bit {
+    let mut value = Bit::Z;
+    for driver in drivers {
+        match driver.get_bit(bit) {
+            Bit::Z => {}
+            Bit::One => return Bit::One,
+            Bit::X => value = Bit::X,
+            Bit::Zero if value == Bit::Z => value = Bit::Zero,
+            Bit::Zero => {}
+        }
+    }
+    value
 }
 
 /// The top-level simulation driver: owns the process table and the [`Kernel`].

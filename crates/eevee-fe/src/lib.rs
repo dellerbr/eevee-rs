@@ -39,12 +39,12 @@ pub fn parse_source_conformant(src: &str) -> Result<SourceFile, FeError> {
 
 /// Parse source with an explicit fallback policy.
 pub fn parse_source_with_mode(src: &str, mode: ParseMode) -> Result<SourceFile, FeError> {
-    let tree = match mode {
-        ParseMode::Permissive => cst::parse_source(src)?,
+    let (tree, tokens) = match mode {
+        ParseMode::Permissive => (cst::parse_source(src)?, Vec::new()),
         ParseMode::Conformance => cst::parse_source_strict(src)?,
     };
     if mode == ParseMode::Conformance {
-        conformance::validate(&tree, src)?;
+        conformance::validate(&tree, &tokens, src)?;
     }
     Ok(lower::lower_file(&tree))
 }
@@ -64,12 +64,12 @@ pub fn parse_file_with_mode(
 ) -> Result<SourceFile, FeError> {
     let mut pp = Preprocessor::new(include_dirs);
     let text = pp.process_file(path).map_err(FeError::Io)?;
-    let tree = match mode {
-        ParseMode::Permissive => cst::parse_source(&text)?,
+    let (tree, tokens) = match mode {
+        ParseMode::Permissive => (cst::parse_source(&text)?, Vec::new()),
         ParseMode::Conformance => cst::parse_source_strict(&text)?,
     };
     if mode == ParseMode::Conformance {
-        conformance::validate(&tree, &text)?;
+        conformance::validate(&tree, &tokens, &text)?;
     }
     Ok(lower::lower_file(&tree))
 }
@@ -92,12 +92,12 @@ pub fn parse_source_with_includes_and_mode(
 ) -> Result<SourceFile, FeError> {
     let mut pp = Preprocessor::new(include_dirs);
     let text = pp.process(src, source_path);
-    let tree = match mode {
-        ParseMode::Permissive => cst::parse_source(&text)?,
+    let (tree, tokens) = match mode {
+        ParseMode::Permissive => (cst::parse_source(&text)?, Vec::new()),
         ParseMode::Conformance => cst::parse_source_strict(&text)?,
     };
     if mode == ParseMode::Conformance {
-        conformance::validate(&tree, &text)?;
+        conformance::validate(&tree, &tokens, &text)?;
     }
     Ok(lower::lower_file(&tree))
 }

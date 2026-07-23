@@ -83,6 +83,10 @@ slang's elaborated, typed AST is genuinely attractive — it could subsume much 
 - `q[$]` last-element select: `$` is a raw token with `text=='$'`.
 - Several data-type wrappers (`kDataType`/`kDataTypePrimitive`/`kTypeInfo`/
   `kInstantiationType`) must be treated as one "type subtree" set.
+- Verible parses continuous drive-strength syntax but omits its tokens from the
+  exported CST. Conformance parsing therefore requests `--printtokens` together
+  with `--printtree` and rejects unsupported strength keywords from their token
+  locations before CST lowering. Permissive parsing remains tree-only.
 
 ## Revisit criteria
 

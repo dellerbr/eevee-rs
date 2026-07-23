@@ -138,25 +138,30 @@ pub fn parse_source(src: &str) -> Result<Value, FeError> {
 }
 
 /// Parse source and reject any Verible lexical/parser recovery diagnostics.
-pub(crate) fn parse_source_strict(src: &str) -> Result<Value, FeError> {
+pub(crate) fn parse_source_strict(src: &str) -> Result<(Value, Vec<Value>), FeError> {
     let exe = find_verible().ok_or(FeError::VeribleNotFound)?;
     parse_source_with_policy(&exe, src, true)
 }
 
 /// Parse using an explicit Verible binary path.
 pub fn parse_source_with(exe: &std::path::Path, src: &str) -> Result<Value, FeError> {
-    parse_source_with_policy(exe, src, false)
+    parse_source_with_policy(exe, src, false).map(|(tree, _)| tree)
 }
 
 fn parse_source_with_policy(
     exe: &std::path::Path,
     src: &str,
     reject_recovery: bool,
-) -> Result<Value, FeError> {
+) -> Result<(Value, Vec<Value>), FeError> {
     use std::io::Write;
 
-    let mut child = Command::new(exe)
-        .args(["--export_json", "--printtree", "-"])
+    let mut command = Command::new(exe);
+    command.args(["--export_json", "--printtree"]);
+    if reject_recovery {
+        command.arg("--printtokens");
+    }
+    let mut child = command
+        .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -198,7 +203,13 @@ fn parse_source_with_policy(
         }
     }
     let tree = file.and_then(|value| value.get("tree")).cloned();
-    tree.ok_or(FeError::NoTree { stderr })
+    let tokens = file
+        .and_then(|value| value.get("tokens"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    tree.map(|tree| (tree, tokens))
+        .ok_or(FeError::NoTree { stderr })
 }
 
 fn first_error(errors: &Value) -> Option<&Value> {

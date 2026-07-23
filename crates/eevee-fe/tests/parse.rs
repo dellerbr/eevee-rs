@@ -260,6 +260,67 @@ fn parses_continuous_assignments() {
 }
 
 #[test]
+fn parses_resolved_net_types() {
+    let src = "module top;\n\
+      wire wire_net;\n\
+      tri tri_net;\n\
+      wand wand_net;\n\
+      triand triand_net;\n\
+      wor wor_net;\n\
+      trior trior_net;\n\
+    endmodule\n";
+    let file = parse_source(src).expect("verible parse");
+    let nets: Vec<_> = module(&file)
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::Net(net) => Some((net.name.as_str(), net.kind)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        nets,
+        vec![
+            ("wire_net", NetKind::Wire),
+            ("tri_net", NetKind::Wire),
+            ("wand_net", NetKind::Wand),
+            ("triand_net", NetKind::Wand),
+            ("wor_net", NetKind::Wor),
+            ("trior_net", NetKind::Wor),
+        ]
+    );
+}
+
+#[test]
+fn conformance_mode_accepts_resolved_and_rejects_pull_nets() {
+    let supported = "module top; tri t; wand wa; triand ta; wor wo; trior to; endmodule";
+    parse_source_conformant(supported).expect("resolved net types are supported");
+
+    let unsupported = "module top; tri0 pulled; endmodule";
+    let error = parse_source_conformant(unsupported).expect_err("implicit pull net unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "tri0"
+    ));
+
+    let resolved_port = "module top(output tri value); endmodule";
+    let error =
+        parse_source_conformant(resolved_port).expect_err("resolved net ports are unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "tri"
+    ));
+
+    let strength = "module top; logic source; wire result;\n\
+                    assign (strong1, strong0) result = source; endmodule";
+    let error = parse_source_conformant(strength).expect_err("drive strengths unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "strong1"
+    ));
+}
+
+#[test]
 fn parses_module_parameter_defaults_and_overrides() {
     let src = "module child #(parameter int VALUE = 3, DELAY = 5) ();\n\
       endmodule\n\

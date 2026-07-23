@@ -5,7 +5,27 @@ use eevee_ast::Expr;
 use crate::cst::{const_int, find, find_deep, kids, leaf_op, tag, text, FeError};
 use crate::lower::lower_expr;
 
-pub(crate) fn validate(tree: &Value, source: &str) -> Result<(), FeError> {
+pub(crate) fn validate(tree: &Value, tokens: &[Value], source: &str) -> Result<(), FeError> {
+    if let Some(strength) = tokens.iter().find(|token| {
+        matches!(
+            tag(token),
+            "supply0"
+                | "supply1"
+                | "strong0"
+                | "strong1"
+                | "pull0"
+                | "pull1"
+                | "weak0"
+                | "weak1"
+                | "highz0"
+                | "highz1"
+                | "large"
+                | "medium"
+                | "small"
+        )
+    }) {
+        return unsupported(strength, source);
+    }
     validate_node(tree, source)
 }
 
@@ -74,10 +94,16 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
             validate_separated_list(assignments, "kNetVariableAssignment", source)?;
         }
         "kNetDeclaration" => {
-            let is_wire = find(node, "kDataType")
-                .is_some_and(|data_type| kids(data_type).any(|child| tag(child) == "wire"));
-            if !is_wire {
+            let Some(net_type) =
+                find(node, "kDataType").and_then(|data_type| kids(data_type).next())
+            else {
                 return unsupported(node, source);
+            };
+            if !matches!(
+                tag(net_type),
+                "wire" | "tri" | "wand" | "triand" | "wor" | "trior"
+            ) {
+                return unsupported(net_type, source);
             }
             if let Some(delay) = find_deep(node, "kDelay") {
                 return unsupported(delay, source);
@@ -99,6 +125,24 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                 {
                     return unsupported(declaration, source);
                 }
+            }
+        }
+        "kPortDeclaration" => {
+            if let Some(net_type) = kids(node).find(|child| {
+                matches!(
+                    tag(child),
+                    "tri"
+                        | "wand"
+                        | "triand"
+                        | "wor"
+                        | "trior"
+                        | "tri0"
+                        | "tri1"
+                        | "supply0"
+                        | "supply1"
+                )
+            }) {
+                return unsupported(net_type, source);
             }
         }
         "kNetVariableAssignment" => {

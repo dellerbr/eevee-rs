@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 154 tests.
+- `cargo test --workspace` passes all 158 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -71,10 +71,10 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   nonliteral/parameter-dependent packed widths,
   unknown/duplicate/excess overrides, and unresolved/nonconstant parameter
   expressions.
-- Plain `wire` declarations and undelayed, strengthless whole-net continuous
-  assignments now execute as reactive IR processes. Scheduler-owned driver
-  slots resolve Z, X, and conflicting 0/1 values; child output nets alias and
-  drive parent nets.
+- Strengthless whole-net continuous assignments over the supported internal net
+  types execute as reactive IR processes with zero or one inertial delay.
+  Scheduler-owned driver slots resolve Z, X, and conflicting 0/1 values; child
+  output wire nets alias and drive parent nets.
 - Continuous assignments now derive a deduplicated RHS `NetId` read set and
   park on only those sources. Constant RHS drivers evaluate once. Unrelated
   writes no longer resume continuous processes.
@@ -86,11 +86,18 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   per-driver generations: newer values cancel older pending events, identical
   requests retain their deadline, and canceled events are pruned before time
   advancement. `#0` applies immediately.
+- Internal `tri` nets now share ordinary wire resolution;
+  `wand`/`triand` and `wor`/`trior` use strengthless wired-AND and wired-OR
+  resolution. Strict tests cover Z/X behavior and dominating 0/1 values.
+- Strict parsing exports Verible tokens alongside the CST. This closes a
+  Verible gap where drive-strength tokens are omitted from the CST: supply,
+  strong, pull, weak, high-Z, and charge-strength syntax is rejected by token
+  location before lowering.
 - Strict mode rejects net declaration assignments, procedural or signed net
-  drives, implicit width conversion, non-wire net types, strengths, assignment
-  delay tuples, explicit-unit delay literals, negative/X/Z/nonconstant delays,
-  dynamic/out-of-range RHS selects, partial targets, unknown RHS names, and
-  unsupported RHS calls.
+  drives, implicit width conversion, pull/supply nets, resolved net ports,
+  strengths, assignment delay tuples, explicit-unit delay literals,
+  negative/X/Z/nonconstant delays, dynamic/out-of-range RHS selects, partial
+  targets, unknown RHS names, and unsupported RHS calls.
 
 The module connectivity model currently aliases a scheduler net. Full port
 directionality, complete net/variable port semantics, and width-converting or
@@ -99,9 +106,9 @@ expression connections are not claimed.
 ## Next Priorities
 
 1. Extend continuous drivers with rise/fall/turn-off and net declaration delays,
-  strengths, additional net types, and driver release. Then extend module
-  parameters into parameter-dependent packed widths and complete value
-  typing/coercion.
+  strength-aware resolution, implicit pull/supply drives, resolved net ports,
+  and driver release. Then extend module parameters into parameter-dependent
+  packed widths and complete value typing/coercion.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime

@@ -358,6 +358,9 @@ fn lower_module_ports(n: &Value) -> Vec<Port> {
 }
 
 fn lower_net_decl(n: &Value) -> Vec<NetDecl> {
+    let kind = find(n, "kDataType")
+        .and_then(lower_net_kind)
+        .unwrap_or(NetKind::Wire);
     let dtype = find(n, "kDataTypeImplicitIdDimensions")
         .and_then(|dimensions| find(dimensions, "kDataType"));
     let width = dtype.map(packed_width).unwrap_or(1);
@@ -373,9 +376,19 @@ fn lower_net_decl(n: &Value) -> Vec<NetDecl> {
                 name,
                 width,
                 signed,
+                kind,
             })
         })
         .collect()
+}
+
+fn lower_net_kind(dtype: &Value) -> Option<NetKind> {
+    kids(dtype).find_map(|child| match tag(child) {
+        "wire" | "tri" => Some(NetKind::Wire),
+        "wand" | "triand" => Some(NetKind::Wand),
+        "wor" | "trior" => Some(NetKind::Wor),
+        _ => None,
+    })
 }
 
 fn lower_package(n: &Value) -> Package {

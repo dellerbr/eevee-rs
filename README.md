@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 21, 2026:
 
-- 154 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 158 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -75,9 +75,10 @@ Validated on July 21, 2026:
   declaration-order defaults plus named and positional instance overrides.
   Per-instance values drive constant initializers, `initial`/`always`
   expressions, and delays.
-- Plain `wire` declarations and undelayed, strengthless whole-net continuous
-  assignments execute as reactive processes. Scheduler-owned drivers resolve
-  Z, X, and conflicting unsigned values across hierarchy.
+- Strengthless whole-net continuous assignments over the supported internal net
+  types execute as reactive processes with zero or one inertial delay.
+  Scheduler-owned drivers resolve Z, X, and conflicting unsigned values across
+  hierarchy.
 - Continuous assignments park on deduplicated RHS net read sets, so unrelated
   writes do not wake them. Generic multi-net waits invalidate and remove sibling
   registrations after the first source fires.
@@ -85,6 +86,10 @@ Validated on July 21, 2026:
   supported with inertial replacement: short pulses are rejected, identical
   requests do not postpone pending updates, and canceled events do not advance
   simulation time.
+- Internal `tri` nets use ordinary wire resolution; `wand`/`triand` and
+  `wor`/`trior` apply strengthless wired-AND and wired-OR resolution,
+  respectively. Strict parsing rejects explicit strengths from Verible's token
+  stream because this Verible CST omits those syntax nodes.
 
 ## Implemented Language Surface
 
@@ -121,8 +126,8 @@ The current implementation includes:
   instances, and named/positional whole-signal port binding.
 - Explicit/inherited bare `int` module parameter defaults and named/positional
   value overrides with per-instance constant scopes.
-- Plain `wire` nets, reactive continuous assignment processes, and strengthless
-  four-state multiple-driver resolution.
+- Plain `wire`/`tri` nets, `wand`/`triand`, `wor`/`trior`, reactive continuous
+  assignment processes, and strengthless four-state multiple-driver resolution.
 - Precise continuous-assignment sensitivity and generation-safe multi-net wait
   registration/cleanup.
 - Single-value inertial continuous assignment delays with per-instance
@@ -238,8 +243,9 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-  transition-specific/net delays, strength-aware drivers, hierarchical
-  references, and generate `if`/`case`/`for`.
+  transition-specific/net delays, strength-aware and implicit-pull drivers,
+  resolved net ports, hierarchical references, and generate
+  `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -297,11 +303,12 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   whole-signal named/positional connections. Ports alias a scheduler net;
   complete directionality, net/variable distinctions, width conversion,
   expression actuals, hierarchy references, and generate remain unsupported.
-- Continuous assignment support is limited to plain unsigned `wire` nets,
-  whole-net LHS targets, exact-width represented unsigned signal/literal RHS
-  expressions, and strengthless drivers with zero or one timescale-relative
-  inertial delay. Net declaration assignments/delays, procedural net writes,
-  implicit width conversion, signed operands/targets, other net types, drive
+- Continuous assignment support is limited to internal unsigned `wire`/`tri`,
+  `wand`/`triand`, and `wor`/`trior` nets; whole-net LHS targets; exact-width
+  represented unsigned signal/literal RHS expressions; and strengthless drivers
+  with zero or one timescale-relative inertial delay. Resolved net ports,
+  `tri0`/`tri1`, supply nets, net declaration assignments/delays, procedural net
+  writes, implicit width conversion, signed operands/targets, drive/charge
   strengths, rise/fall/turn-off delay tuples, explicit-unit delay literals,
   dynamic/out-of-range RHS selects, partial/hierarchical targets, and driver
   release remain unsupported in conformance mode.

@@ -120,6 +120,46 @@ fn continuous_assignments_propagate_and_resolve_drivers() {
 }
 
 #[test]
+fn wired_and_or_net_types_resolve_continuous_drivers() {
+    let src = "module top;\n\
+      logic left = 1;\n\
+      logic right = 1;\n\
+      wand all;\n\
+      wor any;\n\
+      assign all = left;\n\
+      assign all = right;\n\
+      assign any = left;\n\
+      assign any = right;\n\
+      initial begin\n\
+        #1 right = 0;\n\
+        #1 left = 0;\n\
+        #1 left = 1'bx;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let all = sim.kernel().find_net("all").expect("wand net");
+    let any = sim.kernel().find_net("any").expect("wor net");
+
+    sim.run_until(Some(SimTime::ZERO));
+    assert_eq!(sim.kernel().net_value(all).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(any).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    assert_eq!(sim.kernel().net_value(all).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(any).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    assert_eq!(sim.kernel().net_value(all).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(any).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(3_000_000)));
+    assert_eq!(sim.kernel().net_value(all).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(any).get_bit(0), Bit::X);
+}
+
+#[test]
 fn continuous_assignment_uses_rhs_source_sensitivity() {
     let src = "module top;\n\
       logic source = 0;\n\

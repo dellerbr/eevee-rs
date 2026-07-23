@@ -116,6 +116,18 @@ pub struct NetDecl {
     pub name: String,
     pub width: u32,
     pub signed: bool,
+    pub kind: NetKind,
+}
+
+/// Resolution function selected by a built-in net type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetKind {
+    /// `wire` or `tri`: strongest/equal-strength logic resolution.
+    Wire,
+    /// `wand` or `triand`: wired-AND resolution.
+    Wand,
+    /// `wor` or `trior`: wired-OR resolution.
+    Wor,
 }
 
 /// One instance in a module-instantiation declaration.

@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use eevee_core::{Bit, LogicVec, SimTime};
-use eevee_sched::{EdgeKind, Kernel, NetId, Process, Sim, Wait};
+use eevee_sched::{EdgeKind, Kernel, NetId, NetResolution, Process, Sim, Wait};
 
 fn lv(v: u64, w: u32) -> LogicVec {
     LogicVec::from_u64(v, w)
@@ -35,6 +35,35 @@ fn continuous_drivers_resolve_four_state_values() {
 
     sim.kernel().drive_net(left, LogicVec::x(1));
     assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::X);
+}
+
+#[test]
+fn wired_net_types_apply_and_or_resolution() {
+    let mut sim = Sim::with_default_timescale();
+    let wand = sim
+        .kernel()
+        .new_net_with_resolution("wand", LogicVec::z(1), NetResolution::Wand);
+    let wor = sim
+        .kernel()
+        .new_net_with_resolution("wor", LogicVec::z(1), NetResolution::Wor);
+    let wand_left = sim.kernel().new_driver(wand);
+    let wand_right = sim.kernel().new_driver(wand);
+    let wor_left = sim.kernel().new_driver(wor);
+    let wor_right = sim.kernel().new_driver(wor);
+
+    sim.kernel().drive_net(wand_left, lv(1, 1));
+    assert_eq!(sim.kernel().net_value(wand).get_bit(0), Bit::One);
+    sim.kernel().drive_net(wand_right, LogicVec::x(1));
+    assert_eq!(sim.kernel().net_value(wand).get_bit(0), Bit::X);
+    sim.kernel().drive_net(wand_left, lv(0, 1));
+    assert_eq!(sim.kernel().net_value(wand).get_bit(0), Bit::Zero);
+
+    sim.kernel().drive_net(wor_left, lv(0, 1));
+    assert_eq!(sim.kernel().net_value(wor).get_bit(0), Bit::Zero);
+    sim.kernel().drive_net(wor_right, LogicVec::x(1));
+    assert_eq!(sim.kernel().net_value(wor).get_bit(0), Bit::X);
+    sim.kernel().drive_net(wor_left, lv(1, 1));
+    assert_eq!(sim.kernel().net_value(wor).get_bit(0), Bit::One);
 }
 
 struct InertialPulseDriver {

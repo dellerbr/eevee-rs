@@ -28,7 +28,7 @@ use eevee_ir::{
     ArgMode, ClassDef, CollOp, DpiRegistry, ExecBackend, Inst, Label, Linkage, Program,
     ProgramBuilder, Reg, Value,
 };
-use eevee_sched::{DriverId, EdgeKind, ForkJoin, NetId, Sim};
+use eevee_sched::{DriverId, EdgeKind, ForkJoin, NetId, NetResolution, Sim};
 
 /// Statistics from a global elaboration pass (how much UVM we ingested).
 #[derive(Debug, Default, Clone)]
@@ -1300,9 +1300,16 @@ fn elaborate_module_instance(
     }
     for item in &m.items {
         if let ModuleItem::Net(net) = item {
-            let id = sim
-                .kernel()
-                .new_net(scoped_name(path, &net.name), LogicVec::z(net.width));
+            let resolution = match net.kind {
+                NetKind::Wire => NetResolution::Wire,
+                NetKind::Wand => NetResolution::Wand,
+                NetKind::Wor => NetResolution::Wor,
+            };
+            let id = sim.kernel().new_net_with_resolution(
+                scoped_name(path, &net.name),
+                LogicVec::z(net.width),
+                resolution,
+            );
             scope.insert(net.name.clone(), (id, net.width));
             drivable.insert(net.name.clone());
         }
