@@ -503,6 +503,14 @@ fn run_frame(
                 let value = regs[src as usize].as_logic().clone();
                 k.drive_net(driver, value);
             }
+            Inst::ScheduleDrive {
+                driver,
+                src,
+                delay_fs,
+            } => {
+                let value = regs[src as usize].as_logic().clone();
+                k.schedule_drive(driver, value, delay_fs);
+            }
             Inst::Delay { fs } => return Step::Wait(Wait::Delay(fs)),
             Inst::WaitEdge { net, edge } => return Step::Wait(Wait::Edge(net, edge)),
             Inst::WaitCond { nets } => {

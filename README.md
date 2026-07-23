@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 21, 2026:
 
-- 151 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 154 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -81,6 +81,10 @@ Validated on July 21, 2026:
 - Continuous assignments park on deduplicated RHS net read sets, so unrelated
   writes do not wake them. Generic multi-net waits invalidate and remove sibling
   registrations after the first source fires.
+- A single known nonnegative timescale-relative continuous assignment delay is
+  supported with inertial replacement: short pulses are rejected, identical
+  requests do not postpone pending updates, and canceled events do not advance
+  simulation time.
 
 ## Implemented Language Surface
 
@@ -121,6 +125,8 @@ The current implementation includes:
   four-state multiple-driver resolution.
 - Precise continuous-assignment sensitivity and generation-safe multi-net wait
   registration/cleanup.
+- Single-value inertial continuous assignment delays with per-instance
+  parameter expressions and zero-delay immediate application.
 - Fail-closed `parse_source_conformant` and `elaborate_conformant` APIs. The
   legacy APIs remain permissive for coverage exploration.
 - UVM-oriented report formatting primitives including enum names, string
@@ -232,8 +238,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-  delayed/strength-aware drivers, hierarchical references, and generate
-  `if`/`case`/`for`.
+  transition-specific/net delays, strength-aware drivers, hierarchical
+  references, and generate `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -293,9 +299,10 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   expression actuals, hierarchy references, and generate remain unsupported.
 - Continuous assignment support is limited to plain unsigned `wire` nets,
   whole-net LHS targets, exact-width represented unsigned signal/literal RHS
-  expressions, and immediate strengthless drivers. Net declaration
-  assignments, procedural net writes, implicit width conversion, signed
-  operands/targets, other net types, drive strengths, assignment delays,
+  expressions, and strengthless drivers with zero or one timescale-relative
+  inertial delay. Net declaration assignments/delays, procedural net writes,
+  implicit width conversion, signed operands/targets, other net types, drive
+  strengths, rise/fall/turn-off delay tuples, explicit-unit delay literals,
   dynamic/out-of-range RHS selects, partial/hierarchical targets, and driver
   release remain unsupported in conformance mode.
 - Module parameter support is limited to explicit or inherited bare 32-bit

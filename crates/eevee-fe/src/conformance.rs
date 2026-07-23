@@ -63,7 +63,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
         }
         "kContinuousAssignmentStatement" => {
             if let Some(delay) = find(node, "kDelay") {
-                return unsupported(delay, source);
+                validate_single_assignment_delay(delay, source)?;
             }
             if let Some(strength) = find(node, "kDriveStrength") {
                 return unsupported(strength, source);
@@ -279,6 +279,23 @@ fn validate_separated_list(node: &Value, item_tag: &str, source: &str) -> Result
         })
     {
         return unsupported(node, source);
+    }
+    Ok(())
+}
+
+fn validate_single_assignment_delay(node: &Value, source: &str) -> Result<(), FeError> {
+    if let Some(value) = find(node, "kDelayValue") {
+        if kids(value).count() != 1 {
+            return unsupported(value, source);
+        }
+        return Ok(());
+    }
+    let Some(group) = find(node, "kParenGroup") else {
+        return unsupported(node, source);
+    };
+    let children: Vec<_> = kids(group).collect();
+    if children.len() != 3 || tag(children[1]) != "kExpression" {
+        return unsupported(children.get(1).copied().unwrap_or(group), source);
     }
     Ok(())
 }

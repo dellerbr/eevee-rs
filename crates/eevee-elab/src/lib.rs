@@ -1365,7 +1365,7 @@ fn elaborate_module_instance(
                 .gen_initial(body);
                 sim.add_process(backend.instantiate(Rc::new(prog), g.linkage.clone()));
             }
-            ModuleItem::ContinuousAssign { lhs, rhs } => {
+            ModuleItem::ContinuousAssign { lhs, rhs, delay } => {
                 if lhs.receiver.is_some() || lhs.index.is_some() || lhs.scope.is_some() {
                     panic!("continuous assignment requires a whole module net");
                 }
@@ -1376,6 +1376,20 @@ fn elaborate_module_instance(
                     panic!("continuous assignment target '{}' is unknown", lhs.name)
                 });
                 let driver = sim.kernel().new_driver(net);
+                let delay_fs = delay.as_ref().map(|delay| {
+                    let value = try_const_eval_with(delay, &consts).unwrap_or_else(|| {
+                        panic!("continuous assignment delay is not a constant expression")
+                    });
+                    assert!(
+                        value.is_known(),
+                        "continuous assignment delay contains X or Z"
+                    );
+                    assert!(
+                        value.to_i64() >= 0,
+                        "continuous assignment delay is negative"
+                    );
+                    ts.delay_to_fs(value.to_u64() as f64)
+                });
                 let prog = CodeGen::new(
                     &scope,
                     &g.func_ids,
@@ -1385,7 +1399,7 @@ fn elaborate_module_instance(
                     &gv,
                     ts,
                 )
-                .gen_continuous(rhs, driver);
+                .gen_continuous(rhs, driver, delay_fs);
                 sim.add_process(backend.instantiate(Rc::new(prog), g.linkage.clone()));
             }
             ModuleItem::Var(_)
@@ -1690,14 +1704,21 @@ impl<'a> CodeGen<'a> {
 
     /// A continuous assignment is an implicit process that drives once at
     /// time zero, then re-evaluates after signal/runtime activity.
-    fn gen_continuous(&mut self, rhs: &Expr, driver: DriverId) -> Program {
+    fn gen_continuous(&mut self, rhs: &Expr, driver: DriverId, delay_fs: Option<u64>) -> Program {
         let mut pb = ProgramBuilder::new("continuous assign");
         let mut read_set = Vec::new();
         self.collect_net_reads(rhs, &mut read_set);
         let evaluate = pb.new_label();
         pb.bind(evaluate);
         let value = self.gen_expr(rhs, &mut pb);
-        pb.emit(Inst::DriveNet { driver, src: value });
+        match delay_fs {
+            Some(delay_fs) => pb.emit(Inst::ScheduleDrive {
+                driver,
+                src: value,
+                delay_fs,
+            }),
+            None => pb.emit(Inst::DriveNet { driver, src: value }),
+        }
         if read_set.is_empty() {
             pb.emit(Inst::Finish);
         } else {

@@ -153,6 +153,47 @@ fn continuous_assignment_uses_rhs_source_sensitivity() {
 }
 
 #[test]
+fn delayed_continuous_assignment_rejects_short_pulses() {
+    let src = "module child #(parameter int DELAY = 4)\n\
+                         (input logic source, output wire result,\n\
+                          output wire immediate);\n\
+      assign #(DELAY + 1) result = source;\n\
+      assign #0 immediate = source;\n\
+    endmodule\n\
+    module top;\n\
+      logic source = 0;\n\
+      wire result;\n\
+      wire immediate;\n\
+      child #(.DELAY(2)) dut(.source(source), .result(result),\n\
+                              .immediate(immediate));\n\
+      initial begin\n\
+        #1 source = 1;\n\
+        #1 source = 0;\n\
+        #4 source = 1;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let result = sim.kernel().find_net("result").expect("result net");
+    let immediate = sim.kernel().find_net("immediate").expect("immediate net");
+
+    sim.run_until(Some(SimTime::from_fs(4_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::Z);
+    assert_eq!(sim.kernel().net_value(immediate).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(5_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(8_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(immediate).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(9_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::One);
+}
+
+#[test]
 fn conformance_mode_rejects_invalid_continuous_drivers() {
     let cases = [
         (
@@ -178,6 +219,18 @@ fn conformance_mode_rejects_invalid_continuous_drivers() {
         (
             "module top; logic [3:0] source; wire result; assign result = source[4]; endmodule",
             "packed index is out of range",
+        ),
+        (
+            "module top; logic source; wire result; assign #(-1) result = source; endmodule",
+            "delay is negative",
+        ),
+        (
+            "module top; logic source; wire result; assign #(1'bx) result = source; endmodule",
+            "delay contains X or Z",
+        ),
+        (
+            "module top; logic source; wire result; assign #source result = source; endmodule",
+            "delay in module 'top' is not a constant parameter expression",
         ),
     ];
     for (source, expected) in cases {

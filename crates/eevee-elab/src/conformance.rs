@@ -122,6 +122,11 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
 }
 
 fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
+    let module_parameters: HashSet<&str> = module
+        .parameters
+        .iter()
+        .map(|parameter| parameter.name.as_str())
+        .collect();
     let drivable: HashSet<&str> = module
         .items
         .iter()
@@ -135,7 +140,7 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
         }))
         .collect();
     for item in &module.items {
-        let ModuleItem::ContinuousAssign { lhs, rhs } = item else {
+        let ModuleItem::ContinuousAssign { lhs, rhs, delay } = item else {
             continue;
         };
         if lhs.receiver.is_some()
@@ -167,6 +172,15 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
                 "continuous assignment width conversion is unsupported for '{}.{}': RHS is {} bits, target is {} bits",
                 module.name, lhs.name, rhs_width, target_width
             ));
+        }
+        if let Some(delay) = delay {
+            if !is_parameter_constant_expr(delay, &module_parameters) {
+                return unsupported(format!(
+                    "continuous assignment delay in module '{}' is not a constant parameter expression",
+                    module.name
+                ));
+            }
+            validate_expr(delay)?;
         }
     }
     Ok(())
@@ -568,9 +582,12 @@ fn validate_items(
                     }
                 }
             }
-            ModuleItem::ContinuousAssign { lhs, rhs } => {
+            ModuleItem::ContinuousAssign { lhs, rhs, delay } => {
                 validate_lvalue(lhs)?;
                 validate_expr(rhs)?;
+                if let Some(delay) = delay {
+                    validate_expr(delay)?;
+                }
             }
             ModuleItem::Always(always) => validate_stmt(&always.body, module_parameters)?,
             ModuleItem::Initial(body) => validate_stmt(body, module_parameters)?,

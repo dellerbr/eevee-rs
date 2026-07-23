@@ -211,13 +211,14 @@ fn parses_continuous_assignments() {
       wire y, z;\n\
       assign y = a & b;\n\
       assign z = a, y = b;\n\
+            assign #2 z = b;\n\
     endmodule\n";
     let file = parse_source(src).expect("verible parse");
-    let continuous: Vec<(&Lvalue, &Expr)> = module(&file)
+    let continuous: Vec<(&Lvalue, &Expr, &Option<Expr>)> = module(&file)
         .items
         .iter()
         .filter_map(|item| match item {
-            ModuleItem::ContinuousAssign { lhs, rhs } => Some((lhs, rhs)),
+            ModuleItem::ContinuousAssign { lhs, rhs, delay } => Some((lhs, rhs, delay)),
             _ => None,
         })
         .collect();
@@ -232,7 +233,7 @@ fn parses_continuous_assignments() {
     assert_eq!(nets.len(), 2);
     assert_eq!(nets[0].name, "y");
     assert_eq!(nets[1].name, "z");
-    assert_eq!(continuous.len(), 3);
+    assert_eq!(continuous.len(), 4);
     assert_eq!(continuous[0].0.name, "y");
     assert!(matches!(
         continuous[0].1,
@@ -247,6 +248,15 @@ fn parses_continuous_assignments() {
     assert!(matches!(continuous[1].1, Expr::Ref(name) if name == "a"));
     assert_eq!(continuous[2].0.name, "y");
     assert!(matches!(continuous[2].1, Expr::Ref(name) if name == "b"));
+    assert!(continuous[0].2.is_none());
+    assert!(matches!(
+        continuous[3],
+        (
+            Lvalue { name, .. },
+            Expr::Ref(source),
+            Some(Expr::Literal(delay))
+        ) if name == "z" && source == "b" && delay.to_u64() == 2
+    ));
 }
 
 #[test]
@@ -327,21 +337,25 @@ fn parses_module_parameter_defaults_and_overrides() {
 }
 
 #[test]
-fn conformance_mode_accepts_simple_and_rejects_delayed_continuous_assignments() {
+fn conformance_mode_accepts_single_and_rejects_multi_delayed_continuous_assignments() {
     let simple =
         "module top;\n  logic source; wire result;\n  assign result = source;\nendmodule\n";
     parse_source_conformant(simple).expect("simple continuous assignment is supported");
 
     let delayed =
         "module top;\n  logic source; wire result;\n  assign #2 result = source;\nendmodule\n";
-    let error = parse_source_conformant(delayed).expect_err("assignment delay is unsupported");
+    parse_source_conformant(delayed).expect("single assignment delay is supported");
+
+    let multi =
+        "module top;\n  logic source; wire result;\n  assign #(1, 2) result = source;\nendmodule\n";
+    let error = parse_source_conformant(multi).expect_err("multi-value delay is unsupported");
     assert!(matches!(
         error,
         FeError::UnsupportedSyntax {
             ref construct,
             line: 3,
-            column: 10,
-        } if construct == "kDelay"
+            ..
+        } if construct == "kUntagged"
     ));
 
     let declaration_assign = "module top;\n  logic source;\n  wire result = source;\nendmodule\n";

@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 151 tests.
+- `cargo test --workspace` passes all 154 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -81,10 +81,16 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
 - Generic `Wait::Cond`/`Wait::Sensitivity` registration now uses process wait
   generations and reverse net tracking, preventing duplicate wakeups and
   removing stale quiet-sibling waiters after the first source fires.
+- Continuous assignments accept one known nonnegative timescale-relative delay
+  expression. The typed time wheel schedules inertial driver actions with
+  per-driver generations: newer values cancel older pending events, identical
+  requests retain their deadline, and canceled events are pruned before time
+  advancement. `#0` applies immediately.
 - Strict mode rejects net declaration assignments, procedural or signed net
   drives, implicit width conversion, non-wire net types, strengths, assignment
-  delays, dynamic/out-of-range RHS selects, partial targets, unknown RHS names,
-  and unsupported RHS calls.
+  delay tuples, explicit-unit delay literals, negative/X/Z/nonconstant delays,
+  dynamic/out-of-range RHS selects, partial targets, unknown RHS names, and
+  unsupported RHS calls.
 
 The module connectivity model currently aliases a scheduler net. Full port
 directionality, complete net/variable port semantics, and width-converting or
@@ -92,9 +98,10 @@ expression connections are not claimed.
 
 ## Next Priorities
 
-1. Extend continuous drivers with assignment/net delays, strengths, additional
-  net types, and driver release. Then extend module parameters into
-  parameter-dependent packed widths and complete value typing/coercion.
+1. Extend continuous drivers with rise/fall/turn-off and net declaration delays,
+  strengths, additional net types, and driver release. Then extend module
+  parameters into parameter-dependent packed widths and complete value
+  typing/coercion.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime

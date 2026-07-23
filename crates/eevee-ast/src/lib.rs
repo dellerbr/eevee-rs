@@ -87,6 +87,7 @@ pub enum ModuleItem {
     ContinuousAssign {
         lhs: Lvalue,
         rhs: Expr,
+        delay: Option<Expr>,
     },
     Always(AlwaysBlock),
     Initial(Stmt),

@@ -128,6 +128,12 @@ pub enum Inst {
     NbaWrite { net: NetId, src: Reg },
     /// Update one continuous driver; the scheduler resolves all drivers.
     DriveNet { driver: DriverId, src: Reg },
+    /// Schedule an inertial continuous-driver update after `delay_fs`.
+    ScheduleDrive {
+        driver: DriverId,
+        src: Reg,
+        delay_fs: u64,
+    },
 
     // --- timing controls = process suspension points ---
     /// `#fs` — suspend for `fs` femtoseconds.

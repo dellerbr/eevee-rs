@@ -37,6 +37,80 @@ fn continuous_drivers_resolve_four_state_values() {
     assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::X);
 }
 
+struct InertialPulseDriver {
+    driver: eevee_sched::DriverId,
+    phase: u8,
+}
+
+impl Process for InertialPulseDriver {
+    fn resume(&mut self, kernel: &mut Kernel) -> Wait {
+        match self.phase {
+            0 => {
+                self.phase = 1;
+                kernel.schedule_drive(self.driver, lv(0, 1), 5);
+                Wait::Delay(2)
+            }
+            1 => {
+                self.phase = 2;
+                kernel.schedule_drive(self.driver, lv(1, 1), 5);
+                Wait::Delay(2)
+            }
+            _ => {
+                kernel.schedule_drive(self.driver, lv(0, 1), 5);
+                Wait::Finished
+            }
+        }
+    }
+}
+
+#[test]
+fn delayed_continuous_driver_rejects_short_pulse() {
+    let mut sim = Sim::with_default_timescale();
+    let net = sim.kernel().new_net("delayed", LogicVec::z(1));
+    let driver = sim.kernel().new_driver(net);
+    sim.kernel().drive_net(driver, lv(0, 1));
+    sim.add_process(Box::new(InertialPulseDriver { driver, phase: 0 }));
+
+    sim.run_until(Some(SimTime::from_fs(8)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(9)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Zero);
+    assert_eq!(
+        sim.kernel().stats().time_advances,
+        2,
+        "canceled driver updates must not create phantom time slots"
+    );
+}
+
+struct SameValueReevaluation {
+    driver: eevee_sched::DriverId,
+    phase: u8,
+}
+
+impl Process for SameValueReevaluation {
+    fn resume(&mut self, kernel: &mut Kernel) -> Wait {
+        kernel.schedule_drive(self.driver, lv(0, 1), 5);
+        if self.phase == 0 {
+            self.phase = 1;
+            Wait::Delay(2)
+        } else {
+            Wait::Finished
+        }
+    }
+}
+
+#[test]
+fn same_delayed_driver_value_does_not_postpone_update() {
+    let mut sim = Sim::with_default_timescale();
+    let net = sim.kernel().new_net("same_value", LogicVec::z(1));
+    let driver = sim.kernel().new_driver(net);
+    sim.add_process(Box::new(SameValueReevaluation { driver, phase: 0 }));
+
+    sim.run_until(Some(SimTime::from_fs(5)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Zero);
+}
+
 struct MultiNetWaiter {
     left: NetId,
     right: NetId,

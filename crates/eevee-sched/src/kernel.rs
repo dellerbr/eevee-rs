@@ -29,6 +29,7 @@ use crate::process::{DriverId, EdgeKind, EventId, ForkJoin, NetId, ProcId, Proce
 struct DriverTarget {
     net: NetId,
     slot: usize,
+    generation: u64,
 }
 
 /// A parent process blocked on `join`/`join_any` for a set of forked children.
@@ -45,7 +46,16 @@ struct TimedEvent {
     time: SimTime,
     region: Region,
     seq: u64,
-    proc: ProcId,
+    action: TimedAction,
+}
+
+enum TimedAction {
+    Resume(ProcId),
+    Drive {
+        driver: DriverId,
+        value: LogicVec,
+        generation: u64,
+    },
 }
 
 impl PartialEq for TimedEvent {
@@ -90,6 +100,7 @@ pub struct Kernel {
     timescale: Timescale,
     nets: Vec<Net>,
     drivers: Vec<DriverTarget>,
+    driver_requests: Vec<LogicVec>,
 
     // Current-time-slot region queues of process wakeups.
     active: VecDeque<ProcId>,
@@ -132,6 +143,7 @@ impl Kernel {
             timescale,
             nets: Vec::new(),
             drivers: Vec::new(),
+            driver_requests: Vec::new(),
             active: VecDeque::new(),
             inactive: VecDeque::new(),
             nba: Vec::new(),
@@ -182,12 +194,57 @@ impl Kernel {
         let slot = self.nets[net.0].driver_values.len();
         self.nets[net.0].driver_values.push(LogicVec::z(width));
         let id = DriverId(self.drivers.len());
-        self.drivers.push(DriverTarget { net, slot });
+        self.drivers.push(DriverTarget {
+            net,
+            slot,
+            generation: 0,
+        });
+        self.driver_requests.push(LogicVec::z(width));
         id
     }
 
     /// Update one continuous driver and write the net's resolved four-state value.
     pub fn drive_net(&mut self, driver: DriverId, value: LogicVec) {
+        let target = self.drivers[driver.0];
+        let width = self.nets[target.net.0].value.width();
+        let value = value.resize(width, false);
+        self.drivers[driver.0].generation = self.drivers[driver.0].generation.wrapping_add(1);
+        self.driver_requests[driver.0] = value.clone();
+        self.apply_drive(driver, value);
+    }
+
+    /// Schedule an inertial continuous-driver update after `delay_fs`.
+    /// A newer update for the same driver invalidates any older pending value.
+    pub fn schedule_drive(&mut self, driver: DriverId, value: LogicVec, delay_fs: u64) {
+        let target = self.drivers[driver.0];
+        let width = self.nets[target.net.0].value.width();
+        let value = value.resize(width, false);
+        if self.driver_requests[driver.0].eq_case(&value) {
+            return;
+        }
+        self.driver_requests[driver.0] = value.clone();
+        self.drivers[driver.0].generation = self.drivers[driver.0].generation.wrapping_add(1);
+        let generation = self.drivers[driver.0].generation;
+        if self.nets[target.net.0].driver_values[target.slot].eq_case(&value) {
+            return;
+        }
+        if delay_fs == 0 {
+            self.apply_drive(driver, value);
+            return;
+        }
+        let time = self.time.saturating_add_fs(delay_fs);
+        self.push_timed_action(
+            time,
+            Region::Active,
+            TimedAction::Drive {
+                driver,
+                value,
+                generation,
+            },
+        );
+    }
+
+    fn apply_drive(&mut self, driver: DriverId, value: LogicVec) {
         let target = self.drivers[driver.0];
         let width = self.nets[target.net.0].value.width();
         self.nets[target.net.0].driver_values[target.slot] = value.resize(width, false);
@@ -331,12 +388,16 @@ impl Kernel {
     // ---- Internal scheduling -------------------------------------------
 
     fn push_timed(&mut self, time: SimTime, region: Region, proc: ProcId) {
+        self.push_timed_action(time, region, TimedAction::Resume(proc));
+    }
+
+    fn push_timed_action(&mut self, time: SimTime, region: Region, action: TimedAction) {
         self.seq += 1;
         self.timed.push(Reverse(TimedEvent {
             time,
             region,
             seq: self.seq,
-            proc,
+            action,
         }));
     }
 
@@ -435,11 +496,41 @@ impl Kernel {
                 break;
             }
             let Reverse(ev) = self.timed.pop().unwrap();
-            match ev.region {
-                Region::Inactive => self.inactive.push_back(ev.proc),
-                // Active and (for now) every other region resume in Active.
-                _ => self.active.push_back(ev.proc),
+            match ev.action {
+                TimedAction::Resume(proc) => match ev.region {
+                    Region::Inactive => self.inactive.push_back(proc),
+                    // Active and (for now) every other region resume in Active.
+                    _ => self.active.push_back(proc),
+                },
+                TimedAction::Drive {
+                    driver,
+                    value,
+                    generation,
+                } => {
+                    if self.drivers[driver.0].generation == generation {
+                        self.apply_drive(driver, value);
+                    }
+                }
             }
+        }
+    }
+
+    fn discard_stale_timed_actions(&mut self) {
+        loop {
+            let stale = self.timed.peek().is_some_and(|Reverse(event)| {
+                matches!(
+                    &event.action,
+                    TimedAction::Drive {
+                        driver,
+                        generation,
+                        ..
+                    } if self.drivers[driver.0].generation != *generation
+                )
+            });
+            if !stale {
+                break;
+            }
+            self.timed.pop();
         }
     }
 }
@@ -534,6 +625,7 @@ impl Sim {
             }
 
             // Advance time to the next scheduled event.
+            self.kernel.discard_stale_timed_actions();
             let next_t = match self.kernel.timed.peek() {
                 Some(Reverse(ev)) => ev.time,
                 None => return, // nothing left to do

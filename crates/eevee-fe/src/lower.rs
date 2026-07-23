@@ -102,11 +102,13 @@ fn lower_continuous_assignments(n: &Value, out: &mut Vec<ModuleItem>) {
     let Some(assignments) = find(n, "kAssignmentList") else {
         return;
     };
+    let delay = find(n, "kDelay").map(lower_delay_expr);
     for assignment in kids(assignments) {
         if tag(assignment) == "kNetVariableAssignment" {
             out.push(ModuleItem::ContinuousAssign {
                 lhs: lower_lvalue(assignment),
                 rhs: lower_rhs(assignment),
+                delay: delay.clone(),
             });
         }
     }
@@ -1552,16 +1554,7 @@ fn lower_sys_call(n: &Value) -> Stmt {
 
 fn lower_timing_control(n: &Value) -> TimingControl {
     match tag(n) {
-        "kDelay" => TimingControl::Delay(
-            find(n, "kDelayValue")
-                .or_else(|| find(n, "kParenGroup"))
-                .map(|value| {
-                    find(value, "kExpression")
-                        .map(lower_expr)
-                        .unwrap_or_else(|| lower_expr(value))
-                })
-                .unwrap_or_else(|| Expr::Literal(LogicVec::zero(32))),
-        ),
+        "kDelay" => TimingControl::Delay(lower_delay_expr(n)),
         "kEventControl" => {
             let mut events = Vec::new();
             if let Some(list) = find_deep(n, "kEventExpressionList") {
@@ -1575,6 +1568,17 @@ fn lower_timing_control(n: &Value) -> TimingControl {
         }
         _ => TimingControl::Delay(Expr::Literal(LogicVec::zero(32))),
     }
+}
+
+fn lower_delay_expr(n: &Value) -> Expr {
+    find(n, "kDelayValue")
+        .or_else(|| find(n, "kParenGroup"))
+        .map(|value| {
+            find(value, "kExpression")
+                .map(lower_expr)
+                .unwrap_or_else(|| lower_expr(value))
+        })
+        .unwrap_or_else(|| Expr::Literal(LogicVec::zero(32)))
 }
 
 fn lower_event_expr(n: &Value) -> EventExpr {
