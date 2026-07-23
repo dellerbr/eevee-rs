@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use eevee_core::LogicVec;
-use eevee_sched::{DriverId, EdgeKind, ForkJoin, NetId};
+use eevee_sched::{DriveDelay, DriverId, EdgeKind, ForkJoin, NetId};
 
 use crate::value::Value;
 
@@ -133,6 +133,12 @@ pub enum Inst {
         driver: DriverId,
         src: Reg,
         delay_fs: u64,
+    },
+    /// Schedule per-bit inertial updates using rise/fall/turn-off delays.
+    ScheduleDriveTransitions {
+        driver: DriverId,
+        src: Reg,
+        delays: DriveDelay,
     },
 
     // --- timing controls = process suspension points ---

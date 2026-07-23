@@ -27,6 +27,30 @@ pub enum DriveStrength {
     Supply,
 }
 
+/// Transition-specific delays for one continuous driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriveDelay {
+    pub rise_fs: u64,
+    pub fall_fs: u64,
+    pub turn_off_fs: u64,
+}
+
+impl DriveDelay {
+    pub(crate) fn for_transition(self, from: Bit, to: Bit) -> u64 {
+        match to {
+            Bit::One => self.rise_fs,
+            Bit::Zero => self.fall_fs,
+            Bit::Z => self.turn_off_fs,
+            Bit::X => match from {
+                Bit::Zero => self.rise_fs.min(self.turn_off_fs),
+                Bit::One => self.fall_fs.min(self.turn_off_fs),
+                Bit::Z => self.rise_fs.min(self.fall_fs),
+                Bit::X => 0,
+            },
+        }
+    }
+}
+
 /// A process parked on a net, with the edge it is waiting for.
 pub(crate) struct Waiter {
     pub proc: ProcId,
@@ -141,6 +165,21 @@ fn is_negedge(old: Bit, new: Bit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transition_to_x_uses_minimum_applicable_delay() {
+        let delays = DriveDelay {
+            rise_fs: 7,
+            fall_fs: 5,
+            turn_off_fs: 3,
+        };
+        assert_eq!(delays.for_transition(Bit::Zero, Bit::X), 3);
+        assert_eq!(delays.for_transition(Bit::One, Bit::X), 3);
+        assert_eq!(delays.for_transition(Bit::Z, Bit::X), 5);
+        assert_eq!(delays.for_transition(Bit::X, Bit::Zero), 5);
+        assert_eq!(delays.for_transition(Bit::X, Bit::One), 7);
+        assert_eq!(delays.for_transition(Bit::X, Bit::Z), 3);
+    }
 
     fn b1(v: u64) -> LogicVec {
         LogicVec::from_u64(v, 1)

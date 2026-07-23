@@ -85,7 +85,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
         }
         "kContinuousAssignmentStatement" => {
             if let Some(delay) = find(node, "kDelay") {
-                validate_single_assignment_delay(delay, source)?;
+                validate_assignment_delay(delay, source)?;
             }
             if let Some(strength) = find(node, "kDriveStrength") {
                 return unsupported(strength, source);
@@ -355,7 +355,7 @@ fn validate_separated_list(node: &Value, item_tag: &str, source: &str) -> Result
     Ok(())
 }
 
-fn validate_single_assignment_delay(node: &Value, source: &str) -> Result<(), FeError> {
+fn validate_assignment_delay(node: &Value, source: &str) -> Result<(), FeError> {
     if let Some(value) = find(node, "kDelayValue") {
         if kids(value).count() != 1 {
             return unsupported(value, source);
@@ -365,9 +365,20 @@ fn validate_single_assignment_delay(node: &Value, source: &str) -> Result<(), Fe
     let Some(group) = find(node, "kParenGroup") else {
         return unsupported(node, source);
     };
-    let children: Vec<_> = kids(group).collect();
-    if children.len() != 3 || tag(children[1]) != "kExpression" {
-        return unsupported(children.get(1).copied().unwrap_or(group), source);
+    let Some(body) = kids(group).find(|child| matches!(tag(child), "kExpression" | "kUntagged"))
+    else {
+        return unsupported(group, source);
+    };
+    if tag(body) == "kExpression" {
+        return Ok(());
+    }
+    validate_separated_list(body, "kExpression", source)?;
+    if !(2..=3).contains(
+        &kids(body)
+            .filter(|child| tag(child) == "kExpression")
+            .count(),
+    ) {
+        return unsupported(body, source);
     }
     Ok(())
 }

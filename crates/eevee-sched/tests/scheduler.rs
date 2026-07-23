@@ -8,7 +8,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use eevee_core::{Bit, LogicVec, SimTime};
-use eevee_sched::{DriveStrength, EdgeKind, Kernel, NetId, NetResolution, Process, Sim, Wait};
+use eevee_sched::{
+    DriveDelay, DriveStrength, EdgeKind, Kernel, NetId, NetResolution, Process, Sim, Wait,
+};
 
 fn lv(v: u64, w: u32) -> LogicVec {
     LogicVec::from_u64(v, w)
@@ -182,6 +184,86 @@ fn same_delayed_driver_value_does_not_postpone_update() {
 
     sim.run_until(Some(SimTime::from_fs(5)));
     assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Zero);
+}
+
+#[test]
+fn transition_specific_driver_delays_apply_per_bit() {
+    let mut sim = Sim::with_default_timescale();
+    let net = sim.kernel().new_net("transition_delayed", LogicVec::z(3));
+    let driver = sim.kernel().new_driver(net);
+    let mut initial = LogicVec::zero(3);
+    initial.set_bit(1, Bit::One);
+    initial.set_bit(2, Bit::One);
+    sim.kernel().drive_net(driver, initial);
+
+    let mut requested = LogicVec::zero(3);
+    requested.set_bit(0, Bit::One);
+    requested.set_bit(2, Bit::Z);
+    sim.kernel().schedule_drive_transitions(
+        driver,
+        requested,
+        DriveDelay {
+            rise_fs: 2,
+            fall_fs: 4,
+            turn_off_fs: 6,
+        },
+    );
+
+    sim.run_until(Some(SimTime::from_fs(2)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(net).get_bit(1), Bit::One);
+    assert_eq!(sim.kernel().net_value(net).get_bit(2), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(4)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(net).get_bit(1), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(net).get_bit(2), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(6)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(net).get_bit(1), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(net).get_bit(2), Bit::Z);
+}
+
+struct PerBitInertialDriver {
+    driver: eevee_sched::DriverId,
+    phase: u8,
+}
+
+impl Process for PerBitInertialDriver {
+    fn resume(&mut self, kernel: &mut Kernel) -> Wait {
+        let delays = DriveDelay {
+            rise_fs: 5,
+            fall_fs: 5,
+            turn_off_fs: 5,
+        };
+        match self.phase {
+            0 => {
+                self.phase = 1;
+                kernel.schedule_drive_transitions(self.driver, lv(3, 2), delays);
+                Wait::Delay(2)
+            }
+            _ => {
+                kernel.schedule_drive_transitions(self.driver, lv(1, 2), delays);
+                Wait::Finished
+            }
+        }
+    }
+}
+
+#[test]
+fn transition_delays_cancel_and_preserve_pending_bits_independently() {
+    let mut sim = Sim::with_default_timescale();
+    let net = sim.kernel().new_net("per_bit_inertial", LogicVec::z(2));
+    let driver = sim.kernel().new_driver(net);
+    sim.kernel().drive_net(driver, lv(0, 2));
+    sim.add_process(Box::new(PerBitInertialDriver { driver, phase: 0 }));
+
+    sim.run_until(Some(SimTime::from_fs(4)));
+    assert_eq!(sim.kernel().net_value(net).to_u64(), 0);
+
+    sim.run_until(Some(SimTime::from_fs(5)));
+    assert_eq!(sim.kernel().net_value(net).to_u64(), 1);
 }
 
 struct MultiNetWaiter {

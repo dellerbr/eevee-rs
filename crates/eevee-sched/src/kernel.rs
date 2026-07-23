@@ -22,13 +22,19 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use eevee_core::{Bit, LogicVec, Region, SimTime, Timescale};
 
-use crate::net::{detect_edge, DriveStrength, Net, NetResolution, Waiter};
+use crate::net::{detect_edge, DriveDelay, DriveStrength, Net, NetResolution, Waiter};
 use crate::process::{DriverId, EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};
 
 #[derive(Clone, Copy)]
 struct DriverTarget {
     net: NetId,
     slot: usize,
+    generation: u64,
+}
+
+struct BitDrive {
+    bit: u32,
+    value: Bit,
     generation: u64,
 }
 
@@ -55,6 +61,10 @@ enum TimedAction {
         driver: DriverId,
         value: LogicVec,
         generation: u64,
+    },
+    DriveBits {
+        driver: DriverId,
+        updates: Vec<BitDrive>,
     },
 }
 
@@ -101,6 +111,7 @@ pub struct Kernel {
     nets: Vec<Net>,
     drivers: Vec<DriverTarget>,
     driver_requests: Vec<LogicVec>,
+    driver_bit_generations: Vec<Vec<u64>>,
 
     // Current-time-slot region queues of process wakeups.
     active: VecDeque<ProcId>,
@@ -144,6 +155,7 @@ impl Kernel {
             nets: Vec::new(),
             drivers: Vec::new(),
             driver_requests: Vec::new(),
+            driver_bit_generations: Vec::new(),
             active: VecDeque::new(),
             inactive: VecDeque::new(),
             nba: Vec::new(),
@@ -221,6 +233,7 @@ impl Kernel {
             generation: 0,
         });
         self.driver_requests.push(LogicVec::z(width));
+        self.driver_bit_generations.push(vec![0; width as usize]);
         id
     }
 
@@ -230,6 +243,9 @@ impl Kernel {
         let width = self.nets[target.net.0].value.width();
         let value = value.resize(width, false);
         self.drivers[driver.0].generation = self.drivers[driver.0].generation.wrapping_add(1);
+        for generation in &mut self.driver_bit_generations[driver.0] {
+            *generation = generation.wrapping_add(1);
+        }
         self.driver_requests[driver.0] = value.clone();
         self.apply_drive(driver, value);
     }
@@ -245,6 +261,9 @@ impl Kernel {
         }
         self.driver_requests[driver.0] = value.clone();
         self.drivers[driver.0].generation = self.drivers[driver.0].generation.wrapping_add(1);
+        for generation in &mut self.driver_bit_generations[driver.0] {
+            *generation = generation.wrapping_add(1);
+        }
         let generation = self.drivers[driver.0].generation;
         if self.nets[target.net.0].driver_values[target.slot].eq_case(&value) {
             return;
@@ -263,6 +282,71 @@ impl Kernel {
                 generation,
             },
         );
+    }
+
+    /// Schedule per-bit inertial updates using rise, fall, and turn-off delays.
+    pub fn schedule_drive_transitions(
+        &mut self,
+        driver: DriverId,
+        value: LogicVec,
+        delays: DriveDelay,
+    ) {
+        let target = self.drivers[driver.0];
+        let width = self.nets[target.net.0].value.width();
+        let value = value.resize(width, false);
+        let previous = self.driver_requests[driver.0].clone();
+        if previous.eq_case(&value) {
+            return;
+        }
+        let current = self.nets[target.net.0].driver_values[target.slot].clone();
+        let mut immediate = current.clone();
+        let mut has_immediate = false;
+        let mut delayed: Vec<(u64, Vec<BitDrive>)> = Vec::new();
+        self.driver_requests[driver.0] = value.clone();
+        self.drivers[driver.0].generation = self.drivers[driver.0].generation.wrapping_add(1);
+
+        for bit in 0..width {
+            let requested = value.get_bit(bit);
+            if previous.get_bit(bit) == requested {
+                continue;
+            }
+            let generation = &mut self.driver_bit_generations[driver.0][bit as usize];
+            *generation = generation.wrapping_add(1);
+            if current.get_bit(bit) == requested {
+                continue;
+            }
+            let delay_fs = delays.for_transition(current.get_bit(bit), requested);
+            if delay_fs == 0 {
+                immediate.set_bit(bit, requested);
+                has_immediate = true;
+                continue;
+            }
+            let update = BitDrive {
+                bit,
+                value: requested,
+                generation: *generation,
+            };
+            if let Some((_, updates)) = delayed
+                .iter_mut()
+                .find(|(existing, _)| *existing == delay_fs)
+            {
+                updates.push(update);
+            } else {
+                delayed.push((delay_fs, vec![update]));
+            }
+        }
+
+        if has_immediate {
+            self.apply_drive(driver, immediate);
+        }
+        for (delay_fs, updates) in delayed {
+            let time = self.time.saturating_add_fs(delay_fs);
+            self.push_timed_action(
+                time,
+                Region::Active,
+                TimedAction::DriveBits { driver, updates },
+            );
+        }
     }
 
     fn apply_drive(&mut self, driver: DriverId, value: LogicVec) {
@@ -538,22 +622,41 @@ impl Kernel {
                         self.apply_drive(driver, value);
                     }
                 }
+                TimedAction::DriveBits { driver, updates } => {
+                    let target = self.drivers[driver.0];
+                    let mut value = self.nets[target.net.0].driver_values[target.slot].clone();
+                    let mut changed = false;
+                    for update in updates {
+                        if self.driver_bit_generations[driver.0][update.bit as usize]
+                            == update.generation
+                        {
+                            value.set_bit(update.bit, update.value);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.apply_drive(driver, value);
+                    }
+                }
             }
         }
     }
 
     fn discard_stale_timed_actions(&mut self) {
         loop {
-            let stale = self.timed.peek().is_some_and(|Reverse(event)| {
-                matches!(
-                    &event.action,
+            let stale = self
+                .timed
+                .peek()
+                .is_some_and(|Reverse(event)| match &event.action {
                     TimedAction::Drive {
-                        driver,
-                        generation,
-                        ..
-                    } if self.drivers[driver.0].generation != *generation
-                )
-            });
+                        driver, generation, ..
+                    } => self.drivers[driver.0].generation != *generation,
+                    TimedAction::DriveBits { driver, updates } => updates.iter().all(|update| {
+                        self.driver_bit_generations[driver.0][update.bit as usize]
+                            != update.generation
+                    }),
+                    TimedAction::Resume(_) => false,
+                });
             if !stale {
                 break;
             }

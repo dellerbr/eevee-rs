@@ -282,6 +282,54 @@ fn delayed_continuous_assignment_rejects_short_pulses() {
 }
 
 #[test]
+fn transition_specific_continuous_assignment_delays_apply_per_bit() {
+    let src = "module top #(parameter int RISE = 2);\n\
+      logic [2:0] source = 3'b110;\n\
+      logic off_source = 0;\n\
+      wire [2:0] result;\n\
+      wire two_delay;\n\
+      assign #(RISE, RISE + 2, RISE + 4) result = source;\n\
+      assign #(3, 5) two_delay = off_source;\n\
+      initial begin\n\
+        #10 source = 3'bz01;\n\
+        off_source = 1;\n\
+        #10 off_source = 1'bz;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let result = sim.kernel().find_net("result").expect("result net");
+    let two_delay = sim.kernel().find_net("two_delay").expect("two-delay net");
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::Z);
+    assert_eq!(sim.kernel().net_value(result).get_bit(1), Bit::One);
+    assert_eq!(sim.kernel().net_value(result).get_bit(2), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(5_000_000)));
+    assert_eq!(sim.kernel().net_value(result).to_u64(), 6);
+    assert_eq!(sim.kernel().net_value(two_delay).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(12_000_000)));
+    assert_eq!(sim.kernel().net_value(result).to_u64(), 7);
+
+    sim.run_until(Some(SimTime::from_fs(14_000_000)));
+    assert_eq!(sim.kernel().net_value(result).to_u64(), 5);
+
+    sim.run_until(Some(SimTime::from_fs(16_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(result).get_bit(1), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(result).get_bit(2), Bit::Z);
+
+    sim.run_until(Some(SimTime::from_fs(22_000_000)));
+    assert_eq!(sim.kernel().net_value(two_delay).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(23_000_000)));
+    assert_eq!(sim.kernel().net_value(two_delay).get_bit(0), Bit::Z);
+}
+
+#[test]
 fn conformance_mode_rejects_invalid_continuous_drivers() {
     let cases = [
         (
@@ -319,6 +367,18 @@ fn conformance_mode_rejects_invalid_continuous_drivers() {
         (
             "module top; logic source; wire result; assign #source result = source; endmodule",
             "delay in module 'top' is not a constant parameter expression",
+        ),
+        (
+          "module top; logic source; wire result; assign #(1, source) result = source; endmodule",
+          "delay in module 'top' is not a constant parameter expression",
+        ),
+        (
+          "module top; logic source; wire result; assign #(1, -2) result = source; endmodule",
+          "delay is negative",
+        ),
+        (
+          "module top; logic source; wire result; assign #(1, 2, 1'bz) result = source; endmodule",
+          "delay contains X or Z",
         ),
     ];
     for (source, expected) in cases {

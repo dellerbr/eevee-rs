@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 160 tests.
+- `cargo test --workspace` passes all 164 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -72,7 +72,8 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   unknown/duplicate/excess overrides, and unresolved/nonconstant parameter
   expressions.
 - Default-strong whole-net continuous assignments over the supported internal
-  net types execute as reactive IR processes with zero or one inertial delay.
+  net types execute as reactive IR processes with optional one-, two-, or
+  three-value inertial delays.
   Scheduler-owned driver slots resolve Z, X, and conflicting 0/1 values; child
   output wire nets alias and drive parent nets.
 - Continuous assignments now derive a deduplicated RHS `NetId` read set and
@@ -81,11 +82,13 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
 - Generic `Wait::Cond`/`Wait::Sensitivity` registration now uses process wait
   generations and reverse net tracking, preventing duplicate wakeups and
   removing stale quiet-sibling waiters after the first source fires.
-- Continuous assignments accept one known nonnegative timescale-relative delay
-  expression. The typed time wheel schedules inertial driver actions with
-  per-driver generations: newer values cancel older pending events, identical
-  requests retain their deadline, and canceled events are pruned before time
-  advancement. `#0` applies immediately.
+- Continuous assignments accept one common delay, rise/fall delays, or
+  rise/fall/turn-off delays as known nonnegative timescale-relative parameter
+  expressions. Two-value turn-off uses `min(rise, fall)`. The typed time wheel
+  selects delays and tracks inertial generations per bit, so mixed vector
+  transitions complete independently, changed requests cancel only their bit,
+  identical requests retain their deadlines, and fully canceled events are
+  pruned before time advancement. Zero-delay bits apply immediately.
 - Internal `tri` nets now share ordinary wire resolution;
   `wand`/`triand` and `wor`/`trior` use strengthless wired-AND and wired-OR
   resolution. Strict tests cover Z/X behavior and dominating 0/1 values.
@@ -104,9 +107,9 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   `supply0`/`supply1` remains available as a supported internal net type.
 - Strict mode rejects net declaration assignments, procedural or signed net
   drives, implicit width conversion, resolved net ports, explicit/asymmetric
-  strengths, assignment delay tuples, explicit-unit delay literals,
-  negative/X/Z/nonconstant delays, dynamic/out-of-range RHS selects, partial
-  targets, unknown RHS names, and unsupported RHS calls.
+  strengths, explicit-unit delay literals, negative/X/Z/nonconstant delay
+  operands, dynamic/out-of-range RHS selects, partial targets, unknown RHS
+  names, and unsupported RHS calls.
 
 The module connectivity model currently aliases a scheduler net. Full port
 directionality, complete net/variable port semantics, and width-converting or
@@ -114,10 +117,10 @@ expression connections are not claimed.
 
 ## Next Priorities
 
-1. Extend continuous drivers with rise/fall/turn-off and net declaration delays,
-   explicit/asymmetric strengths, resolved net ports, and driver release. Then
-   extend module parameters into parameter-dependent packed widths and complete
-   value typing/coercion.
+1. Extend continuous drivers with net declaration delays, explicit/asymmetric
+  strengths, resolved net ports, and driver release. Then extend module
+  parameters into parameter-dependent packed widths and complete value
+  typing/coercion.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime

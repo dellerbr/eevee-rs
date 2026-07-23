@@ -78,6 +78,21 @@ pub enum PortDir {
     Ref,
 }
 
+/// Delay values attached to a continuous assignment.
+#[derive(Debug, Clone)]
+pub enum ContinuousDelay {
+    Single(Expr),
+    RiseFall {
+        rise: Expr,
+        fall: Expr,
+    },
+    RiseFallTurnOff {
+        rise: Expr,
+        fall: Expr,
+        turn_off: Expr,
+    },
+}
+
 /// An item inside a module body.
 #[derive(Debug, Clone)]
 pub enum ModuleItem {
@@ -87,7 +102,7 @@ pub enum ModuleItem {
     ContinuousAssign {
         lhs: Lvalue,
         rhs: Expr,
-        delay: Option<Expr>,
+        delay: Option<ContinuousDelay>,
     },
     Always(AlwaysBlock),
     Initial(Stmt),

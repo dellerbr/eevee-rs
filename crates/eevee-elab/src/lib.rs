@@ -28,7 +28,9 @@ use eevee_ir::{
     ArgMode, ClassDef, CollOp, DpiRegistry, ExecBackend, Inst, Label, Linkage, Program,
     ProgramBuilder, Reg, Value,
 };
-use eevee_sched::{DriveStrength, DriverId, EdgeKind, ForkJoin, NetId, NetResolution, Sim};
+use eevee_sched::{
+    DriveDelay, DriveStrength, DriverId, EdgeKind, ForkJoin, NetId, NetResolution, Sim,
+};
 
 /// Statistics from a global elaboration pass (how much UVM we ingested).
 #[derive(Debug, Default, Clone)]
@@ -1398,19 +1400,44 @@ fn elaborate_module_instance(
                     panic!("continuous assignment target '{}' is unknown", lhs.name)
                 });
                 let driver = sim.kernel().new_driver(net);
-                let delay_fs = delay.as_ref().map(|delay| {
-                    let value = try_const_eval_with(delay, &consts).unwrap_or_else(|| {
-                        panic!("continuous assignment delay is not a constant expression")
-                    });
-                    assert!(
-                        value.is_known(),
-                        "continuous assignment delay contains X or Z"
-                    );
-                    assert!(
-                        value.to_i64() >= 0,
-                        "continuous assignment delay is negative"
-                    );
-                    ts.delay_to_fs(value.to_u64() as f64)
+                let delay = delay.as_ref().map(|delay| {
+                    let evaluate = |expression: &Expr| {
+                        let value = try_const_eval_with(expression, &consts).unwrap_or_else(|| {
+                            panic!("continuous assignment delay is not a constant expression")
+                        });
+                        assert!(
+                            value.is_known(),
+                            "continuous assignment delay contains X or Z"
+                        );
+                        assert!(
+                            value.to_i64() >= 0,
+                            "continuous assignment delay is negative"
+                        );
+                        ts.delay_to_fs(value.to_u64() as f64)
+                    };
+                    match delay {
+                        ContinuousDelay::Single(delay) => {
+                            CompiledContinuousDelay::Single(evaluate(delay))
+                        }
+                        ContinuousDelay::RiseFall { rise, fall } => {
+                            let rise_fs = evaluate(rise);
+                            let fall_fs = evaluate(fall);
+                            CompiledContinuousDelay::Transitions(DriveDelay {
+                                rise_fs,
+                                fall_fs,
+                                turn_off_fs: rise_fs.min(fall_fs),
+                            })
+                        }
+                        ContinuousDelay::RiseFallTurnOff {
+                            rise,
+                            fall,
+                            turn_off,
+                        } => CompiledContinuousDelay::Transitions(DriveDelay {
+                            rise_fs: evaluate(rise),
+                            fall_fs: evaluate(fall),
+                            turn_off_fs: evaluate(turn_off),
+                        }),
+                    }
                 });
                 let prog = CodeGen::new(
                     &scope,
@@ -1421,7 +1448,7 @@ fn elaborate_module_instance(
                     &gv,
                     ts,
                 )
-                .gen_continuous(rhs, driver, delay_fs);
+                .gen_continuous(rhs, driver, delay);
                 sim.add_process(backend.instantiate(Rc::new(prog), g.linkage.clone()));
             }
             ModuleItem::Var(_)
@@ -1634,6 +1661,12 @@ fn default_value(fld: &VarDecl, consts: &HashMap<String, LogicVec>) -> Value {
 
 /// Compiles AST to IR. Resolves names to module nets, process-local registers,
 /// or (inside a method) class fields.
+#[derive(Clone, Copy)]
+enum CompiledContinuousDelay {
+    Single(u64),
+    Transitions(DriveDelay),
+}
+
 struct CodeGen<'a> {
     nets: &'a HashMap<String, (NetId, u32)>,
     funcs: &'a HashMap<String, u32>,
@@ -1726,19 +1759,31 @@ impl<'a> CodeGen<'a> {
 
     /// A continuous assignment is an implicit process that drives once at
     /// time zero, then re-evaluates after signal/runtime activity.
-    fn gen_continuous(&mut self, rhs: &Expr, driver: DriverId, delay_fs: Option<u64>) -> Program {
+    fn gen_continuous(
+        &mut self,
+        rhs: &Expr,
+        driver: DriverId,
+        delay: Option<CompiledContinuousDelay>,
+    ) -> Program {
         let mut pb = ProgramBuilder::new("continuous assign");
         let mut read_set = Vec::new();
         self.collect_net_reads(rhs, &mut read_set);
         let evaluate = pb.new_label();
         pb.bind(evaluate);
         let value = self.gen_expr(rhs, &mut pb);
-        match delay_fs {
-            Some(delay_fs) => pb.emit(Inst::ScheduleDrive {
+        match delay {
+            Some(CompiledContinuousDelay::Single(delay_fs)) => pb.emit(Inst::ScheduleDrive {
                 driver,
                 src: value,
                 delay_fs,
             }),
+            Some(CompiledContinuousDelay::Transitions(delays)) => {
+                pb.emit(Inst::ScheduleDriveTransitions {
+                    driver,
+                    src: value,
+                    delays,
+                })
+            }
             None => pb.emit(Inst::DriveNet { driver, src: value }),
         }
         if read_set.is_empty() {

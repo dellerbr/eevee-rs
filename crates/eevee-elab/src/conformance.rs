@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use eevee_ast::{
-    BinOp, ClassDecl, Expr, FuncDecl, Item, Lvalue, Module, ModuleItem, PortDir, SourceFile, Stmt,
-    TimingControl, UnaryOp, VarDecl,
+    BinOp, ClassDecl, ContinuousDelay, Expr, FuncDecl, Item, Lvalue, Module, ModuleItem, PortDir,
+    SourceFile, Stmt, TimingControl, UnaryOp, VarDecl,
 };
 
 use crate::ElabError;
@@ -174,13 +174,15 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
             ));
         }
         if let Some(delay) = delay {
-            if !is_parameter_constant_expr(delay, &module_parameters) {
-                return unsupported(format!(
-                    "continuous assignment delay in module '{}' is not a constant parameter expression",
-                    module.name
-                ));
+            for expression in continuous_delay_expressions(delay) {
+                if !is_parameter_constant_expr(expression, &module_parameters) {
+                    return unsupported(format!(
+                        "continuous assignment delay in module '{}' is not a constant parameter expression",
+                        module.name
+                    ));
+                }
+                validate_expr(expression)?;
             }
-            validate_expr(delay)?;
         }
     }
     Ok(())
@@ -586,7 +588,9 @@ fn validate_items(
                 validate_lvalue(lhs)?;
                 validate_expr(rhs)?;
                 if let Some(delay) = delay {
-                    validate_expr(delay)?;
+                    for expression in continuous_delay_expressions(delay) {
+                        validate_expr(expression)?;
+                    }
                 }
             }
             ModuleItem::Always(always) => validate_stmt(&always.body, module_parameters)?,
@@ -599,6 +603,19 @@ fn validate_items(
         }
     }
     Ok(())
+}
+
+fn continuous_delay_expressions(delay: &ContinuousDelay) -> impl Iterator<Item = &Expr> {
+    let expressions = match delay {
+        ContinuousDelay::Single(delay) => [Some(delay), None, None],
+        ContinuousDelay::RiseFall { rise, fall } => [Some(rise), Some(fall), None],
+        ContinuousDelay::RiseFallTurnOff {
+            rise,
+            fall,
+            turn_off,
+        } => [Some(rise), Some(fall), Some(turn_off)],
+    };
+    expressions.into_iter().flatten()
 }
 
 fn validate_static_var(

@@ -102,7 +102,7 @@ fn lower_continuous_assignments(n: &Value, out: &mut Vec<ModuleItem>) {
     let Some(assignments) = find(n, "kAssignmentList") else {
         return;
     };
-    let delay = find(n, "kDelay").map(lower_delay_expr);
+    let delay = find(n, "kDelay").map(lower_continuous_delay);
     for assignment in kids(assignments) {
         if tag(assignment) == "kNetVariableAssignment" {
             out.push(ModuleItem::ContinuousAssign {
@@ -1596,6 +1596,40 @@ fn lower_delay_expr(n: &Value) -> Expr {
                 .unwrap_or_else(|| lower_expr(value))
         })
         .unwrap_or_else(|| Expr::Literal(LogicVec::zero(32)))
+}
+
+fn lower_continuous_delay(n: &Value) -> ContinuousDelay {
+    if find(n, "kDelayValue").is_some() {
+        return ContinuousDelay::Single(lower_delay_expr(n));
+    }
+    let expressions: Vec<_> = find(n, "kParenGroup")
+        .and_then(|group| {
+            kids(group).find(|child| matches!(tag(child), "kExpression" | "kUntagged"))
+        })
+        .map(|body| {
+            if tag(body) == "kExpression" {
+                vec![lower_expr(body)]
+            } else {
+                kids(body)
+                    .filter(|child| tag(child) == "kExpression")
+                    .map(lower_expr)
+                    .collect()
+            }
+        })
+        .unwrap_or_default();
+    match expressions.as_slice() {
+        [delay] => ContinuousDelay::Single(delay.clone()),
+        [rise, fall] => ContinuousDelay::RiseFall {
+            rise: rise.clone(),
+            fall: fall.clone(),
+        },
+        [rise, fall, turn_off] => ContinuousDelay::RiseFallTurnOff {
+            rise: rise.clone(),
+            fall: fall.clone(),
+            turn_off: turn_off.clone(),
+        },
+        _ => panic!("validated continuous assignment delay must contain one to three values"),
+    }
 }
 
 fn lower_event_expr(n: &Value) -> EventExpr {

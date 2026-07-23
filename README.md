@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 23, 2026:
 
-- 160 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 164 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -76,16 +76,18 @@ Validated on July 23, 2026:
   Per-instance values drive constant initializers, `initial`/`always`
   expressions, and delays.
 - Default-strong whole-net continuous assignments over the supported internal
-  net types execute as reactive processes with zero or one inertial delay.
+  net types execute as reactive processes with optional one-, two-, or
+  three-value inertial delays.
   Scheduler-owned drivers resolve Z, X, and conflicting unsigned values across
   hierarchy.
 - Continuous assignments park on deduplicated RHS net read sets, so unrelated
   writes do not wake them. Generic multi-net waits invalidate and remove sibling
   registrations after the first source fires.
-- A single known nonnegative timescale-relative continuous assignment delay is
-  supported with inertial replacement: short pulses are rejected, identical
-  requests do not postpone pending updates, and canceled events do not advance
-  simulation time.
+- Known nonnegative timescale-relative continuous assignment delays support
+  one common value, rise/fall values, or rise/fall/turn-off values. Transition
+  selection is per bit, two-value turn-off uses `min(rise, fall)`, short pulses
+  are rejected independently per bit, identical requests retain their pending
+  deadlines, and fully canceled events do not advance simulation time.
 - Internal `tri` nets use ordinary wire resolution; `tri0`/`tri1` add an
   implicit pull-strength driver, and `supply0`/`supply1` add an implicit
   supply-strength driver. Ordinary nets resolve symmetric
@@ -134,8 +136,9 @@ The current implementation includes:
   processes; and symmetric strength-aware ordinary-net resolution.
 - Precise continuous-assignment sensitivity and generation-safe multi-net wait
   registration/cleanup.
-- Single-value inertial continuous assignment delays with per-instance
-  parameter expressions and zero-delay immediate application.
+- One-, two-, and three-value inertial continuous assignment delays with
+  per-instance parameter expressions, per-bit transition selection, and
+  zero-delay immediate application.
 - Fail-closed `parse_source_conformant` and `elaborate_conformant` APIs. The
   legacy APIs remain permissive for coverage exploration.
 - UVM-oriented report formatting primitives including enum names, string
@@ -247,9 +250,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-     transition-specific/net delays, explicit/asymmetric drive strengths,
-     resolved net ports, hierarchical references, and generate
-     `if`/`case`/`for`.
+     net declaration delays, explicit/asymmetric drive strengths, resolved net
+     ports, hierarchical references, and generate `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -310,12 +312,12 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 - Continuous assignment support is limited to internal unsigned `wire`/`tri`,
   `tri0`/`tri1`, `supply0`/`supply1`, `wand`/`triand`, and `wor`/`trior` nets;
   whole-net LHS targets; exact-width represented unsigned signal/literal RHS
-  expressions; default-strong drivers; and zero or one timescale-relative
-  inertial delay. Only symmetric ordinary-net strengths and implicit pull/supply
-  drivers are modeled. Resolved net ports, net declaration assignments/delays,
-  procedural net writes, implicit width conversion, signed operands/targets,
-  explicit/asymmetric drive strengths, charge strengths, nondefault wired-net
-  strengths, rise/fall/turn-off delay tuples, explicit-unit delay literals,
+  expressions; default-strong drivers; and optional one-, two-, or three-value
+  timescale-relative inertial delays. Only symmetric ordinary-net strengths and
+  implicit pull/supply drivers are modeled. Resolved net ports, net declaration
+  assignments/delays, procedural net writes, implicit width conversion, signed
+  operands/targets, explicit/asymmetric drive strengths, charge strengths,
+  nondefault wired-net strengths, explicit-unit delay literals,
   dynamic/out-of-range RHS selects, partial/hierarchical targets, and driver
   release remain unsupported in conformance mode.
 - Module parameter support is limited to explicit or inherited bare 32-bit
