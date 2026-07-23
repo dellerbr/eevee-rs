@@ -387,6 +387,10 @@ fn lower_net_kind(dtype: &Value) -> Option<NetKind> {
         "wire" | "tri" => Some(NetKind::Wire),
         "wand" | "triand" => Some(NetKind::Wand),
         "wor" | "trior" => Some(NetKind::Wor),
+        "tri0" => Some(NetKind::Tri0),
+        "tri1" => Some(NetKind::Tri1),
+        "supply0" => Some(NetKind::Supply0),
+        "supply1" => Some(NetKind::Supply1),
         _ => None,
     })
 }

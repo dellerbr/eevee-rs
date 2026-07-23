@@ -18,6 +18,15 @@ pub enum NetResolution {
     Wor,
 }
 
+/// Symmetric strength applied to both 0 and 1 values of one driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DriveStrength {
+    Weak,
+    Pull,
+    Strong,
+    Supply,
+}
+
 /// A process parked on a net, with the edge it is waiting for.
 pub(crate) struct Waiter {
     pub proc: ProcId,
@@ -30,6 +39,7 @@ pub struct Net {
     pub(crate) value: LogicVec,
     pub(crate) resolution: NetResolution,
     pub(crate) driver_values: Vec<LogicVec>,
+    pub(crate) driver_strengths: Vec<DriveStrength>,
     pub(crate) waiters: Vec<Waiter>,
     pub(crate) name: String,
 }
@@ -44,6 +54,7 @@ impl Net {
             value,
             resolution,
             driver_values: Vec::new(),
+            driver_strengths: Vec::new(),
             waiters: Vec::new(),
             name: name.into(),
         }

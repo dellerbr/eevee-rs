@@ -7,8 +7,9 @@ use crate::lower::lower_expr;
 
 pub(crate) fn validate(tree: &Value, tokens: &[Value], source: &str) -> Result<(), FeError> {
     if let Some(strength) = tokens.iter().find(|token| {
+        let token_tag = tag(token);
         matches!(
-            tag(token),
+            token_tag,
             "supply0"
                 | "supply1"
                 | "strong0"
@@ -22,7 +23,8 @@ pub(crate) fn validate(tree: &Value, tokens: &[Value], source: &str) -> Result<(
                 | "large"
                 | "medium"
                 | "small"
-        )
+        ) && !(matches!(token_tag, "supply0" | "supply1")
+            && is_internal_supply_net_token(tree, token))
     }) {
         return unsupported(strength, source);
     }
@@ -101,7 +103,16 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
             };
             if !matches!(
                 tag(net_type),
-                "wire" | "tri" | "wand" | "triand" | "wor" | "trior"
+                "wire"
+                    | "tri"
+                    | "wand"
+                    | "triand"
+                    | "wor"
+                    | "trior"
+                    | "tri0"
+                    | "tri1"
+                    | "supply0"
+                    | "supply1"
             ) {
                 return unsupported(net_type, source);
             }
@@ -286,6 +297,23 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
         validate_node(child, source)?;
     }
     Ok(())
+}
+
+fn is_internal_supply_net_token(tree: &Value, token: &Value) -> bool {
+    let Some(start) = token.get("start").and_then(Value::as_u64) else {
+        return false;
+    };
+    if tag(tree) == "kNetDeclaration" {
+        if let Some(net_type) = find(tree, "kDataType").and_then(|data_type| kids(data_type).next())
+        {
+            if tag(net_type) == tag(token)
+                && net_type.get("start").and_then(Value::as_u64) == Some(start)
+            {
+                return true;
+            }
+        }
+    }
+    kids(tree).any(|child| is_internal_supply_net_token(child, token))
 }
 
 fn supported_statement(tag: &str) -> bool {

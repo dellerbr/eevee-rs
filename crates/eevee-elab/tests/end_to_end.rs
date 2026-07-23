@@ -2,7 +2,7 @@
 //! → IR → run on the event-driven kernel. This is the P2 milestone: a real
 //! `.sv` design (not hand-built IR) producing correct behavior.
 
-use eevee_core::{Bit, SimTime};
+use eevee_core::{Bit, LogicVec, SimTime};
 use eevee_elab::{elaborate, elaborate_conformant, ElabError};
 use eevee_fe::{parse_source, parse_source_conformant};
 use eevee_ir::Interp;
@@ -157,6 +157,54 @@ fn wired_and_or_net_types_resolve_continuous_drivers() {
     sim.run_until(Some(SimTime::from_fs(3_000_000)));
     assert_eq!(sim.kernel().net_value(all).get_bit(0), Bit::Zero);
     assert_eq!(sim.kernel().net_value(any).get_bit(0), Bit::X);
+}
+
+#[test]
+fn implicit_pull_and_supply_net_drivers_resolve_by_strength() {
+    let src = "module top;\n\
+      logic low = 1'bz;\n\
+      logic high = 1'bz;\n\
+      tri0 pulled_low;\n\
+      tri1 pulled_high;\n\
+      tri0 [3:0] pulled_bus;\n\
+      supply0 supply_low;\n\
+      supply1 supply_high;\n\
+      assign pulled_low = high;\n\
+      assign pulled_high = low;\n\
+      assign supply_low = high;\n\
+      assign supply_high = low;\n\
+      initial begin\n\
+        #1 low = 0;\n\
+        high = 1;\n\
+        #1 low = 1'bz;\n\
+        high = 1'bz;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let pulled_low = sim.kernel().find_net("pulled_low").expect("tri0 net");
+    let pulled_high = sim.kernel().find_net("pulled_high").expect("tri1 net");
+    let pulled_bus = sim.kernel().find_net("pulled_bus").expect("tri0 bus");
+    let supply_low = sim.kernel().find_net("supply_low").expect("supply0 net");
+    let supply_high = sim.kernel().find_net("supply_high").expect("supply1 net");
+
+    sim.run_until(Some(SimTime::ZERO));
+    assert_eq!(sim.kernel().net_value(pulled_low).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(pulled_high).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(pulled_bus), &LogicVec::zero(4));
+    assert_eq!(sim.kernel().net_value(supply_low).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(supply_high).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    assert_eq!(sim.kernel().net_value(pulled_low).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(pulled_high).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(supply_low).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(supply_high).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    assert_eq!(sim.kernel().net_value(pulled_low).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(pulled_high).get_bit(0), Bit::One);
 }
 
 #[test]

@@ -268,6 +268,10 @@ fn parses_resolved_net_types() {
       triand triand_net;\n\
       wor wor_net;\n\
       trior trior_net;\n\
+    tri0 tri0_net;\n\
+    tri1 tri1_net;\n\
+    supply0 supply0_net;\n\
+    supply1 supply1_net;\n\
     endmodule\n";
     let file = parse_source(src).expect("verible parse");
     let nets: Vec<_> = module(&file)
@@ -287,21 +291,19 @@ fn parses_resolved_net_types() {
             ("triand_net", NetKind::Wand),
             ("wor_net", NetKind::Wor),
             ("trior_net", NetKind::Wor),
+            ("tri0_net", NetKind::Tri0),
+            ("tri1_net", NetKind::Tri1),
+            ("supply0_net", NetKind::Supply0),
+            ("supply1_net", NetKind::Supply1),
         ]
     );
 }
 
 #[test]
-fn conformance_mode_accepts_resolved_and_rejects_pull_nets() {
-    let supported = "module top; tri t; wand wa; triand ta; wor wo; trior to; endmodule";
-    parse_source_conformant(supported).expect("resolved net types are supported");
-
-    let unsupported = "module top; tri0 pulled; endmodule";
-    let error = parse_source_conformant(unsupported).expect_err("implicit pull net unsupported");
-    assert!(matches!(
-        error,
-        FeError::UnsupportedSyntax { ref construct, .. } if construct == "tri0"
-    ));
+fn conformance_mode_accepts_resolved_and_implicit_strength_nets() {
+    let supported = "module top; tri t; wand wa; triand ta; wor wo; trior to;\n\
+                     tri0 t0; tri1 t1; supply0 s0; supply1 s1; endmodule";
+    parse_source_conformant(supported).expect("resolved and implicit-strength nets supported");
 
     let resolved_port = "module top(output tri value); endmodule";
     let error =
@@ -317,6 +319,15 @@ fn conformance_mode_accepts_resolved_and_rejects_pull_nets() {
     assert!(matches!(
         error,
         FeError::UnsupportedSyntax { ref construct, .. } if construct == "strong1"
+    ));
+
+    let supply_strength = "module top; logic source; wire result;\n\
+                           assign (supply1, supply0) result = source; endmodule";
+    let error = parse_source_conformant(supply_strength)
+        .expect_err("supply drive strengths remain unsupported");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "supply1"
     ));
 }
 

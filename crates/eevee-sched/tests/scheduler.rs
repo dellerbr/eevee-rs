@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use eevee_core::{Bit, LogicVec, SimTime};
-use eevee_sched::{EdgeKind, Kernel, NetId, NetResolution, Process, Sim, Wait};
+use eevee_sched::{DriveStrength, EdgeKind, Kernel, NetId, NetResolution, Process, Sim, Wait};
 
 fn lv(v: u64, w: u32) -> LogicVec {
     LogicVec::from_u64(v, w)
@@ -64,6 +64,50 @@ fn wired_net_types_apply_and_or_resolution() {
     assert_eq!(sim.kernel().net_value(wor).get_bit(0), Bit::X);
     sim.kernel().drive_net(wor_left, lv(1, 1));
     assert_eq!(sim.kernel().net_value(wor).get_bit(0), Bit::One);
+}
+
+#[test]
+fn wire_resolution_honors_symmetric_driver_strengths() {
+    let mut sim = Sim::with_default_timescale();
+    let net = sim.kernel().new_net("strength", LogicVec::z(1));
+    let pull_up = sim
+        .kernel()
+        .new_driver_with_strength(net, DriveStrength::Pull);
+    let strong_low = sim
+        .kernel()
+        .new_driver_with_strength(net, DriveStrength::Strong);
+    let weak_low = sim
+        .kernel()
+        .new_driver_with_strength(net, DriveStrength::Weak);
+    let supply_up = sim
+        .kernel()
+        .new_driver_with_strength(net, DriveStrength::Supply);
+    let supply_low = sim
+        .kernel()
+        .new_driver_with_strength(net, DriveStrength::Supply);
+
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Z);
+
+    sim.kernel().drive_net(weak_low, lv(0, 1));
+    sim.kernel().drive_net(pull_up, lv(1, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+
+    sim.kernel().drive_net(strong_low, lv(0, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Zero);
+
+    sim.kernel().drive_net(strong_low, LogicVec::x(1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::X);
+
+    sim.kernel().drive_net(supply_up, lv(1, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+
+    sim.kernel().drive_net(supply_low, lv(0, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::X);
+
+    sim.kernel().drive_net(supply_low, LogicVec::z(1));
+    sim.kernel().drive_net(supply_up, LogicVec::z(1));
+    sim.kernel().drive_net(strong_low, LogicVec::z(1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
 }
 
 struct InertialPulseDriver {

@@ -28,7 +28,7 @@ use eevee_ir::{
     ArgMode, ClassDef, CollOp, DpiRegistry, ExecBackend, Inst, Label, Linkage, Program,
     ProgramBuilder, Reg, Value,
 };
-use eevee_sched::{DriverId, EdgeKind, ForkJoin, NetId, NetResolution, Sim};
+use eevee_sched::{DriveStrength, DriverId, EdgeKind, ForkJoin, NetId, NetResolution, Sim};
 
 /// Statistics from a global elaboration pass (how much UVM we ingested).
 #[derive(Debug, Default, Clone)]
@@ -1301,7 +1301,11 @@ fn elaborate_module_instance(
     for item in &m.items {
         if let ModuleItem::Net(net) = item {
             let resolution = match net.kind {
-                NetKind::Wire => NetResolution::Wire,
+                NetKind::Wire
+                | NetKind::Tri0
+                | NetKind::Tri1
+                | NetKind::Supply0
+                | NetKind::Supply1 => NetResolution::Wire,
                 NetKind::Wand => NetResolution::Wand,
                 NetKind::Wor => NetResolution::Wor,
             };
@@ -1312,6 +1316,17 @@ fn elaborate_module_instance(
             );
             scope.insert(net.name.clone(), (id, net.width));
             drivable.insert(net.name.clone());
+            let implicit = match net.kind {
+                NetKind::Tri0 => Some((LogicVec::zero(net.width), DriveStrength::Pull)),
+                NetKind::Tri1 => Some((LogicVec::ones(net.width), DriveStrength::Pull)),
+                NetKind::Supply0 => Some((LogicVec::zero(net.width), DriveStrength::Supply)),
+                NetKind::Supply1 => Some((LogicVec::ones(net.width), DriveStrength::Supply)),
+                NetKind::Wire | NetKind::Wand | NetKind::Wor => None,
+            };
+            if let Some((value, strength)) = implicit {
+                let driver = sim.kernel().new_driver_with_strength(id, strength);
+                sim.kernel().drive_net(driver, value);
+            }
         }
     }
     for it in &m.items {

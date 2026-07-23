@@ -19,5 +19,5 @@ pub mod net;
 pub mod process;
 
 pub use kernel::{Kernel, Sim, Stats};
-pub use net::{Net, NetResolution};
+pub use net::{DriveStrength, Net, NetResolution};
 pub use process::{DriverId, EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};

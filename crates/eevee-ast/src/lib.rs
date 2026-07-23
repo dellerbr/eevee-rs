@@ -128,6 +128,14 @@ pub enum NetKind {
     Wand,
     /// `wor` or `trior`: wired-OR resolution.
     Wor,
+    /// `tri0`: ordinary resolution with an implicit pull-strength 0 driver.
+    Tri0,
+    /// `tri1`: ordinary resolution with an implicit pull-strength 1 driver.
+    Tri1,
+    /// `supply0`: ordinary resolution with an implicit supply-strength 0 driver.
+    Supply0,
+    /// `supply1`: ordinary resolution with an implicit supply-strength 1 driver.
+    Supply1,
 }
 
 /// One instance in a module-instantiation declaration.

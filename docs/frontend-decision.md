@@ -85,8 +85,11 @@ slang's elaborated, typed AST is genuinely attractive — it could subsume much 
   `kInstantiationType`) must be treated as one "type subtree" set.
 - Verible parses continuous drive-strength syntax but omits its tokens from the
   exported CST. Conformance parsing therefore requests `--printtokens` together
-  with `--printtree` and rejects unsupported strength keywords from their token
-  locations before CST lowering. Permissive parsing remains tree-only.
+  with `--printtree` and rejects unsupported explicit strength keywords from
+  their token locations before CST lowering. Declaration-position
+  `supply0`/`supply1` tokens are recognized as supported internal net types;
+  the same tokens in explicit strength syntax are rejected. Permissive parsing
+  remains tree-only.
 
 ## Revisit criteria
 

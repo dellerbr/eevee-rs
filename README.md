@@ -38,9 +38,9 @@ interpreter, or scheduler.
 
 ## Current Status
 
-Validated on July 21, 2026:
+Validated on July 23, 2026:
 
-- 158 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 160 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -75,8 +75,8 @@ Validated on July 21, 2026:
   declaration-order defaults plus named and positional instance overrides.
   Per-instance values drive constant initializers, `initial`/`always`
   expressions, and delays.
-- Strengthless whole-net continuous assignments over the supported internal net
-  types execute as reactive processes with zero or one inertial delay.
+- Default-strong whole-net continuous assignments over the supported internal
+  net types execute as reactive processes with zero or one inertial delay.
   Scheduler-owned drivers resolve Z, X, and conflicting unsigned values across
   hierarchy.
 - Continuous assignments park on deduplicated RHS net read sets, so unrelated
@@ -86,10 +86,13 @@ Validated on July 21, 2026:
   supported with inertial replacement: short pulses are rejected, identical
   requests do not postpone pending updates, and canceled events do not advance
   simulation time.
-- Internal `tri` nets use ordinary wire resolution; `wand`/`triand` and
-  `wor`/`trior` apply strengthless wired-AND and wired-OR resolution,
-  respectively. Strict parsing rejects explicit strengths from Verible's token
-  stream because this Verible CST omits those syntax nodes.
+- Internal `tri` nets use ordinary wire resolution; `tri0`/`tri1` add an
+  implicit pull-strength driver, and `supply0`/`supply1` add an implicit
+  supply-strength driver. Ordinary nets resolve symmetric
+  `Weak < Pull < Strong < Supply` strengths per bit. `wand`/`triand` and
+  `wor`/`trior` retain strengthless wired-AND and wired-OR resolution. Strict
+  parsing rejects explicit strength syntax from Verible's token stream because
+  this Verible CST omits those syntax nodes.
 
 ## Implemented Language Surface
 
@@ -126,8 +129,9 @@ The current implementation includes:
   instances, and named/positional whole-signal port binding.
 - Explicit/inherited bare `int` module parameter defaults and named/positional
   value overrides with per-instance constant scopes.
-- Plain `wire`/`tri` nets, `wand`/`triand`, `wor`/`trior`, reactive continuous
-  assignment processes, and strengthless four-state multiple-driver resolution.
+- Plain `wire`/`tri`, implicit `tri0`/`tri1` and `supply0`/`supply1`,
+  `wand`/`triand`, and `wor`/`trior` nets; reactive continuous assignment
+  processes; and symmetric strength-aware ordinary-net resolution.
 - Precise continuous-assignment sensitivity and generation-safe multi-net wait
   registration/cleanup.
 - Single-value inertial continuous assignment delays with per-instance
@@ -243,9 +247,9 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-  transition-specific/net delays, strength-aware and implicit-pull drivers,
-  resolved net ports, hierarchical references, and generate
-  `if`/`case`/`for`.
+     transition-specific/net delays, explicit/asymmetric drive strengths,
+     resolved net ports, hierarchical references, and generate
+     `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -304,11 +308,13 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   complete directionality, net/variable distinctions, width conversion,
   expression actuals, hierarchy references, and generate remain unsupported.
 - Continuous assignment support is limited to internal unsigned `wire`/`tri`,
-  `wand`/`triand`, and `wor`/`trior` nets; whole-net LHS targets; exact-width
-  represented unsigned signal/literal RHS expressions; and strengthless drivers
-  with zero or one timescale-relative inertial delay. Resolved net ports,
-  `tri0`/`tri1`, supply nets, net declaration assignments/delays, procedural net
-  writes, implicit width conversion, signed operands/targets, drive/charge
+  `tri0`/`tri1`, `supply0`/`supply1`, `wand`/`triand`, and `wor`/`trior` nets;
+  whole-net LHS targets; exact-width represented unsigned signal/literal RHS
+  expressions; default-strong drivers; and zero or one timescale-relative
+  inertial delay. Only symmetric ordinary-net strengths and implicit pull/supply
+  drivers are modeled. Resolved net ports, net declaration assignments/delays,
+  procedural net writes, implicit width conversion, signed operands/targets,
+  explicit/asymmetric drive strengths, charge strengths, nondefault wired-net
   strengths, rise/fall/turn-off delay tuples, explicit-unit delay literals,
   dynamic/out-of-range RHS selects, partial/hierarchical targets, and driver
   release remain unsupported in conformance mode.

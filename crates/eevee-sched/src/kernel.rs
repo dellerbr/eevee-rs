@@ -22,7 +22,7 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use eevee_core::{Bit, LogicVec, Region, SimTime, Timescale};
 
-use crate::net::{detect_edge, Net, NetResolution, Waiter};
+use crate::net::{detect_edge, DriveStrength, Net, NetResolution, Waiter};
 use crate::process::{DriverId, EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};
 
 #[derive(Clone, Copy)]
@@ -201,9 +201,19 @@ impl Kernel {
 
     /// Register a continuous driver on `net`. Until first driven its value is Z.
     pub fn new_driver(&mut self, net: NetId) -> DriverId {
+        self.new_driver_with_strength(net, DriveStrength::Strong)
+    }
+
+    /// Register a continuous driver with one symmetric 0/1 strength.
+    pub fn new_driver_with_strength(&mut self, net: NetId, strength: DriveStrength) -> DriverId {
+        assert!(
+            self.nets[net.0].resolution == NetResolution::Wire || strength == DriveStrength::Strong,
+            "wired-AND/OR drivers currently require default strong strength"
+        );
         let width = self.nets[net.0].value.width();
         let slot = self.nets[net.0].driver_values.len();
         self.nets[net.0].driver_values.push(LogicVec::z(width));
+        self.nets[net.0].driver_strengths.push(strength);
         let id = DriverId(self.drivers.len());
         self.drivers.push(DriverTarget {
             net,
@@ -260,7 +270,12 @@ impl Kernel {
         let width = self.nets[target.net.0].value.width();
         self.nets[target.net.0].driver_values[target.slot] = value.resize(width, false);
         let resolution = self.nets[target.net.0].resolution;
-        let resolved = resolve_drivers(&self.nets[target.net.0].driver_values, width, resolution);
+        let resolved = resolve_drivers(
+            &self.nets[target.net.0].driver_values,
+            &self.nets[target.net.0].driver_strengths,
+            width,
+            resolution,
+        );
         self.write_net(target.net, resolved);
     }
 
@@ -547,11 +562,16 @@ impl Kernel {
     }
 }
 
-fn resolve_drivers(drivers: &[LogicVec], width: u32, resolution: NetResolution) -> LogicVec {
+fn resolve_drivers(
+    drivers: &[LogicVec],
+    strengths: &[DriveStrength],
+    width: u32,
+    resolution: NetResolution,
+) -> LogicVec {
     let mut resolved = LogicVec::z(width);
     for bit in 0..width {
         let value = match resolution {
-            NetResolution::Wire => resolve_wire_bit(drivers, bit),
+            NetResolution::Wire => resolve_wire_bit(drivers, strengths, bit),
             NetResolution::Wand => resolve_wand_bit(drivers, bit),
             NetResolution::Wor => resolve_wor_bit(drivers, bit),
         };
@@ -560,16 +580,28 @@ fn resolve_drivers(drivers: &[LogicVec], width: u32, resolution: NetResolution) 
     resolved
 }
 
-fn resolve_wire_bit(drivers: &[LogicVec], bit: u32) -> Bit {
-    drivers
-        .iter()
-        .fold(Bit::Z, |value, driver| match (value, driver.get_bit(bit)) {
-            (current, Bit::Z) => current,
-            (Bit::Z, driven) => driven,
-            (Bit::X, _) | (_, Bit::X) => Bit::X,
-            (Bit::Zero, Bit::One) | (Bit::One, Bit::Zero) => Bit::X,
-            (current, _) => current,
-        })
+fn resolve_wire_bit(drivers: &[LogicVec], strengths: &[DriveStrength], bit: u32) -> Bit {
+    let mut zero: Option<DriveStrength> = None;
+    let mut one: Option<DriveStrength> = None;
+    for (driver, &strength) in drivers.iter().zip(strengths) {
+        match driver.get_bit(bit) {
+            Bit::Zero => zero = Some(zero.map_or(strength, |old| old.max(strength))),
+            Bit::One => one = Some(one.map_or(strength, |old| old.max(strength))),
+            Bit::X => {
+                zero = Some(zero.map_or(strength, |old| old.max(strength)));
+                one = Some(one.map_or(strength, |old| old.max(strength)));
+            }
+            Bit::Z => {}
+        }
+    }
+    match (zero, one) {
+        (None, None) => Bit::Z,
+        (Some(_), None) => Bit::Zero,
+        (None, Some(_)) => Bit::One,
+        (Some(zero), Some(one)) if zero > one => Bit::Zero,
+        (Some(zero), Some(one)) if one > zero => Bit::One,
+        _ => Bit::X,
+    }
 }
 
 fn resolve_wand_bit(drivers: &[LogicVec], bit: u32) -> Bit {
