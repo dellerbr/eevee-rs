@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use eevee_ast::{
-    BinOp, ClassDecl, ContinuousDelay, Expr, FuncDecl, Item, Lvalue, Module, ModuleItem, PortDir,
-    SourceFile, Stmt, TimingControl, UnaryOp, VarDecl,
+    BinOp, ClassDecl, ContinuousDelay, Expr, FuncDecl, Item, Lvalue, Module, ModuleItem, NetKind,
+    PortDir, SourceFile, Stmt, TimingControl, UnaryOp, VarDecl,
 };
 
 use crate::ElabError;
@@ -101,14 +101,27 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
                         instance.name, port.name, actual, actual_width, port.width
                     ));
                 }
-                if port.is_net
-                    && matches!(port.dir, PortDir::Output | PortDir::Inout)
-                    && !module_signal_is_net(module, actual)
-                {
-                    return unsupported(format!(
-                        "net port '{}.{}' must connect to a parent net",
-                        instance.name, port.name
-                    ));
+                if let Some(port_kind) = port.net_kind {
+                    let actual_kind = module_signal_net_kind(module, actual);
+                    if matches!(port.dir, PortDir::Output | PortDir::Inout) {
+                        let Some(actual_kind) = actual_kind else {
+                            return unsupported(format!(
+                                "net port '{}.{}' must connect to a parent net",
+                                instance.name, port.name
+                            ));
+                        };
+                        if actual_kind != port_kind {
+                            return unsupported(format!(
+                                "port resolution mismatch for '{}.{}': port is {:?}, actual '{}' is {:?}",
+                                instance.name, port.name, port_kind, actual, actual_kind
+                            ));
+                        }
+                    } else if port_kind != NetKind::Wire && actual_kind != Some(port_kind) {
+                        return unsupported(format!(
+                            "resolved input port '{}.{}' requires a matching parent net",
+                            instance.name, port.name
+                        ));
+                    }
                 }
             }
         }
@@ -162,7 +175,7 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
             _ => None,
         })
         .chain(module.ports.iter().filter_map(|port| {
-            (port.is_net && matches!(port.dir, PortDir::Output | PortDir::Inout))
+            (port.net_kind.is_some() && matches!(port.dir, PortDir::Output | PortDir::Inout))
                 .then_some(port.name.as_str())
         }))
         .collect();
@@ -193,13 +206,10 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
             ));
         }
         if strength.is_some()
-            && module.items.iter().any(|item| {
-                matches!(
-                    item,
-                    ModuleItem::Net(net)
-                        if net.name == lhs.name && matches!(net.kind, eevee_ast::NetKind::Wand | eevee_ast::NetKind::Wor)
-                )
-            })
+            && matches!(
+                module_signal_net_kind(module, &lhs.name),
+                Some(NetKind::Wand | NetKind::Wor)
+            )
         {
             return unsupported(format!(
                 "explicit drive strengths on wired net '{}.{}' are unsupported",
@@ -363,7 +373,7 @@ fn validate_procedural_net_writes(module: &Module) -> Result<(), ElabError> {
             module
                 .ports
                 .iter()
-                .filter(|port| port.is_net)
+                .filter(|port| port.net_kind.is_some())
                 .map(|port| port.name.as_str()),
         )
         .collect();
@@ -518,15 +528,18 @@ fn module_signal_width(module: &Module, name: &str) -> Option<u32> {
         })
 }
 
-fn module_signal_is_net(module: &Module, name: &str) -> bool {
+fn module_signal_net_kind(module: &Module, name: &str) -> Option<NetKind> {
     module
         .ports
         .iter()
-        .any(|port| port.name == name && port.is_net)
-        || module
-            .items
-            .iter()
-            .any(|item| matches!(item, ModuleItem::Net(net) if net.name == name))
+        .find(|port| port.name == name)
+        .and_then(|port| port.net_kind)
+        .or_else(|| {
+            module.items.iter().find_map(|item| match item {
+                ModuleItem::Net(net) if net.name == name => Some(net.kind),
+                _ => None,
+            })
+        })
 }
 
 fn module_signal_signed(module: &Module, name: &str) -> bool {

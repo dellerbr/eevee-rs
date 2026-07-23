@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 174 tests.
+- `cargo test --workspace` passes all 176 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -60,6 +60,11 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
 - ANSI scalar/packed module ports and recursively scoped child instances
   support named and positional whole-signal connections. A strict end-to-end
   test validates delayed propagation through both forms.
+- ANSI resolved net ports retain canonical built-in resolution kinds.
+  Matching `wire`/`tri`, `wand`/`triand`, `wor`/`trior`, or identical implicit
+  pull/supply kinds collapse onto the parent `NetId`; tests cross two sibling
+  instances and a grandchild. Unbound root ports install one implicit driver.
+  Resolution mismatches and non-net output/inout actuals fail preflight.
 - Constant initialization evaluates every unary/binary operator represented by
   the current AST instead of returning an operand for unsupported cases.
 - Explicit/inherited bare 32-bit `int` module value parameters now support
@@ -120,20 +125,21 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   path. Charge strengths remain rejected; declaration-position
   `supply0`/`supply1` remains a supported internal net type.
 - Strict mode rejects net declaration assignments, procedural or signed net
-  drives, implicit width conversion, resolved net ports, explicit strengths on
-  wired-AND/OR nets, charge strengths, explicit-unit delay literals,
+  drives, implicit width conversion, mismatched resolved port kinds, explicit
+  strengths on wired-AND/OR nets, charge strengths, explicit-unit delay literals,
   negative/X/Z/nonconstant delay operands, dynamic/out-of-range RHS selects,
   partial targets, unknown RHS names, and unsupported RHS calls.
 
-The module connectivity model currently aliases a scheduler net. Full port
-directionality, complete net/variable port semantics, and width-converting or
-expression connections are not claimed.
+The module connectivity model collapses matching resolved port kinds onto one
+scheduler net. Full port directionality, cross-resolution bridges, complete
+net/variable port semantics, and width-converting or expression connections are
+not claimed.
 
 ## Next Priorities
 
-1. Extend continuous connectivity with resolved net ports and driver release.
-  Then extend module parameters into parameter-dependent packed widths and
-  complete value typing/coercion.
+1. Extend continuous connectivity with driver release and cross-resolution port
+  bridges. Then extend module parameters into parameter-dependent packed widths
+  and complete value typing/coercion.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime

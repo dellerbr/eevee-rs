@@ -377,7 +377,7 @@ fn lower_module_ports(n: &Value) -> Vec<Port> {
                 dir,
                 width: dtype.map(packed_width).unwrap_or(1),
                 signed: find_deep(declaration, "signed").is_some(),
-                is_net: kids(declaration).any(|child| tag(child) == "wire"),
+                net_kind: kids(declaration).find_map(lower_net_kind_token),
             }
         })
         .collect()
@@ -411,7 +411,11 @@ fn lower_net_decl(n: &Value) -> Vec<NetDecl> {
 }
 
 fn lower_net_kind(dtype: &Value) -> Option<NetKind> {
-    kids(dtype).find_map(|child| match tag(child) {
+    kids(dtype).find_map(lower_net_kind_token)
+}
+
+fn lower_net_kind_token(token: &Value) -> Option<NetKind> {
+    match tag(token) {
         "wire" | "tri" => Some(NetKind::Wire),
         "wand" | "triand" => Some(NetKind::Wand),
         "wor" | "trior" => Some(NetKind::Wor),
@@ -420,7 +424,7 @@ fn lower_net_kind(dtype: &Value) -> Option<NetKind> {
         "supply0" => Some(NetKind::Supply0),
         "supply1" => Some(NetKind::Supply1),
         _ => None,
-    })
+    }
 }
 
 fn lower_package(n: &Value, strengths: &HashMap<u64, DriveStrengthSpec>) -> Package {

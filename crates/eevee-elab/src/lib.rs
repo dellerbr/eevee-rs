@@ -1287,31 +1287,32 @@ fn elaborate_module_instance(
     let mut drivable = HashSet::new();
     for port in &m.ports {
         if let Some(&(net, _)) = port_bindings.get(&port.name) {
+            // A collapsed port reuses the parent net, including any implicit
+            // pull/supply driver installed when that net was created.
             scope.insert(port.name.clone(), (net, port.width));
         } else {
-            let initial = if port.is_net {
-                LogicVec::z(port.width)
-            } else {
-                LogicVec::zero(port.width)
+            let net = match port.net_kind {
+                Some(kind) => {
+                    let net = sim.kernel().new_net_with_resolution(
+                        scoped_name(path, &port.name),
+                        LogicVec::z(port.width),
+                        scheduler_resolution(kind),
+                    );
+                    add_implicit_net_driver(sim, net, kind, port.width);
+                    net
+                }
+                None => sim
+                    .kernel()
+                    .new_net(scoped_name(path, &port.name), LogicVec::zero(port.width)),
             };
-            let net = sim.kernel().new_net(scoped_name(path, &port.name), initial);
             scope.insert(port.name.clone(), (net, port.width));
         }
-        if port.is_net && matches!(port.dir, PortDir::Output | PortDir::Inout) {
+        if port.net_kind.is_some() && matches!(port.dir, PortDir::Output | PortDir::Inout) {
             drivable.insert(port.name.clone());
         }
     }
     for item in &m.items {
         if let ModuleItem::Net(net) = item {
-            let resolution = match net.kind {
-                NetKind::Wire
-                | NetKind::Tri0
-                | NetKind::Tri1
-                | NetKind::Supply0
-                | NetKind::Supply1 => NetResolution::Wire,
-                NetKind::Wand => NetResolution::Wand,
-                NetKind::Wor => NetResolution::Wor,
-            };
             let delay = net
                 .delay
                 .as_ref()
@@ -1319,22 +1320,12 @@ fn elaborate_module_instance(
             let id = sim.kernel().new_net_with_resolution_and_delay(
                 scoped_name(path, &net.name),
                 LogicVec::z(net.width),
-                resolution,
+                scheduler_resolution(net.kind),
                 delay,
             );
             scope.insert(net.name.clone(), (id, net.width));
             drivable.insert(net.name.clone());
-            let implicit = match net.kind {
-                NetKind::Tri0 => Some((LogicVec::zero(net.width), DriveStrength::Pull)),
-                NetKind::Tri1 => Some((LogicVec::ones(net.width), DriveStrength::Pull)),
-                NetKind::Supply0 => Some((LogicVec::zero(net.width), DriveStrength::Supply)),
-                NetKind::Supply1 => Some((LogicVec::ones(net.width), DriveStrength::Supply)),
-                NetKind::Wire | NetKind::Wand | NetKind::Wor => None,
-            };
-            if let Some((value, strength)) = implicit {
-                let driver = sim.kernel().new_driver_with_strength(id, strength);
-                sim.kernel().drive_net(driver, value);
-            }
+            add_implicit_net_driver(sim, id, net.kind, net.width);
         }
     }
     for it in &m.items {
@@ -1467,6 +1458,30 @@ fn elaborate_module_instance(
             sim,
             backend,
         );
+    }
+}
+
+fn scheduler_resolution(kind: NetKind) -> NetResolution {
+    match kind {
+        NetKind::Wire | NetKind::Tri0 | NetKind::Tri1 | NetKind::Supply0 | NetKind::Supply1 => {
+            NetResolution::Wire
+        }
+        NetKind::Wand => NetResolution::Wand,
+        NetKind::Wor => NetResolution::Wor,
+    }
+}
+
+fn add_implicit_net_driver(sim: &mut Sim, net: NetId, kind: NetKind, width: u32) {
+    let implicit = match kind {
+        NetKind::Tri0 => Some((LogicVec::zero(width), DriveStrength::Pull)),
+        NetKind::Tri1 => Some((LogicVec::ones(width), DriveStrength::Pull)),
+        NetKind::Supply0 => Some((LogicVec::zero(width), DriveStrength::Supply)),
+        NetKind::Supply1 => Some((LogicVec::ones(width), DriveStrength::Supply)),
+        NetKind::Wire | NetKind::Wand | NetKind::Wor => None,
+    };
+    if let Some((value, strength)) = implicit {
+        let driver = sim.kernel().new_driver_with_strength(net, strength);
+        sim.kernel().drive_net(driver, value);
     }
 }
 

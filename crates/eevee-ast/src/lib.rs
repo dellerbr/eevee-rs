@@ -66,7 +66,7 @@ pub struct Port {
     pub dir: PortDir,
     pub width: u32,
     pub signed: bool,
-    pub is_net: bool,
+    pub net_kind: Option<NetKind>,
 }
 
 /// Port direction.

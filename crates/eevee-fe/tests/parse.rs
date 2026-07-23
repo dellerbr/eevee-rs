@@ -307,13 +307,17 @@ fn conformance_mode_accepts_resolved_nets_and_explicit_drive_strengths() {
                      tri0 t0; tri1 t1; supply0 s0; supply1 s1; endmodule";
     parse_source_conformant(supported).expect("resolved and implicit-strength nets supported");
 
-    let resolved_port = "module top(output tri value); endmodule";
-    let error =
-        parse_source_conformant(resolved_port).expect_err("resolved net ports are unsupported");
-    assert!(matches!(
-        error,
-        FeError::UnsupportedSyntax { ref construct, .. } if construct == "tri"
-    ));
+    let resolved_ports = "module top(input wand all, output triand result,\n\
+                          inout wor shared, output tri0 pulled,\n\
+                          output supply1 power); endmodule";
+    let resolved_ports =
+        parse_source_conformant(resolved_ports).expect("resolved net ports are supported");
+    let resolved = module(&resolved_ports);
+    assert_eq!(resolved.ports[0].net_kind, Some(NetKind::Wand));
+    assert_eq!(resolved.ports[1].net_kind, Some(NetKind::Wand));
+    assert_eq!(resolved.ports[2].net_kind, Some(NetKind::Wor));
+    assert_eq!(resolved.ports[3].net_kind, Some(NetKind::Tri0));
+    assert_eq!(resolved.ports[4].net_kind, Some(NetKind::Supply1));
 
     let strength_source = "module top; logic source; wire a, b, c, d, e;\n\
             assign (strong1, pull0) a = source, e = source;\n\

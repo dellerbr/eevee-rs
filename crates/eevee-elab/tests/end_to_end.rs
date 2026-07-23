@@ -78,6 +78,120 @@ fn child_instances_propagate_named_and_positional_ports() {
 }
 
 #[test]
+fn resolved_net_ports_collapse_with_matching_parent_nets() {
+    let src = "module leaf(input triand sensed, output wire seen);\n\
+      assign seen = sensed;\n\
+    endmodule\n\
+    module child(input wand sensed, output triand all,\n\
+                inout wor any, output tri0 pulled,\n\
+                output tri ordinary, output wire seen);\n\
+      assign all = 1'b1;\n\
+      assign all = 1'b0;\n\
+      assign any = 1'b0;\n\
+      assign pulled = 1'bz;\n\
+      assign ordinary = 1'b1;\n\
+      leaf observer(.sensed(sensed), .seen(seen));\n\
+    endmodule\n\
+    module top(output tri1 root_pull, inout tri0 root_inout);\n\
+      logic left = 1;\n\
+      logic right = 0;\n\
+      wand sensed;\n\
+      wand all;\n\
+      wor any;\n\
+      tri0 pulled;\n\
+      wire ordinary;\n\
+      wire seen;\n\
+      wire seen_second;\n\
+      assign sensed = left;\n\
+      assign sensed = right;\n\
+      assign any = 1'b1;\n\
+      assign root_pull = 1'bz;\n\
+      assign root_inout = 1'bz;\n\
+      child dut(.sensed(sensed), .all(all), .any(any),\n\
+          .pulled(pulled), .ordinary(ordinary), .seen(seen));\n\
+      child dut_second(.sensed(sensed), .all(all), .any(any),\n\
+          .pulled(pulled), .ordinary(ordinary), .seen(seen_second));\n\
+      initial #1 right = 1;\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let all = sim.kernel().find_net("all").expect("wand output");
+    let any = sim.kernel().find_net("any").expect("wor inout");
+    let pulled = sim.kernel().find_net("pulled").expect("tri0 output");
+    let ordinary = sim.kernel().find_net("ordinary").expect("tri/wire output");
+    let seen = sim.kernel().find_net("seen").expect("wand input observer");
+    let seen_second = sim
+        .kernel()
+        .find_net("seen_second")
+        .expect("second resolved input observer");
+    let root_pull = sim
+        .kernel()
+        .find_net("root_pull")
+        .expect("unbound root tri1 port");
+    let root_inout = sim
+        .kernel()
+        .find_net("root_inout")
+        .expect("unbound root tri0 inout port");
+
+    sim.run_until(Some(SimTime::ZERO));
+    assert_eq!(sim.kernel().net_value(all).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(any).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(pulled).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(ordinary).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(seen).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(seen_second).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(root_pull).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(root_inout).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    assert_eq!(sim.kernel().net_value(seen).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(seen_second).get_bit(0), Bit::One);
+}
+
+#[test]
+fn conformance_mode_rejects_resolved_port_mismatches() {
+    let cases = [
+        (
+            "module child(output wand value); assign value = 1'b1; endmodule\n\
+         module top; wire value; child dut(.value(value)); endmodule",
+            "port resolution mismatch",
+        ),
+        (
+            "module child(input wor value); endmodule\n\
+         module top; logic value; child dut(.value(value)); endmodule",
+            "requires a matching parent net",
+        ),
+        (
+            "module top(output wand value);\n\
+           assign (strong1, pull0) value = 1'b1; endmodule",
+            "explicit drive strengths on wired net",
+        ),
+        (
+            "module child(output tri0 value); assign value = 1'bz; endmodule\n\
+         module top; wire value; child dut(.value(value)); endmodule",
+            "port resolution mismatch",
+        ),
+        (
+            "module child(output wand value); assign value = 1'b1; endmodule\n\
+         module top; wor value; child dut(.value(value)); endmodule",
+            "port resolution mismatch",
+        ),
+    ];
+    for (source, expected) in cases {
+        let file = parse_source_conformant(source).expect("resolved port syntax parses");
+        let error = match elaborate_conformant(&file, &Interp) {
+            Ok(_) => panic!("incompatible resolved port must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+          error,
+          ElabError::UnsupportedSemantic { ref message } if message.contains(expected)
+        ));
+    }
+}
+
+#[test]
 fn continuous_assignments_propagate_and_resolve_drivers() {
     let src = "module child(input logic [7:0] source, output wire [7:0] result);\n\
       assign result = source + 8'd1;\n\

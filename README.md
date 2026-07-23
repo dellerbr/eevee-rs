@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 23, 2026:
 
-- 174 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 176 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -71,6 +71,10 @@ Validated on July 23, 2026:
 - ANSI packed/scalar ports and recursive child module instances elaborate with
   named or positional whole-signal connectivity. A strict end-to-end test
   validates delayed parent-to-child-to-parent propagation through both forms.
+- ANSI resolved net ports preserve `wire`/`tri`, `wand`/`triand`,
+  `wor`/`trior`, `tri0`/`tri1`, and `supply0`/`supply1` kinds. Ports collapse
+  onto parent nets with the same canonical resolution across nested and
+  repeated instances; incompatible resolution fails before allocation.
 - Explicit/inherited bare 32-bit `int` module value parameters support
   declaration-order defaults plus named and positional instance overrides.
   Per-instance values drive constant initializers, `initial`/`always`
@@ -134,7 +138,8 @@ The current implementation includes:
 - Imported DPI-C callables with injectable, per-simulation host bindings and
   `input`/`output`/`inout` value transfer.
 - ANSI module port metadata, root-module discovery, recursively scoped child
-  instances, and named/positional whole-signal port binding.
+  instances, named/positional whole-signal binding, and matching-resolution
+  collapsed net ports with implicit root pull/supply drivers.
 - Explicit/inherited bare `int` module parameter defaults and named/positional
   value overrides with per-instance constant scopes.
 - Plain `wire`/`tri`, implicit `tri0`/`tri1` and `supply0`/`supply1`,
@@ -260,8 +265,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-     resolved net ports, driver release, hierarchical references, and generate
-     `if`/`case`/`for`.
+     driver release, cross-resolution port bridges, hierarchical references,
+     and generate `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -316,18 +321,18 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 - This is not yet a complete IEEE 1800 implementation or a production/signoff
   simulator.
 - The current hierarchy slice supports ANSI packed/scalar ports and simple
-  whole-signal named/positional connections. Ports alias a scheduler net;
-  complete directionality, net/variable distinctions, width conversion,
-  expression actuals, hierarchy references, and generate remain unsupported.
+  whole-signal named/positional connections. Matching canonical resolved net
+  kinds collapse onto one scheduler net. Complete directionality, net/variable
+  distinctions, cross-resolution port bridges, width conversion, expression
+  actuals, hierarchy references, and generate remain unsupported.
 - Continuous assignment support is limited to internal unsigned `wire`/`tri`,
   `tri0`/`tri1`, `supply0`/`supply1`, `wand`/`triand`, and `wor`/`trior` nets;
   whole-net LHS targets; exact-width represented unsigned signal/literal RHS
   expressions; default or explicit `highz`/`weak`/`pull`/`strong`/`supply`
   strengths on ordinary continuous drivers; and optional one-, two-, or
-  three-value timescale-relative inertial delays. Resolved net ports, net
-  declaration assignments, procedural net writes, implicit width conversion,
-  signed operands/targets, charge strengths, nondefault wired-net strengths,
-  explicit-unit delay literals,
+  three-value timescale-relative inertial delays. Net declaration assignments,
+  procedural net writes, implicit width conversion, signed operands/targets,
+  charge strengths, nondefault wired-net strengths, explicit-unit delay literals,
   dynamic/out-of-range RHS selects, partial/hierarchical targets, and driver
   release remain unsupported in conformance mode.
 - Module parameter support is limited to explicit or inherited bare 32-bit

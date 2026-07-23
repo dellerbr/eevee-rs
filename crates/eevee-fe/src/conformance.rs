@@ -37,7 +37,7 @@ pub(crate) fn validate(
             .and_then(Value::as_u64)
             .is_some_and(|start| consumed.contains(&start))
             && !(matches!(token_tag, "supply0" | "supply1")
-                && is_internal_supply_net_token(tree, token))
+                && is_supply_net_type_token(tree, token))
     }) {
         return unsupported(strength, source);
     }
@@ -237,24 +237,6 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                 }
             }
         }
-        "kPortDeclaration" => {
-            if let Some(net_type) = kids(node).find(|child| {
-                matches!(
-                    tag(child),
-                    "tri"
-                        | "wand"
-                        | "triand"
-                        | "wor"
-                        | "trior"
-                        | "tri0"
-                        | "tri1"
-                        | "supply0"
-                        | "supply1"
-                )
-            }) {
-                return unsupported(net_type, source);
-            }
-        }
         "kNetVariableAssignment" => {
             let Some(lhs) = find(node, "kLPValue") else {
                 return unsupported(node, source);
@@ -398,7 +380,9 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
     Ok(())
 }
 
-fn is_internal_supply_net_token(tree: &Value, token: &Value) -> bool {
+// `supply0/1` can be either a net type or a drive strength. Match the exact
+// CST leaf by source offset so only declaration-position tokens are exempted.
+fn is_supply_net_type_token(tree: &Value, token: &Value) -> bool {
     let Some(start) = token.get("start").and_then(Value::as_u64) else {
         return false;
     };
@@ -412,7 +396,17 @@ fn is_internal_supply_net_token(tree: &Value, token: &Value) -> bool {
             }
         }
     }
-    kids(tree).any(|child| is_internal_supply_net_token(child, token))
+    if tag(tree) == "kPortDeclaration" {
+        if let Some(net_type) = kids(tree).find(|child| matches!(tag(child), "supply0" | "supply1"))
+        {
+            if tag(net_type) == tag(token)
+                && net_type.get("start").and_then(Value::as_u64) == Some(start)
+            {
+                return true;
+            }
+        }
+    }
+    kids(tree).any(|child| is_supply_net_type_token(child, token))
 }
 
 fn supported_statement(tag: &str) -> bool {
