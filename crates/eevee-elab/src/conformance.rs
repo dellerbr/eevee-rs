@@ -38,6 +38,7 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
         }
         validate_module_scope(module)?;
         validate_module_parameters(module)?;
+        validate_net_declaration_delays(module)?;
         validate_continuous_assignments(module)?;
         validate_procedural_net_writes(module)?;
     }
@@ -117,6 +118,32 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
     let mut stack = Vec::new();
     for &name in modules.keys() {
         visit_module(name, &modules, &mut marks, &mut stack)?;
+    }
+    Ok(())
+}
+
+fn validate_net_declaration_delays(module: &Module) -> Result<(), ElabError> {
+    let module_parameters: HashSet<&str> = module
+        .parameters
+        .iter()
+        .map(|parameter| parameter.name.as_str())
+        .collect();
+    for net in module.items.iter().filter_map(|item| match item {
+        ModuleItem::Net(net) => Some(net),
+        _ => None,
+    }) {
+        let Some(delay) = &net.delay else {
+            continue;
+        };
+        for expression in continuous_delay_expressions(delay) {
+            if !is_parameter_constant_expr(expression, &module_parameters) {
+                return unsupported(format!(
+                    "net declaration delay for '{}.{}' is not a constant parameter expression",
+                    module.name, net.name
+                ));
+            }
+            validate_expr(expression)?;
+        }
     }
     Ok(())
 }
@@ -572,7 +599,13 @@ fn validate_items(
     for item in items {
         match item {
             ModuleItem::Var(var) => validate_static_var(var, module_parameters)?,
-            ModuleItem::Net(_) => {}
+            ModuleItem::Net(net) => {
+                if let Some(delay) = &net.delay {
+                    for expression in continuous_delay_expressions(delay) {
+                        validate_expr(expression)?;
+                    }
+                }
+            }
             ModuleItem::Instance(instance) => {
                 for connection in &instance.connections {
                     if !matches!(connection.expr, Expr::Ref(_)) {

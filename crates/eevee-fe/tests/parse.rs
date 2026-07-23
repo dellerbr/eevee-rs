@@ -567,6 +567,36 @@ fn conformance_mode_rejects_type_module_parameters() {
 }
 
 #[test]
+fn conformance_mode_accepts_net_declaration_delay_tuples() {
+    for source in [
+        "module top; wire #2 result; endmodule",
+        "module top; wire #(1, 2) result; endmodule",
+        "module top; wire #(1, 2, 3) result; endmodule",
+    ] {
+        parse_source_conformant(source).expect("net declaration delay is supported");
+    }
+
+    let file = parse_source_conformant("module top; wire #(1, 2, 3) result; endmodule")
+        .expect("three-value net declaration delay");
+    let net = module(&file)
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ModuleItem::Net(net) => Some(net),
+            _ => None,
+        })
+        .expect("delayed net declaration");
+    assert!(matches!(
+        net.delay,
+        Some(ContinuousDelay::RiseFallTurnOff {
+            rise: Expr::Literal(ref rise),
+            fall: Expr::Literal(ref fall),
+            turn_off: Expr::Literal(ref turn_off),
+        }) if rise.to_u64() == 1 && fall.to_u64() == 2 && turn_off.to_u64() == 3
+    ));
+}
+
+#[test]
 fn conformance_mode_rejects_unimplemented_parameter_types_and_widths() {
     let non_int = "module child #(parameter byte VALUE = 1) (); endmodule";
     let error =

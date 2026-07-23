@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 164 tests.
+- `cargo test --workspace` passes all 170 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -66,6 +66,11 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   ordered defaults and named/positional overrides. Parent-parameter
   expressions feed child overrides; per-instance constants drive net
   initialization, `initial`/`always` expressions, and delays.
+- The narrow sequential RTL core is source-to-runtime validated:
+  `always #delay`, `always_ff @(posedge clk)`, nonblocking updates, and NBA old-value
+  behavior execute correctly. This does not imply broad synthesizable-Verilog
+  compatibility; generate, complete typing/sizing, memories, and full port/net
+  semantics remain major gaps.
 - Strict parsing/elaboration reject type or non-`int` module parameters,
   header/body localparams, module-body parameters,
   nonliteral/parameter-dependent packed widths,
@@ -89,6 +94,11 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   transitions complete independently, changed requests cancel only their bit,
   identical requests retain their deadlines, and fully canceled events are
   pruned before time advancement. Zero-delay bits apply immediately.
+- Internal net declarations accept the same one-, two-, and three-value delay
+  forms as known nonnegative parameter expressions. A distinct post-resolution
+  net-delay stage tracks inertial generations per bit, so multi-driver
+  resolution occurs first; mixed zero/nonzero bits, invalid operands, and
+  assignment-plus-net delay composition have strict tests.
 - Internal `tri` nets now share ordinary wire resolution;
   `wand`/`triand` and `wor`/`trior` use strengthless wired-AND and wired-OR
   resolution. Strict tests cover Z/X behavior and dominating 0/1 values.
@@ -117,10 +127,9 @@ expression connections are not claimed.
 
 ## Next Priorities
 
-1. Extend continuous drivers with net declaration delays, explicit/asymmetric
-  strengths, resolved net ports, and driver release. Then extend module
-  parameters into parameter-dependent packed widths and complete value
-  typing/coercion.
+1. Extend continuous drivers with explicit/asymmetric strengths, resolved net
+  ports, and driver release. Then extend module parameters into
+  parameter-dependent packed widths and complete value typing/coercion.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime

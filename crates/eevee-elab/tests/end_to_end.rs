@@ -330,6 +330,94 @@ fn transition_specific_continuous_assignment_delays_apply_per_bit() {
 }
 
 #[test]
+fn net_declaration_delays_apply_to_resolved_values() {
+    let src = "module top #(parameter int RISE = 2);\n\
+      logic [2:0] source = 3'b110;\n\
+      wire [2:0] #(RISE, RISE + 2, RISE + 4) result;\n\
+      assign result = source;\n\
+      initial #10 source = 3'bz01;\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let result = sim.kernel().find_net("result").expect("delayed net");
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::Z);
+    assert_eq!(sim.kernel().net_value(result).get_bit(1), Bit::One);
+    assert_eq!(sim.kernel().net_value(result).get_bit(2), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(5_000_000)));
+    assert_eq!(sim.kernel().net_value(result).to_u64(), 6);
+
+    sim.run_until(Some(SimTime::from_fs(12_000_000)));
+    assert_eq!(sim.kernel().net_value(result).to_u64(), 7);
+
+    sim.run_until(Some(SimTime::from_fs(14_000_000)));
+    assert_eq!(sim.kernel().net_value(result).to_u64(), 5);
+
+    sim.run_until(Some(SimTime::from_fs(16_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(result).get_bit(1), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(result).get_bit(2), Bit::Z);
+}
+
+#[test]
+fn continuous_and_net_declaration_delays_compose() {
+    let src = "module top;\n\
+      logic source = 0;\n\
+      wire #3 result;\n\
+      assign #2 result = source;\n\
+      initial #10 source = 1;\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let result = sim.kernel().find_net("result").expect("delayed net");
+
+    sim.run_until(Some(SimTime::from_fs(4_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::Z);
+
+    sim.run_until(Some(SimTime::from_fs(5_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(14_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(15_000_000)));
+    assert_eq!(sim.kernel().net_value(result).get_bit(0), Bit::One);
+}
+
+#[test]
+fn conformance_mode_rejects_invalid_net_declaration_delays() {
+    let cases = [
+        (
+            "module top; logic source; wire #source result; endmodule",
+            "net declaration delay for 'top.result' is not a constant parameter expression",
+        ),
+        (
+            "module top; wire #(1, -2) result; endmodule",
+            "delay is negative",
+        ),
+        (
+            "module top; wire #(1, 2, 1'bx) result; endmodule",
+            "delay contains X or Z",
+        ),
+    ];
+    for (source, expected) in cases {
+        let file = parse_source_conformant(source).expect("net delay syntax parses");
+        let error = match elaborate_conformant(&file, &Interp) {
+            Ok(_) => panic!("invalid net declaration delay must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+          error,
+          ElabError::UnsupportedSemantic { ref message } if message.contains(expected)
+        ));
+    }
+}
+
+#[test]
 fn conformance_mode_rejects_invalid_continuous_drivers() {
     let cases = [
         (

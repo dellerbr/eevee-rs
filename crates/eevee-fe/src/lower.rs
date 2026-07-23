@@ -365,6 +365,7 @@ fn lower_net_decl(n: &Value) -> Vec<NetDecl> {
         .and_then(|dimensions| find(dimensions, "kDataType"));
     let width = dtype.map(packed_width).unwrap_or(1);
     let signed = find_deep(n, "signed").is_some();
+    let delay = find_deep(n, "kDelay").map(lower_continuous_delay);
     let Some(declarations) = find(n, "kNetVariableDeclarationAssign") else {
         return Vec::new();
     };
@@ -377,6 +378,7 @@ fn lower_net_decl(n: &Value) -> Vec<NetDecl> {
                 width,
                 signed,
                 kind,
+                delay: delay.clone(),
             })
         })
         .collect()

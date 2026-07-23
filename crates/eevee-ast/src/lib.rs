@@ -78,7 +78,7 @@ pub enum PortDir {
     Ref,
 }
 
-/// Delay values attached to a continuous assignment.
+/// Delay values attached to a continuous assignment or net declaration.
 #[derive(Debug, Clone)]
 pub enum ContinuousDelay {
     Single(Expr),
@@ -132,6 +132,7 @@ pub struct NetDecl {
     pub width: u32,
     pub signed: bool,
     pub kind: NetKind,
+    pub delay: Option<ContinuousDelay>,
 }
 
 /// Resolution function selected by a built-in net type.

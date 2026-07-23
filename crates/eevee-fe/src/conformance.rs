@@ -117,7 +117,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                 return unsupported(net_type, source);
             }
             if let Some(delay) = find_deep(node, "kDelay") {
-                return unsupported(delay, source);
+                validate_assignment_delay(delay, source)?;
             }
             if let Some(strength) = find_deep(node, "kDriveStrength") {
                 return unsupported(strength, source);

@@ -37,17 +37,35 @@ pub struct DriveDelay {
 
 impl DriveDelay {
     pub(crate) fn for_transition(self, from: Bit, to: Bit) -> u64 {
-        match to {
-            Bit::One => self.rise_fs,
-            Bit::Zero => self.fall_fs,
-            Bit::Z => self.turn_off_fs,
-            Bit::X => match from {
-                Bit::Zero => self.rise_fs.min(self.turn_off_fs),
-                Bit::One => self.fall_fs.min(self.turn_off_fs),
-                Bit::Z => self.rise_fs.min(self.fall_fs),
-                Bit::X => 0,
-            },
-        }
+        transition_delay(from, to, self.rise_fs, self.fall_fs, self.turn_off_fs)
+    }
+}
+
+/// Transition-specific propagation delays for a resolved net value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetDelay {
+    pub rise_fs: u64,
+    pub fall_fs: u64,
+    pub turn_off_fs: u64,
+}
+
+impl NetDelay {
+    pub(crate) fn for_transition(self, from: Bit, to: Bit) -> u64 {
+        transition_delay(from, to, self.rise_fs, self.fall_fs, self.turn_off_fs)
+    }
+}
+
+fn transition_delay(from: Bit, to: Bit, rise_fs: u64, fall_fs: u64, turn_off_fs: u64) -> u64 {
+    match to {
+        Bit::One => rise_fs,
+        Bit::Zero => fall_fs,
+        Bit::Z => turn_off_fs,
+        Bit::X => match from {
+            Bit::Zero => rise_fs.min(turn_off_fs),
+            Bit::One => fall_fs.min(turn_off_fs),
+            Bit::Z => rise_fs.min(fall_fs),
+            Bit::X => 0,
+        },
     }
 }
 
@@ -62,6 +80,9 @@ pub(crate) struct Waiter {
 pub struct Net {
     pub(crate) value: LogicVec,
     pub(crate) resolution: NetResolution,
+    pub(crate) delay: Option<NetDelay>,
+    pub(crate) delay_request: LogicVec,
+    pub(crate) delay_generations: Vec<u64>,
     pub(crate) driver_values: Vec<LogicVec>,
     pub(crate) driver_strengths: Vec<DriveStrength>,
     pub(crate) waiters: Vec<Waiter>,
@@ -73,10 +94,15 @@ impl Net {
         name: impl Into<String>,
         value: LogicVec,
         resolution: NetResolution,
+        delay: Option<NetDelay>,
     ) -> Net {
+        let width = value.width();
         Net {
+            delay_request: value.clone(),
             value,
             resolution,
+            delay,
+            delay_generations: vec![0; width as usize],
             driver_values: Vec::new(),
             driver_strengths: Vec::new(),
             waiters: Vec::new(),

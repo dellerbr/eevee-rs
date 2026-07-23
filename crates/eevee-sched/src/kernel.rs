@@ -22,7 +22,7 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use eevee_core::{Bit, LogicVec, Region, SimTime, Timescale};
 
-use crate::net::{detect_edge, DriveDelay, DriveStrength, Net, NetResolution, Waiter};
+use crate::net::{detect_edge, DriveDelay, DriveStrength, Net, NetDelay, NetResolution, Waiter};
 use crate::process::{DriverId, EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};
 
 #[derive(Clone, Copy)]
@@ -64,6 +64,10 @@ enum TimedAction {
     },
     DriveBits {
         driver: DriverId,
+        updates: Vec<BitDrive>,
+    },
+    NetBits {
+        net: NetId,
         updates: Vec<BitDrive>,
     },
 }
@@ -188,9 +192,20 @@ impl Kernel {
         initial: LogicVec,
         resolution: NetResolution,
     ) -> NetId {
+        self.new_net_with_resolution_and_delay(name, initial, resolution, None)
+    }
+
+    /// Create a resolved net with an optional rise/fall/turn-off propagation delay.
+    pub fn new_net_with_resolution_and_delay(
+        &mut self,
+        name: impl Into<String>,
+        initial: LogicVec,
+        resolution: NetResolution,
+        delay: Option<NetDelay>,
+    ) -> NetId {
         let id = NetId(self.nets.len());
         self.nets
-            .push(Net::with_resolution(name, initial, resolution));
+            .push(Net::with_resolution(name, initial, resolution, delay));
         id
     }
 
@@ -360,7 +375,64 @@ impl Kernel {
             width,
             resolution,
         );
-        self.write_net(target.net, resolved);
+        self.apply_resolved_net(target.net, resolved);
+    }
+
+    fn apply_resolved_net(&mut self, net: NetId, value: LogicVec) {
+        let Some(delays) = self.nets[net.0].delay else {
+            self.write_net(net, value);
+            return;
+        };
+        let width = self.nets[net.0].value.width();
+        let value = value.resize(width, false);
+        let previous = self.nets[net.0].delay_request.clone();
+        if previous.eq_case(&value) {
+            return;
+        }
+        let current = self.nets[net.0].value.clone();
+        let mut immediate = current.clone();
+        let mut has_immediate = false;
+        let mut delayed: Vec<(u64, Vec<BitDrive>)> = Vec::new();
+        self.nets[net.0].delay_request = value.clone();
+
+        for bit in 0..width {
+            let requested = value.get_bit(bit);
+            if previous.get_bit(bit) == requested {
+                continue;
+            }
+            let generation = &mut self.nets[net.0].delay_generations[bit as usize];
+            *generation = generation.wrapping_add(1);
+            if current.get_bit(bit) == requested {
+                continue;
+            }
+            let delay_fs = delays.for_transition(current.get_bit(bit), requested);
+            if delay_fs == 0 {
+                immediate.set_bit(bit, requested);
+                has_immediate = true;
+                continue;
+            }
+            let update = BitDrive {
+                bit,
+                value: requested,
+                generation: *generation,
+            };
+            if let Some((_, updates)) = delayed
+                .iter_mut()
+                .find(|(existing, _)| *existing == delay_fs)
+            {
+                updates.push(update);
+            } else {
+                delayed.push((delay_fs, vec![update]));
+            }
+        }
+
+        if has_immediate {
+            self.write_net(net, immediate);
+        }
+        for (delay_fs, updates) in delayed {
+            let time = self.time.saturating_add_fs(delay_fs);
+            self.push_timed_action(time, Region::Active, TimedAction::NetBits { net, updates });
+        }
     }
 
     // ---- Display / output ----------------------------------------------
@@ -638,6 +710,21 @@ impl Kernel {
                         self.apply_drive(driver, value);
                     }
                 }
+                TimedAction::NetBits { net, updates } => {
+                    let mut value = self.nets[net.0].value.clone();
+                    let mut changed = false;
+                    for update in updates {
+                        if self.nets[net.0].delay_generations[update.bit as usize]
+                            == update.generation
+                        {
+                            value.set_bit(update.bit, update.value);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.write_net(net, value);
+                    }
+                }
             }
         }
     }
@@ -654,6 +741,9 @@ impl Kernel {
                     TimedAction::DriveBits { driver, updates } => updates.iter().all(|update| {
                         self.driver_bit_generations[driver.0][update.bit as usize]
                             != update.generation
+                    }),
+                    TimedAction::NetBits { net, updates } => updates.iter().all(|update| {
+                        self.nets[net.0].delay_generations[update.bit as usize] != update.generation
                     }),
                     TimedAction::Resume(_) => false,
                 });

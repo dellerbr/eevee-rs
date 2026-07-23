@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 23, 2026:
 
-- 164 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 170 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -75,6 +75,10 @@ Validated on July 23, 2026:
   declaration-order defaults plus named and positional instance overrides.
   Per-instance values drive constant initializers, `initial`/`always`
   expressions, and delays.
+- A source-level synchronous counter validates `always #delay`,
+  `always_ff @(posedge clk)`, nonblocking assignment, and NBA settling. Focused
+  swap tests confirm simultaneous NBAs read old values. This is a usable narrow
+  sequential RTL core, not broad synthesizable-Verilog compatibility.
 - Default-strong whole-net continuous assignments over the supported internal
   net types execute as reactive processes with optional one-, two-, or
   three-value inertial delays.
@@ -88,6 +92,9 @@ Validated on July 23, 2026:
   selection is per bit, two-value turn-off uses `min(rise, fall)`, short pulses
   are rejected independently per bit, identical requests retain their pending
   deadlines, and fully canceled events do not advance simulation time.
+- Internal net declarations accept the same one-, two-, and three-value delay
+  forms. These delays apply per bit to the resolved net value after all driver
+  and strength resolution; driver and net delays compose as separate stages.
 - Internal `tri` nets use ordinary wire resolution; `tri0`/`tri1` add an
   implicit pull-strength driver, and `supply0`/`supply1` add an implicit
   supply-strength driver. Ordinary nets resolve symmetric
@@ -139,6 +146,9 @@ The current implementation includes:
 - One-, two-, and three-value inertial continuous assignment delays with
   per-instance parameter expressions, per-bit transition selection, and
   zero-delay immediate application.
+- One-, two-, and three-value internal net-declaration delays applied after
+  resolution, including mixed immediate/delayed bits and composition with
+  continuous-assignment delays.
 - Fail-closed `parse_source_conformant` and `elaborate_conformant` APIs. The
   legacy APIs remain permissive for coverage exploration.
 - UVM-oriented report formatting primitives including enum names, string
@@ -250,8 +260,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-     net declaration delays, explicit/asymmetric drive strengths, resolved net
-     ports, hierarchical references, and generate `if`/`case`/`for`.
+     explicit/asymmetric drive strengths, resolved net ports, hierarchical
+     references, and generate `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -315,7 +325,7 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   expressions; default-strong drivers; and optional one-, two-, or three-value
   timescale-relative inertial delays. Only symmetric ordinary-net strengths and
   implicit pull/supply drivers are modeled. Resolved net ports, net declaration
-  assignments/delays, procedural net writes, implicit width conversion, signed
+  assignments, procedural net writes, implicit width conversion, signed
   operands/targets, explicit/asymmetric drive strengths, charge strengths,
   nondefault wired-net strengths, explicit-unit delay literals,
   dynamic/out-of-range RHS selects, partial/hierarchical targets, and driver

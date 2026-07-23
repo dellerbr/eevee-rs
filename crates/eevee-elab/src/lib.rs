@@ -29,7 +29,7 @@ use eevee_ir::{
     ProgramBuilder, Reg, Value,
 };
 use eevee_sched::{
-    DriveDelay, DriveStrength, DriverId, EdgeKind, ForkJoin, NetId, NetResolution, Sim,
+    DriveDelay, DriveStrength, DriverId, EdgeKind, ForkJoin, NetDelay, NetId, NetResolution, Sim,
 };
 
 /// Statistics from a global elaboration pass (how much UVM we ingested).
@@ -1282,6 +1282,7 @@ fn elaborate_module_instance(
     backend: &dyn ExecBackend,
 ) {
     let consts = bind_module_parameters(m, parameter_overrides, parent_consts, &g.consts);
+    let ts = sim.kernel().timescale();
     let mut scope: HashMap<String, (NetId, u32)> = HashMap::new();
     let mut drivable = HashSet::new();
     for port in &m.ports {
@@ -1311,10 +1312,15 @@ fn elaborate_module_instance(
                 NetKind::Wand => NetResolution::Wand,
                 NetKind::Wor => NetResolution::Wor,
             };
-            let id = sim.kernel().new_net_with_resolution(
+            let delay = net
+                .delay
+                .as_ref()
+                .map(|delay| compile_continuous_delay(delay, &consts, ts).as_net_delay());
+            let id = sim.kernel().new_net_with_resolution_and_delay(
                 scoped_name(path, &net.name),
                 LogicVec::z(net.width),
                 resolution,
+                delay,
             );
             scope.insert(net.name.clone(), (id, net.width));
             drivable.insert(net.name.clone());
@@ -1351,7 +1357,6 @@ fn elaborate_module_instance(
         }
     }
 
-    let ts = sim.kernel().timescale();
     let gv = GlobalVars {
         vars: &g.globals,
         coll: &g.global_coll,
@@ -1400,45 +1405,9 @@ fn elaborate_module_instance(
                     panic!("continuous assignment target '{}' is unknown", lhs.name)
                 });
                 let driver = sim.kernel().new_driver(net);
-                let delay = delay.as_ref().map(|delay| {
-                    let evaluate = |expression: &Expr| {
-                        let value = try_const_eval_with(expression, &consts).unwrap_or_else(|| {
-                            panic!("continuous assignment delay is not a constant expression")
-                        });
-                        assert!(
-                            value.is_known(),
-                            "continuous assignment delay contains X or Z"
-                        );
-                        assert!(
-                            value.to_i64() >= 0,
-                            "continuous assignment delay is negative"
-                        );
-                        ts.delay_to_fs(value.to_u64() as f64)
-                    };
-                    match delay {
-                        ContinuousDelay::Single(delay) => {
-                            CompiledContinuousDelay::Single(evaluate(delay))
-                        }
-                        ContinuousDelay::RiseFall { rise, fall } => {
-                            let rise_fs = evaluate(rise);
-                            let fall_fs = evaluate(fall);
-                            CompiledContinuousDelay::Transitions(DriveDelay {
-                                rise_fs,
-                                fall_fs,
-                                turn_off_fs: rise_fs.min(fall_fs),
-                            })
-                        }
-                        ContinuousDelay::RiseFallTurnOff {
-                            rise,
-                            fall,
-                            turn_off,
-                        } => CompiledContinuousDelay::Transitions(DriveDelay {
-                            rise_fs: evaluate(rise),
-                            fall_fs: evaluate(fall),
-                            turn_off_fs: evaluate(turn_off),
-                        }),
-                    }
-                });
+                let delay = delay
+                    .as_ref()
+                    .map(|delay| compile_continuous_delay(delay, &consts, ts));
                 let prog = CodeGen::new(
                     &scope,
                     &g.func_ids,
@@ -1665,6 +1634,58 @@ fn default_value(fld: &VarDecl, consts: &HashMap<String, LogicVec>) -> Value {
 enum CompiledContinuousDelay {
     Single(u64),
     Transitions(DriveDelay),
+}
+
+impl CompiledContinuousDelay {
+    fn as_net_delay(self) -> NetDelay {
+        match self {
+            Self::Single(delay_fs) => NetDelay {
+                rise_fs: delay_fs,
+                fall_fs: delay_fs,
+                turn_off_fs: delay_fs,
+            },
+            Self::Transitions(delays) => NetDelay {
+                rise_fs: delays.rise_fs,
+                fall_fs: delays.fall_fs,
+                turn_off_fs: delays.turn_off_fs,
+            },
+        }
+    }
+}
+
+fn compile_continuous_delay(
+    delay: &ContinuousDelay,
+    consts: &HashMap<String, LogicVec>,
+    ts: Timescale,
+) -> CompiledContinuousDelay {
+    let evaluate = |expression: &Expr| {
+        let value = try_const_eval_with(expression, consts)
+            .unwrap_or_else(|| panic!("delay is not a constant expression"));
+        assert!(value.is_known(), "delay contains X or Z");
+        assert!(value.to_i64() >= 0, "delay is negative");
+        ts.delay_to_fs(value.to_u64() as f64)
+    };
+    match delay {
+        ContinuousDelay::Single(delay) => CompiledContinuousDelay::Single(evaluate(delay)),
+        ContinuousDelay::RiseFall { rise, fall } => {
+            let rise_fs = evaluate(rise);
+            let fall_fs = evaluate(fall);
+            CompiledContinuousDelay::Transitions(DriveDelay {
+                rise_fs,
+                fall_fs,
+                turn_off_fs: rise_fs.min(fall_fs),
+            })
+        }
+        ContinuousDelay::RiseFallTurnOff {
+            rise,
+            fall,
+            turn_off,
+        } => CompiledContinuousDelay::Transitions(DriveDelay {
+            rise_fs: evaluate(rise),
+            fall_fs: evaluate(fall),
+            turn_off_fs: evaluate(turn_off),
+        }),
+    }
 }
 
 struct CodeGen<'a> {

@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use eevee_core::{Bit, LogicVec, SimTime};
 use eevee_sched::{
-    DriveDelay, DriveStrength, EdgeKind, Kernel, NetId, NetResolution, Process, Sim, Wait,
+    DriveDelay, DriveStrength, EdgeKind, Kernel, NetDelay, NetId, NetResolution, Process, Sim, Wait,
 };
 
 fn lv(v: u64, w: u32) -> LogicVec {
@@ -264,6 +264,80 @@ fn transition_delays_cancel_and_preserve_pending_bits_independently() {
 
     sim.run_until(Some(SimTime::from_fs(5)));
     assert_eq!(sim.kernel().net_value(net).to_u64(), 1);
+}
+
+#[test]
+fn net_declaration_delays_apply_after_driver_resolution() {
+    let mut sim = Sim::with_default_timescale();
+    let net = sim.kernel().new_net_with_resolution_and_delay(
+        "net_delayed",
+        LogicVec::z(3),
+        NetResolution::Wire,
+        Some(NetDelay {
+            rise_fs: 2,
+            fall_fs: 4,
+            turn_off_fs: 6,
+        }),
+    );
+    let high_driver = sim.kernel().new_driver(net);
+    let low_driver = sim.kernel().new_driver(net);
+    let mut high = LogicVec::z(3);
+    high.set_bit(2, Bit::One);
+    let mut low = LogicVec::z(3);
+    low.set_bit(0, Bit::Zero);
+    low.set_bit(1, Bit::One);
+    sim.kernel().drive_net(high_driver, high);
+    sim.kernel().drive_net(low_driver, low);
+
+    sim.run_until(Some(SimTime::from_fs(2)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Z);
+    assert_eq!(sim.kernel().net_value(net).get_bit(1), Bit::One);
+    assert_eq!(sim.kernel().net_value(net).get_bit(2), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(4)));
+    assert_eq!(sim.kernel().net_value(net).to_u64(), 6);
+
+    sim.kernel().drive_net(high_driver, LogicVec::z(3));
+    let mut requested = LogicVec::z(3);
+    requested.set_bit(0, Bit::One);
+    requested.set_bit(1, Bit::Zero);
+    sim.kernel().drive_net(low_driver, requested);
+
+    sim.run_until(Some(SimTime::from_fs(6)));
+    assert_eq!(sim.kernel().net_value(net).to_u64(), 7);
+
+    sim.run_until(Some(SimTime::from_fs(8)));
+    assert_eq!(sim.kernel().net_value(net).to_u64(), 5);
+
+    sim.run_until(Some(SimTime::from_fs(9)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(2), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(10)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(2), Bit::Z);
+}
+
+#[test]
+fn net_declaration_delay_applies_zero_delay_bits_immediately() {
+    let mut sim = Sim::with_default_timescale();
+    let net = sim.kernel().new_net_with_resolution_and_delay(
+        "mixed_net_delay",
+        LogicVec::z(2),
+        NetResolution::Wire,
+        Some(NetDelay {
+            rise_fs: 0,
+            fall_fs: 3,
+            turn_off_fs: 5,
+        }),
+    );
+    let driver = sim.kernel().new_driver(net);
+    sim.kernel().drive_net(driver, lv(1, 2));
+
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(net).get_bit(1), Bit::Z);
+
+    sim.run_until(Some(SimTime::from_fs(3)));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(net).get_bit(1), Bit::Zero);
 }
 
 struct MultiNetWaiter {
