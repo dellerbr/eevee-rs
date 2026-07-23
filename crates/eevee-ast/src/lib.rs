@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-use eevee_core::LogicVec;
+use eevee_core::{Bit, LogicVec};
 
 /// A parsed source unit: the top-level descriptions in one or more files.
 #[derive(Debug, Clone, Default)]
@@ -484,6 +484,8 @@ pub struct Lvalue {
 pub enum Expr {
     /// A sized/unsized literal, already parsed to a 4-state vector.
     Literal(LogicVec),
+    /// An unbased unsized literal (`'0`, `'1`, `'x`, `'z`) that fills context width.
+    Fill(Bit),
     /// A string literal (e.g. a `$display` format string).
     Str(String),
     /// A reference to a variable/net by name.
@@ -495,6 +497,12 @@ pub enum Expr {
         op: BinOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+    },
+    /// Four-state conditional operator: `condition ? when_true : when_false`.
+    Conditional {
+        condition: Box<Expr>,
+        when_true: Box<Expr>,
+        when_false: Box<Expr>,
     },
     /// A function call returning a value: `name(args...)`.
     Call { name: String, args: Vec<Expr> },

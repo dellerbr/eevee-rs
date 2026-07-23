@@ -378,6 +378,15 @@ fn run_frame(
             Inst::Mov { dst, src } => {
                 regs[dst as usize] = regs[src as usize].clone();
             }
+            Inst::Resize {
+                dst,
+                src,
+                width,
+                signed,
+            } => {
+                let value = regs[src as usize].as_logic().resize(width, signed);
+                regs[dst as usize] = Value::Logic(value);
+            }
             Inst::Assign { dst, src } => {
                 regs[dst as usize] = regs[src as usize].assignment_copy();
             }
@@ -470,6 +479,30 @@ fn run_frame(
             Inst::LogOr { dst, a, b } => {
                 let v = value_truthy(&regs[a as usize]) || value_truthy(&regs[b as usize]);
                 regs[dst as usize] = Value::Logic(LogicVec::from_u64(v as u64, 1));
+            }
+            Inst::Select {
+                dst,
+                condition,
+                when_true,
+                when_false,
+            } => {
+                let condition = regs[condition as usize].as_logic();
+                regs[dst as usize] = match (&regs[when_true as usize], &regs[when_false as usize]) {
+                    (Value::Logic(when_true), Value::Logic(when_false)) => {
+                        Value::Logic(LogicVec::conditional(condition, when_true, when_false))
+                    }
+                    (when_true, when_false) if values_identical(when_true, when_false) => {
+                        when_true.clone()
+                    }
+                    _ => Value::Null,
+                };
+            }
+            Inst::IsKnown { dst, a } => {
+                let known = match &regs[a as usize] {
+                    Value::Logic(value) => value.is_known(),
+                    _ => true,
+                };
+                regs[dst as usize] = Value::Logic(LogicVec::from_u64(known as u64, 1));
             }
             Inst::LogNot { dst, a } => {
                 let v = regs[a as usize].as_logic().lognot();
@@ -979,6 +1012,20 @@ fn value_truthy(v: &Value) -> bool {
         Value::Null => false,
         Value::Str(s) => !s.is_empty(),
         Value::Real(r) => *r != 0.0,
+    }
+}
+
+fn values_identical(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Logic(left), Value::Logic(right)) => left.eq_case(right),
+        (Value::Real(left), Value::Real(right)) => left.to_bits() == right.to_bits(),
+        (Value::Str(left), Value::Str(right)) => left == right,
+        (Value::Obj(left), Value::Obj(right)) => Rc::ptr_eq(left, right),
+        (Value::Queue(left), Value::Queue(right)) => Rc::ptr_eq(left, right),
+        (Value::Assoc(left), Value::Assoc(right)) => Rc::ptr_eq(left, right),
+        (Value::Event(left), Value::Event(right)) => left == right,
+        (Value::Null, Value::Null) => true,
+        _ => false,
     }
 }
 

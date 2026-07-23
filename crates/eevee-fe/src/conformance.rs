@@ -340,7 +340,11 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                 return unsupported(node, source);
             }
         }
-        "kNumber" if find(node, "kBaseDigits").is_none() && const_int(node).is_none() => {
+        "kNumber"
+            if find(node, "kBaseDigits").is_none()
+                && find(node, "TK_UnBasedNumber").is_none()
+                && const_int(node).is_none() =>
+        {
             return unsupported(node, source);
         }
         "kExpression" => {
@@ -354,6 +358,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                         | "kSystemTFCall"
                         | "kClassNew"
                         | "kBinaryExpression"
+                        | "kConditionExpression"
                         | "kUnaryPrefixExpression"
                         | "kParenGroup"
                         | "kParenExpression"

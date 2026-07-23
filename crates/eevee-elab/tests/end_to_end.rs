@@ -234,6 +234,171 @@ fn continuous_assignments_propagate_and_resolve_drivers() {
 }
 
 #[test]
+fn conditional_continuous_drivers_release_to_high_impedance() {
+    let src = "module top;\n\
+      logic enable = 0;\n\
+      logic other_enable = 1;\n\
+      logic delayed_enable = 0;\n\
+      logic [3:0] data = 4'ha;\n\
+      logic [3:0] other = 4'h5;\n\
+      wire [3:0] bus;\n\
+      wire [3:0] always_released;\n\
+      wire [3:0] masked_fill;\n\
+      wire delayed;\n\
+      tri1 fallback;\n\
+      assign bus = enable ? data : 'z;\n\
+      assign bus = other_enable ? other : 'z;\n\
+      assign always_released = 'z;\n\
+      assign masked_fill = '1 & 4'ha;\n\
+      assign #2 delayed = delayed_enable ? 1'b1 : 'z;\n\
+      assign fallback = enable ? 1'b0 : 'z;\n\
+      initial begin\n\
+        #1 enable = 1;\n\
+        delayed_enable = 1;\n\
+        #1 other_enable = 0;\n\
+        delayed_enable = 0;\n\
+        #1 enable = 1'bx;\n\
+        #1 enable = 0;\n\
+        delayed_enable = 1;\n\
+        #3 delayed_enable = 0;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let bus = sim.kernel().find_net("bus").expect("tri-state bus");
+    let always_released = sim
+        .kernel()
+        .find_net("always_released")
+        .expect("directly released driver");
+    let delayed = sim.kernel().find_net("delayed").expect("delayed release");
+    let masked_fill = sim
+        .kernel()
+        .find_net("masked_fill")
+        .expect("nested fill expression");
+    let fallback = sim.kernel().find_net("fallback").expect("pulled fallback");
+
+    sim.run_until(Some(SimTime::ZERO));
+    assert_eq!(sim.kernel().net_value(bus).to_u64(), 5);
+    assert!((0..4).all(|bit| sim.kernel().net_value(always_released).get_bit(bit) == Bit::Z));
+    assert_eq!(sim.kernel().net_value(delayed).get_bit(0), Bit::Z);
+    assert_eq!(sim.kernel().net_value(masked_fill).to_u64(), 10);
+    assert_eq!(sim.kernel().net_value(fallback).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    assert!((0..4).all(|bit| sim.kernel().net_value(bus).get_bit(bit) == Bit::X));
+    assert_eq!(sim.kernel().net_value(fallback).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    assert_eq!(sim.kernel().net_value(bus).to_u64(), 10);
+
+    sim.run_until(Some(SimTime::from_fs(3_000_000)));
+    assert!((0..4).all(|bit| sim.kernel().net_value(bus).get_bit(bit) == Bit::X));
+    assert_eq!(sim.kernel().net_value(fallback).get_bit(0), Bit::X);
+    assert_eq!(sim.kernel().net_value(delayed).get_bit(0), Bit::Z);
+
+    sim.run_until(Some(SimTime::from_fs(4_000_000)));
+    assert!((0..4).all(|bit| sim.kernel().net_value(bus).get_bit(bit) == Bit::Z));
+    assert_eq!(sim.kernel().net_value(fallback).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(6_000_000)));
+    assert_eq!(sim.kernel().net_value(delayed).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(8_000_000)));
+    assert_eq!(sim.kernel().net_value(delayed).get_bit(0), Bit::One);
+
+    sim.run_until(Some(SimTime::from_fs(9_000_000)));
+    assert_eq!(sim.kernel().net_value(delayed).get_bit(0), Bit::Z);
+}
+
+#[test]
+fn conditional_expression_width_and_branch_execution_are_stable() {
+    let src = "module top;\n\
+      logic condition = 1;\n\
+      logic [3:0] width_result = 0;\n\
+      logic [3:0] fill_result = 0;\n\
+      logic [31:0] lazy_result = 0;\n\
+      function int mark(input int value);\n\
+        $display(\"MARK %0d\", value);\n\
+        mark = value;\n\
+      endfunction\n\
+      initial begin\n\
+        width_result = condition ? 1'b1 : 4'ha;\n\
+        fill_result = '1;\n\
+        lazy_result = condition ? mark(1) : mark(2);\n\
+        #1 condition = 0;\n\
+        width_result = condition ? 1'b1 : 4'ha;\n\
+        fill_result = 'x;\n\
+        lazy_result = condition ? mark(1) : mark(2);\n\
+        #1 condition = 1'bx;\n\
+        width_result = condition ? 1'b1 : 4'ha;\n\
+        fill_result = '1 & 4'ha;\n\
+        lazy_result = condition ? mark(1) : mark(2);\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let width_result = sim
+        .kernel()
+        .find_net("width_result")
+        .expect("conditional result");
+    let fill_result = sim.kernel().find_net("fill_result").expect("fill result");
+    let lazy_result = sim.kernel().find_net("lazy_result").expect("lazy result");
+
+    sim.run_until(Some(SimTime::ZERO));
+    assert_eq!(sim.kernel().net_value(width_result).to_u64(), 1);
+    assert_eq!(sim.kernel().net_value(fill_result).to_u64(), 15);
+    assert_eq!(sim.kernel().net_value(lazy_result).width(), 32);
+    assert_eq!(sim.kernel().net_value(lazy_result).to_u64(), 1);
+    assert_eq!(sim.kernel().output(), &["MARK 1"]);
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    assert_eq!(sim.kernel().net_value(width_result).to_u64(), 10);
+    assert!((0..4).all(|bit| sim.kernel().net_value(fill_result).get_bit(bit) == Bit::X));
+    assert_eq!(sim.kernel().net_value(lazy_result).width(), 32);
+    assert_eq!(sim.kernel().net_value(lazy_result).to_u64(), 2);
+    assert_eq!(sim.kernel().output(), &["MARK 1", "MARK 2"]);
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    let result = sim.kernel().net_value(width_result);
+    assert_eq!(result.width(), 4);
+    assert_eq!(result.get_bit(0), Bit::X);
+    assert_eq!(result.get_bit(1), Bit::X);
+    assert_eq!(result.get_bit(2), Bit::Zero);
+    assert_eq!(result.get_bit(3), Bit::X);
+    assert_eq!(sim.kernel().net_value(fill_result).to_u64(), 10);
+    let lazy = sim.kernel().net_value(lazy_result);
+    assert_eq!(lazy.width(), 32);
+    assert_eq!(lazy.get_bit(0), Bit::X);
+    assert_eq!(lazy.get_bit(1), Bit::X);
+    assert!((2..32).all(|bit| lazy.get_bit(bit) == Bit::Zero));
+    assert_eq!(
+        sim.kernel().output(),
+        &["MARK 1", "MARK 2", "MARK 1", "MARK 2"]
+    );
+}
+
+#[test]
+fn conformance_mode_rejects_nonintegral_conditionals() {
+    let src = "module top;\n\
+      logic condition;\n\
+      string result;\n\
+      initial result = condition ? \"yes\" : \"no\";\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conditional syntax parses");
+    let error = match elaborate_conformant(&file, &Interp) {
+        Ok(_) => panic!("non-integral conditional must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+      error,
+      ElabError::UnsupportedSemantic { ref message }
+        if message.contains("non-integral conditional expressions")
+    ));
+}
+
+#[test]
 fn wired_and_or_net_types_resolve_continuous_drivers() {
     let src = "module top;\n\
       logic left = 1;\n\
@@ -608,6 +773,11 @@ fn conformance_mode_rejects_invalid_continuous_drivers() {
         (
             "module top; logic source; wire [7:0] result; assign result = source; endmodule",
             "width conversion is unsupported",
+        ),
+        (
+          "module top; logic enable; logic [1:0] source; wire [1:0] result;\n\
+           assign result = enable ? source : 1'bz; endmodule",
+          "continuous conditional branch width mismatch",
         ),
         (
             "module top; logic [3:0] source; wire result; assign result = source[4]; endmodule",

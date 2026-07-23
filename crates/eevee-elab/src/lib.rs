@@ -96,6 +96,8 @@ struct Global {
     consts: HashMap<String, LogicVec>,
     /// Package-level global variables: name -> static-storage id.
     globals: HashMap<String, u32>,
+    /// Declared widths of package-level global variables.
+    global_widths: HashMap<String, u32>,
     /// Collection-typed globals and their element/key class types.
     global_coll: HashMap<String, CollInfo>,
     /// Class-handle globals: name -> class id.
@@ -648,6 +650,7 @@ fn build_global(
     // global variable. Package globals are allocated first (stable ids).
     let mut statics_defaults: Vec<Value> = Vec::new();
     let mut globals: HashMap<String, u32> = HashMap::new();
+    let mut global_widths: HashMap<String, u32> = HashMap::new();
     let mut global_coll: HashMap<String, CollInfo> = HashMap::new();
     let mut global_class: HashMap<String, u32> = HashMap::new();
     for v in global_vars {
@@ -662,6 +665,7 @@ fn build_global(
         };
         statics_defaults.push(default);
         globals.insert(v.name.clone(), id);
+        global_widths.insert(v.name.clone(), v.width.max(1));
         let elem = v
             .class_name
             .as_deref()
@@ -800,6 +804,7 @@ fn build_global(
     let empty_scope: HashMap<String, (NetId, u32)> = HashMap::new();
     let gv = GlobalVars {
         vars: &globals,
+        widths: &global_widths,
         coll: &global_coll,
         class: &global_class,
         type_aliases: &global_type_aliases,
@@ -935,6 +940,7 @@ fn build_global(
         class_infos,
         consts,
         globals,
+        global_widths,
         global_coll,
         global_class,
         global_type_aliases,
@@ -963,6 +969,7 @@ fn build_class_info(
         mut field_coll,
         mut field_events,
         mut static_fields,
+        mut static_field_widths,
         mut static_field_class,
         mut static_field_coll,
         mut type_aliases,
@@ -983,6 +990,7 @@ fn build_class_info(
                 b.field_coll.clone(),
                 b.field_events.clone(),
                 b.static_fields.clone(),
+                b.static_field_widths.clone(),
                 b.static_field_class.clone(),
                 b.static_field_coll.clone(),
                 b.type_aliases.clone(),
@@ -1000,6 +1008,7 @@ fn build_class_info(
             HashMap::new(), // field_coll
             HashSet::new(), // field_events
             HashMap::new(), // static_fields
+            HashMap::new(), // static_field_widths
             HashMap::new(), // static_field_class
             HashMap::new(), // static_field_coll
             HashMap::new(), // type_aliases
@@ -1086,6 +1095,7 @@ fn build_class_info(
             };
             statics_defaults.push(default);
             static_fields.insert(fld.name.clone(), id);
+            static_field_widths.insert(fld.name.clone(), fld.width.max(1));
             if let Some(fc) = elem_class {
                 static_field_class.insert(fld.name.clone(), fc);
             }
@@ -1147,6 +1157,7 @@ fn build_class_info(
         field_coll,
         field_events,
         static_fields,
+        static_field_widths,
         static_field_class,
         static_field_coll,
         type_param_default,
@@ -1331,8 +1342,8 @@ fn elaborate_module_instance(
     for it in &m.items {
         if let ModuleItem::Var(v) = it {
             let init = match &v.init {
-                Some(e) => try_const_eval_with(e, &consts)
-                    .unwrap_or_else(|| {
+                Some(e) => {
+                    try_const_eval_at_width(e, &consts, v.width, v.signed).unwrap_or_else(|| {
                         panic!(
                             "module variable '{}{}{}' initializer is not a constant expression",
                             path,
@@ -1340,7 +1351,7 @@ fn elaborate_module_instance(
                             v.name
                         )
                     })
-                    .resize(v.width, v.signed),
+                }
                 None => LogicVec::zero(v.width),
             };
             let net = sim.kernel().new_net(scoped_name(path, &v.name), init);
@@ -1350,6 +1361,7 @@ fn elaborate_module_instance(
 
     let gv = GlobalVars {
         vars: &g.globals,
+        widths: &g.global_widths,
         coll: &g.global_coll,
         class: &g.global_class,
         type_aliases: &g.global_type_aliases,
@@ -1397,7 +1409,7 @@ fn elaborate_module_instance(
                 if !drivable.contains(&lhs.name) {
                     panic!("continuous assignment target '{}' is not a net", lhs.name);
                 }
-                let &(net, _) = scope.get(&lhs.name).unwrap_or_else(|| {
+                let &(net, width) = scope.get(&lhs.name).unwrap_or_else(|| {
                     panic!("continuous assignment target '{}' is unknown", lhs.name)
                 });
                 let driver = match strength {
@@ -1420,7 +1432,7 @@ fn elaborate_module_instance(
                     &gv,
                     ts,
                 )
-                .gen_continuous(rhs, driver, delay);
+                .gen_continuous(rhs, driver, width, delay);
                 sim.add_process(backend.instantiate(Rc::new(prog), g.linkage.clone()));
             }
             ModuleItem::Var(_)
@@ -1517,13 +1529,18 @@ fn bind_module_parameters(
                 )
             }),
         };
-        let value =
-            try_const_eval_with(&parameter_override.value, parent_consts).unwrap_or_else(|| {
-                panic!(
-                    "module parameter override '{}.{}' is not a constant expression",
-                    module.name, parameter.name
-                )
-            });
+        let value = try_const_eval_at_width(
+            &parameter_override.value,
+            parent_consts,
+            parameter.width,
+            parameter.signed,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "module parameter override '{}.{}' is not a constant expression",
+                module.name, parameter.name
+            )
+        });
         if resolved_overrides
             .insert(parameter.name.clone(), value)
             .is_some()
@@ -1540,7 +1557,13 @@ fn bind_module_parameters(
         let value = resolved_overrides
             .remove(&parameter.name)
             .unwrap_or_else(|| {
-                try_const_eval_with(&parameter.default, &consts).unwrap_or_else(|| {
+                try_const_eval_at_width(
+                    &parameter.default,
+                    &consts,
+                    parameter.width,
+                    parameter.signed,
+                )
+                .unwrap_or_else(|| {
                     panic!(
                         "default value for module parameter '{}.{}' is not a constant expression",
                         module.name, parameter.name
@@ -1619,6 +1642,8 @@ struct ClassInfo {
     field_events: HashSet<String>,
     /// Static fields: name -> global static id (shared storage).
     static_fields: HashMap<String, u32>,
+    /// Declared widths of static fields.
+    static_field_widths: HashMap<String, u32>,
     /// Static fields whose type is a class: name -> class id.
     static_field_class: HashMap<String, u32>,
     /// Static collection fields and their element/key class types.
@@ -1659,7 +1684,10 @@ fn default_value(fld: &VarDecl, consts: &HashMap<String, LogicVec>) -> Value {
             _ => Value::Str(Rc::from("")),
         }
     } else if let Some(init) = &fld.init {
-        Value::Logic(const_eval_with(init, consts).resize(fld.width.max(1), fld.signed))
+        Value::Logic(
+            try_const_eval_at_width(init, consts, fld.width.max(1), fld.signed)
+                .unwrap_or_else(|| LogicVec::zero(fld.width.max(1))),
+        )
     } else {
         Value::Logic(LogicVec::zero(fld.width.max(1)))
     }
@@ -1754,6 +1782,7 @@ struct CodeGen<'a> {
 /// Borrowed package-global tables passed to the codegen.
 struct GlobalVars<'a> {
     vars: &'a HashMap<String, u32>,
+    widths: &'a HashMap<String, u32>,
     coll: &'a HashMap<String, CollInfo>,
     class: &'a HashMap<String, u32>,
     /// Package/module-scope type aliases: alias name -> class id.
@@ -1821,6 +1850,7 @@ impl<'a> CodeGen<'a> {
         &mut self,
         rhs: &Expr,
         driver: DriverId,
+        width: u32,
         delay: Option<CompiledContinuousDelay>,
     ) -> Program {
         let mut pb = ProgramBuilder::new("continuous assign");
@@ -1828,7 +1858,7 @@ impl<'a> CodeGen<'a> {
         self.collect_net_reads(rhs, &mut read_set);
         let evaluate = pb.new_label();
         pb.bind(evaluate);
-        let value = self.gen_expr(rhs, &mut pb);
+        let value = self.gen_expr_at_width(rhs, width, &mut pb);
         match delay {
             Some(CompiledContinuousDelay::Single(delay_fs)) => pb.emit(Inst::ScheduleDrive {
                 driver,
@@ -1870,6 +1900,15 @@ impl<'a> CodeGen<'a> {
                 self.collect_net_reads(lhs, read_set);
                 self.collect_net_reads(rhs, read_set);
             }
+            Expr::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                self.collect_net_reads(condition, read_set);
+                self.collect_net_reads(when_true, read_set);
+                self.collect_net_reads(when_false, read_set);
+            }
             Expr::Call { args, .. }
             | Expr::StaticCall { args, .. }
             | Expr::New { args }
@@ -1896,7 +1935,421 @@ impl<'a> CodeGen<'a> {
                 self.collect_net_reads(left, read_set);
                 self.collect_net_reads(right, read_set);
             }
-            Expr::Literal(_) | Expr::Str(_) | Expr::StaticRef { .. } | Expr::Null => {}
+            Expr::Literal(_)
+            | Expr::Fill(_)
+            | Expr::Str(_)
+            | Expr::StaticRef { .. }
+            | Expr::Null => {}
+        }
+    }
+
+    fn integral_expr_width(&self, expr: &Expr) -> Option<u32> {
+        match expr {
+            Expr::Literal(value) => Some(value.width()),
+            Expr::Fill(_) => None,
+            Expr::Ref(name) => self
+                .locals
+                .get(name)
+                .map(|(_, width)| *width)
+                .or_else(|| self.nets.get(name).map(|(_, width)| *width))
+                .or_else(|| self.consts.get(name).map(LogicVec::width))
+                .or_else(|| self.class_field(name).map(|(_, width)| width))
+                .or_else(|| self.static_field_width(name))
+                .or_else(|| self.globals.widths.get(name).copied()),
+            Expr::Unary { op, operand } => match op {
+                UnaryOp::LogNot | UnaryOp::ReduceAnd | UnaryOp::ReduceOr | UnaryOp::ReduceXor => {
+                    Some(1)
+                }
+                UnaryOp::BitNot | UnaryOp::Neg | UnaryOp::Plus => self.integral_expr_width(operand),
+            },
+            Expr::Binary { op, lhs, rhs } => {
+                let left = self.integral_expr_width(lhs)?;
+                let right = self.integral_expr_width(rhs)?;
+                Some(match op {
+                    BinOp::Eq
+                    | BinOp::Neq
+                    | BinOp::Lt
+                    | BinOp::Gt
+                    | BinOp::Le
+                    | BinOp::Ge
+                    | BinOp::LogAnd
+                    | BinOp::LogOr => 1,
+                    BinOp::Shl | BinOp::Shr => left,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor => {
+                        left.max(right)
+                    }
+                })
+            }
+            Expr::Conditional {
+                when_true,
+                when_false,
+                ..
+            } => match (
+                self.integral_expr_width(when_true),
+                self.integral_expr_width(when_false),
+            ) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(width), None) | (None, Some(width)) => Some(width),
+                (None, None) => None,
+            },
+            Expr::Index { .. } => Some(1),
+            Expr::PartSelect { left, right, .. } => {
+                let Expr::Literal(left) = left.as_ref() else {
+                    return None;
+                };
+                let Expr::Literal(right) = right.as_ref() else {
+                    return None;
+                };
+                Some(left.to_u64().abs_diff(right.to_u64()) as u32 + 1)
+            }
+            Expr::Concat(parts) => parts.iter().try_fold(0u32, |width, part| {
+                width.checked_add(self.integral_expr_width(part)?)
+            }),
+            Expr::Field { obj, field } => {
+                let class = self.try_class_of(obj)?;
+                self.classes[class as usize]
+                    .field_slot
+                    .get(field)
+                    .map(|(_, width)| *width)
+            }
+            Expr::StaticRef { class_name, field } => {
+                let class = self.resolve_class(class_name)?;
+                self.classes[class as usize]
+                    .static_field_widths
+                    .get(field)
+                    .copied()
+            }
+            _ => None,
+        }
+    }
+
+    fn gen_expr_at_width(&mut self, expr: &Expr, width: u32, pb: &mut ProgramBuilder) -> Reg {
+        match expr {
+            Expr::Fill(bit) => {
+                let dst = pb.new_reg();
+                let k = pb.konst_logic(LogicVec::filled(*bit, width));
+                pb.emit(Inst::LoadConst { dst, k });
+                dst
+            }
+            Expr::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => self.gen_conditional(condition, when_true, when_false, width, pb),
+            Expr::Unary { op, operand }
+                if matches!(op, UnaryOp::BitNot | UnaryOp::Neg | UnaryOp::Plus) =>
+            {
+                let operand = self.gen_expr_at_width(operand, width, pb);
+                let dst = pb.new_reg();
+                match op {
+                    UnaryOp::BitNot => pb.emit(Inst::Not { dst, a: operand }),
+                    UnaryOp::Neg => pb.emit(Inst::Neg { dst, a: operand }),
+                    UnaryOp::Plus => pb.emit(Inst::Mov { dst, src: operand }),
+                    _ => unreachable!("guarded unary context"),
+                }
+                dst
+            }
+            Expr::Binary { op, lhs, rhs }
+                if matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor
+                ) =>
+            {
+                let lhs = self.gen_expr_at_width(lhs, width, pb);
+                let rhs = self.gen_expr_at_width(rhs, width, pb);
+                let dst = pb.new_reg();
+                pb.emit(match op {
+                    BinOp::Add => Inst::Add {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Sub => Inst::Sub {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Mul => Inst::Mul {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::And => Inst::And {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Or => Inst::Or {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Xor => Inst::Xor {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    _ => unreachable!("guarded binary context"),
+                });
+                dst
+            }
+            Expr::Binary { op, lhs, rhs } if matches!(op, BinOp::Shl | BinOp::Shr) => {
+                let lhs = self.gen_expr_at_width(lhs, width, pb);
+                let rhs = self.gen_expr(rhs, pb);
+                let dst = pb.new_reg();
+                pb.emit(match op {
+                    BinOp::Shl => Inst::Shl {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Shr => Inst::Shr {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    _ => unreachable!("guarded shift context"),
+                });
+                dst
+            }
+            Expr::Binary { op, lhs, rhs }
+                if matches!(
+                    op,
+                    BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
+                ) =>
+            {
+                let operand_width =
+                    match (self.integral_expr_width(lhs), self.integral_expr_width(rhs)) {
+                        (Some(left), Some(right)) => left.max(right),
+                        (Some(width), None) | (None, Some(width)) => width,
+                        (None, None) => 1,
+                    };
+                let lhs = self.gen_expr_at_width(lhs, operand_width, pb);
+                let rhs = self.gen_expr_at_width(rhs, operand_width, pb);
+                let result = pb.new_reg();
+                pb.emit(match op {
+                    BinOp::Eq => Inst::Eq {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Neq => Inst::Neq {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Lt => Inst::Lt {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Gt => Inst::Gt {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Le => Inst::Le {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Ge => Inst::Ge {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    _ => unreachable!("guarded comparison context"),
+                });
+                if width == 1 {
+                    result
+                } else {
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::Resize {
+                        dst,
+                        src: result,
+                        width,
+                        signed: false,
+                    });
+                    dst
+                }
+            }
+            _ => {
+                let src = self.gen_expr(expr, pb);
+                if self.integral_expr_width(expr) == Some(width) {
+                    src
+                } else {
+                    let dst = pb.new_reg();
+                    pb.emit(Inst::Resize {
+                        dst,
+                        src,
+                        width,
+                        signed: false,
+                    });
+                    dst
+                }
+            }
+        }
+    }
+
+    fn gen_conditional(
+        &mut self,
+        condition: &Expr,
+        when_true: &Expr,
+        when_false: &Expr,
+        width: u32,
+        pb: &mut ProgramBuilder,
+    ) -> Reg {
+        let condition = self.gen_expr(condition, pb);
+        let when_true_label = pb.new_label();
+        let when_false_label = pb.new_label();
+        let done = pb.new_label();
+        let dst = pb.new_reg();
+
+        pb.branch_true(condition, when_true_label);
+        let known = pb.new_reg();
+        pb.emit(Inst::IsKnown {
+            dst: known,
+            a: condition,
+        });
+        pb.branch_true(known, when_false_label);
+
+        let true_value = self.gen_expr_at_width(when_true, width, pb);
+        let false_value = self.gen_expr_at_width(when_false, width, pb);
+        pb.emit(Inst::Select {
+            dst,
+            condition,
+            when_true: true_value,
+            when_false: false_value,
+        });
+        pb.jump(done);
+
+        pb.bind(when_true_label);
+        let value = self.gen_expr_at_width(when_true, width, pb);
+        pb.emit(Inst::Mov { dst, src: value });
+        pb.jump(done);
+
+        pb.bind(when_false_label);
+        let value = self.gen_expr_at_width(when_false, width, pb);
+        pb.emit(Inst::Mov { dst, src: value });
+        pb.bind(done);
+        dst
+    }
+
+    fn gen_generic_conditional(
+        &mut self,
+        condition: &Expr,
+        when_true: &Expr,
+        when_false: &Expr,
+        pb: &mut ProgramBuilder,
+    ) -> Reg {
+        let condition = self.gen_expr(condition, pb);
+        let when_true_label = pb.new_label();
+        let when_false_label = pb.new_label();
+        let done = pb.new_label();
+        let dst = pb.new_reg();
+
+        pb.branch_true(condition, when_true_label);
+        let known = pb.new_reg();
+        pb.emit(Inst::IsKnown {
+            dst: known,
+            a: condition,
+        });
+        pb.branch_true(known, when_false_label);
+
+        let true_value = self.gen_expr(when_true, pb);
+        let false_value = self.gen_expr(when_false, pb);
+        pb.emit(Inst::Select {
+            dst,
+            condition,
+            when_true: true_value,
+            when_false: false_value,
+        });
+        pb.jump(done);
+
+        pb.bind(when_true_label);
+        let value = self.gen_expr(when_true, pb);
+        pb.emit(Inst::Mov { dst, src: value });
+        pb.jump(done);
+
+        pb.bind(when_false_label);
+        let value = self.gen_expr(when_false, pb);
+        pb.emit(Inst::Mov { dst, src: value });
+        pb.bind(done);
+        dst
+    }
+
+    fn expression_needs_context(expression: &Expr) -> bool {
+        match expression {
+            Expr::Fill(_) | Expr::Conditional { .. } => true,
+            Expr::Unary { operand, .. } => Self::expression_needs_context(operand),
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::expression_needs_context(lhs) || Self::expression_needs_context(rhs)
+            }
+            Expr::Index { base, index } => {
+                Self::expression_needs_context(base) || Self::expression_needs_context(index)
+            }
+            Expr::PartSelect { base, left, right } => {
+                Self::expression_needs_context(base)
+                    || Self::expression_needs_context(left)
+                    || Self::expression_needs_context(right)
+            }
+            Expr::Concat(parts) => parts.iter().any(Self::expression_needs_context),
+            Expr::Call { args, .. }
+            | Expr::StaticCall { args, .. }
+            | Expr::New { args }
+            | Expr::SysCall { args, .. } => args.iter().any(Self::expression_needs_context),
+            Expr::Field { obj, .. } => Self::expression_needs_context(obj),
+            Expr::MethodCall { obj, args, .. } => {
+                Self::expression_needs_context(obj)
+                    || args.iter().any(Self::expression_needs_context)
+            }
+            Expr::Literal(_)
+            | Expr::Str(_)
+            | Expr::Ref(_)
+            | Expr::StaticRef { .. }
+            | Expr::Null => false,
+        }
+    }
+
+    fn is_integral_context_expression(expression: &Expr) -> bool {
+        match expression {
+            Expr::Literal(_) | Expr::Fill(_) | Expr::Ref(_) => true,
+            Expr::Unary { operand, .. } => Self::is_integral_context_expression(operand),
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::is_integral_context_expression(lhs)
+                    && Self::is_integral_context_expression(rhs)
+            }
+            Expr::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                Self::is_integral_context_expression(condition)
+                    && Self::is_integral_context_expression(when_true)
+                    && Self::is_integral_context_expression(when_false)
+            }
+            Expr::Call { args, .. } => args.iter().all(Self::is_integral_context_expression),
+            Expr::Index { base, index } => {
+                Self::is_integral_context_expression(base)
+                    && Self::is_integral_context_expression(index)
+            }
+            Expr::PartSelect { base, left, right } => {
+                Self::is_integral_context_expression(base)
+                    && Self::is_integral_context_expression(left)
+                    && Self::is_integral_context_expression(right)
+            }
+            Expr::Concat(parts) => parts.iter().all(Self::is_integral_context_expression),
+            Expr::SysCall { name, args } => {
+                matches!(name.as_str(), "$realtime" | "$time" | "$stime" | "$cast")
+                    && args.iter().all(Self::is_integral_context_expression)
+            }
+            Expr::Str(_)
+            | Expr::Field { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::StaticRef { .. }
+            | Expr::New { .. }
+            | Expr::Null => false,
         }
     }
 
@@ -2126,6 +2579,9 @@ impl<'a> CodeGen<'a> {
                     });
                 } else {
                     let init = match &v.init {
+                        Some(e) if Self::expression_needs_context(e) => {
+                            self.gen_expr_at_width(e, v.width.max(1), pb)
+                        }
                         Some(e) => self.gen_expr(e, pb),
                         None => {
                             // 2-state default is 0.
@@ -2185,12 +2641,12 @@ impl<'a> CodeGen<'a> {
                         self.gen_new(&lhs.name, args, pb);
                     }
                 } else {
-                    let r = self.gen_expr(rhs, pb);
+                    let r = self.gen_assignment_rhs(lhs, rhs, pb);
                     self.gen_assign_lvalue(lhs, r, false, pb);
                 }
             }
             Stmt::Nonblocking { lhs, rhs } => {
-                let r = self.gen_expr(rhs, pb);
+                let r = self.gen_assignment_rhs(lhs, rhs, pb);
                 self.gen_assign_lvalue(lhs, r, true, pb);
             }
             Stmt::If {
@@ -2482,6 +2938,12 @@ impl<'a> CodeGen<'a> {
                 pb.emit(Inst::LoadConst { dst, k });
                 dst
             }
+            Expr::Fill(bit) => {
+                let dst = pb.new_reg();
+                let k = pb.konst_logic(LogicVec::filled(*bit, 1));
+                pb.emit(Inst::LoadConst { dst, k });
+                dst
+            }
             Expr::Str(s) => {
                 let dst = pb.new_reg();
                 let k = pb.konst(Value::Str(Rc::from(s.as_str())));
@@ -2569,6 +3031,11 @@ impl<'a> CodeGen<'a> {
                 pb.emit(inst);
                 dst
             }
+            Expr::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => self.gen_generic_conditional(condition, when_true, when_false, pb),
             Expr::Call { name, args } => {
                 if self.method_of_ctx(name) {
                     // Class-scope lookup precedes compilation-unit functions:
@@ -3185,6 +3652,14 @@ impl<'a> CodeGen<'a> {
         self.classes[cid as usize].static_fields.get(name).copied()
     }
 
+    fn static_field_width(&self, name: &str) -> Option<u32> {
+        let cid = self.class_ctx?;
+        self.classes[cid as usize]
+            .static_field_widths
+            .get(name)
+            .copied()
+    }
+
     /// The class id of a class-typed static field `name` of the current class.
     fn static_field_class(&self, name: &str) -> Option<u32> {
         let cid = self.class_ctx?;
@@ -3477,6 +3952,83 @@ impl<'a> CodeGen<'a> {
         }
     }
 
+    fn gen_assignment_rhs(&mut self, lhs: &Lvalue, rhs: &Expr, pb: &mut ProgramBuilder) -> Reg {
+        if Self::expression_needs_context(rhs) && Self::is_integral_context_expression(rhs) {
+            if let Some(width) = self.lvalue_width(lhs) {
+                return self.gen_expr_at_width(rhs, width, pb);
+            }
+        }
+        self.gen_expr(rhs, pb)
+    }
+
+    fn lvalue_width(&self, lhs: &Lvalue) -> Option<u32> {
+        if lhs.index.is_some() {
+            return None;
+        }
+        if let Some(scope) = &lhs.scope {
+            let class = self.resolve_class(scope)?;
+            if self.classes[class as usize]
+                .static_field_class
+                .contains_key(&lhs.name)
+                || self.classes[class as usize]
+                    .static_field_coll
+                    .contains_key(&lhs.name)
+            {
+                return None;
+            }
+            return self.classes[class as usize]
+                .static_field_widths
+                .get(&lhs.name)
+                .copied();
+        }
+        if let Some(receiver) = &lhs.receiver {
+            let class = self.try_class_of(receiver)?;
+            if self.classes[class as usize]
+                .field_class
+                .contains_key(&lhs.name)
+                || self.classes[class as usize]
+                    .field_coll
+                    .contains_key(&lhs.name)
+                || self.classes[class as usize]
+                    .field_events
+                    .contains(&lhs.name)
+            {
+                return None;
+            }
+            return self.classes[class as usize]
+                .field_slot
+                .get(&lhs.name)
+                .map(|(_, width)| *width);
+        }
+        if self.local_classes.contains_key(&lhs.name)
+            || self.local_colls.contains_key(&lhs.name)
+            || self.local_events.contains(&lhs.name)
+            || self.field_class(&lhs.name).is_some()
+            || self.class_ctx.is_some_and(|class| {
+                self.classes[class as usize]
+                    .field_coll
+                    .contains_key(&lhs.name)
+            })
+            || self.static_field_class(&lhs.name).is_some()
+            || self.class_ctx.is_some_and(|class| {
+                self.classes[class as usize]
+                    .static_field_coll
+                    .contains_key(&lhs.name)
+            })
+            || self.globals.class.contains_key(&lhs.name)
+            || self.globals.coll.contains_key(&lhs.name)
+        {
+            return None;
+        }
+        self.locals
+            .get(&lhs.name)
+            .map(|(_, width)| *width)
+            .or_else(|| self.class_field(&lhs.name).map(|(_, width)| width))
+            .or_else(|| self.static_field_width(&lhs.name))
+            .or_else(|| self.globals.widths.get(&lhs.name).copied())
+            .or_else(|| self.nets.get(&lhs.name).map(|(_, width)| *width))
+    }
+
     /// Assign `src` to `name` (a local move, a class-field write, or a net write).
     fn gen_assign(&mut self, name: &str, src: Reg, nonblocking: bool, pb: &mut ProgramBuilder) {
         if let Some((reg, _)) = self.locals.get(name).copied() {
@@ -3567,9 +4119,31 @@ fn const_eval_with(e: &Expr, consts: &HashMap<String, LogicVec>) -> LogicVec {
     try_const_eval_with(e, consts).unwrap_or_else(|| LogicVec::zero(32))
 }
 
+fn try_const_eval_at_width(
+    expression: &Expr,
+    consts: &HashMap<String, LogicVec>,
+    width: u32,
+    signed: bool,
+) -> Option<LogicVec> {
+    match expression {
+        Expr::Fill(bit) => Some(LogicVec::filled(*bit, width)),
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => Some(LogicVec::conditional(
+            &try_const_eval_with(condition, consts)?,
+            &try_const_eval_at_width(when_true, consts, width, signed)?,
+            &try_const_eval_at_width(when_false, consts, width, signed)?,
+        )),
+        _ => Some(try_const_eval_with(expression, consts)?.resize(width, signed)),
+    }
+}
+
 fn try_const_eval_with(e: &Expr, consts: &HashMap<String, LogicVec>) -> Option<LogicVec> {
     match e {
         Expr::Literal(lv) => Some(lv.clone()),
+        Expr::Fill(bit) => Some(LogicVec::filled(*bit, 1)),
         Expr::Ref(name) => consts.get(name).cloned(),
         Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Field { .. } | Expr::New { .. } => None,
         Expr::Str(_)
@@ -3637,6 +4211,20 @@ fn try_const_eval_with(e: &Expr, consts: &HashMap<String, LogicVec>) -> Option<L
                 BinOp::LogAnd => LogicVec::from_u64((l.is_true() && r.is_true()) as u64, 1),
                 BinOp::LogOr => LogicVec::from_u64((l.is_true() || r.is_true()) as u64, 1),
             })
+        }
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            let when_true_value = try_const_eval_with(when_true, consts)?;
+            let when_false_value = try_const_eval_with(when_false, consts)?;
+            let width = when_true_value.width().max(when_false_value.width());
+            Some(LogicVec::conditional(
+                &try_const_eval_with(condition, consts)?,
+                &try_const_eval_at_width(when_true, consts, width, false)?,
+                &try_const_eval_at_width(when_false, consts, width, false)?,
+            ))
         }
     }
 }

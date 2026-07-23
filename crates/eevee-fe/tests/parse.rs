@@ -262,6 +262,35 @@ fn parses_continuous_assignments() {
 }
 
 #[test]
+fn parses_conditional_continuous_driver_release() {
+    let src = "module top;\n\
+      logic enable;\n\
+      logic [3:0] data;\n\
+      wire [3:0] bus;\n\
+    assign bus = enable ? data : 'z;\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conditional driver parses");
+    let rhs = module(&file)
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ModuleItem::ContinuousAssign { rhs, .. } => Some(rhs),
+            _ => None,
+        })
+        .expect("continuous assignment");
+    assert!(matches!(
+        rhs,
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } if matches!(&**condition, Expr::Ref(name) if name == "enable")
+            && matches!(&**when_true, Expr::Ref(name) if name == "data")
+            && matches!(&**when_false, Expr::Fill(eevee_core::Bit::Z))
+    ));
+}
+
+#[test]
 fn parses_resolved_net_types() {
     let src = "module top;\n\
       wire wire_net;\n\
@@ -746,6 +775,11 @@ fn package_parameter_constant_expressions_are_evaluated() {
       parameter int COPY = (1 << 0);\n\
       parameter int RECORD = (1 << 6);\n\
       parameter int COMBINED = (4 | 16);\n\
+    parameter int CHOSEN = (1 ? 5 : 9);\n\
+    parameter int FILLED = '1;\n\
+    parameter logic [3:0] NIBBLE = '1;\n\
+    parameter int BASE = 0;\n\
+    parameter int FROM_BASE = (BASE ? 5 : 9);\n\
     endpackage\n";
     let file = parse_source(src).expect("verible parse");
     let Item::Package(package) = &file.items[0] else {
@@ -762,6 +796,10 @@ fn package_parameter_constant_expressions_are_evaluated() {
     assert_eq!(constants["COPY"], 1);
     assert_eq!(constants["RECORD"], 64);
     assert_eq!(constants["COMBINED"], 20);
+    assert_eq!(constants["CHOSEN"], 5);
+    assert_eq!(constants["FILLED"], u32::MAX as u64);
+    assert_eq!(constants["NIBBLE"], 15);
+    assert_eq!(constants["FROM_BASE"], 9);
 }
 
 #[test]

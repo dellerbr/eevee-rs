@@ -373,6 +373,32 @@ impl LogicVec {
         }
     }
 
+    /// SystemVerilog conditional selection, including bitwise branch merging
+    /// when the condition is indeterminate.
+    pub fn conditional(
+        condition: &LogicVec,
+        when_true: &LogicVec,
+        when_false: &LogicVec,
+    ) -> LogicVec {
+        let width = when_true.width().max(when_false.width());
+        if condition.is_true() {
+            return when_true.resize(width, false);
+        }
+        if condition.is_known() {
+            return when_false.resize(width, false);
+        }
+        let when_true = when_true.resize(width, false);
+        let when_false = when_false.resize(width, false);
+        let mut merged = LogicVec::x(width);
+        for bit in 0..width {
+            let true_bit = when_true.get_bit(bit);
+            if true_bit == when_false.get_bit(bit) {
+                merged.set_bit(bit, true_bit);
+            }
+        }
+        merged
+    }
+
     /// Read a single bit.
     pub fn get_bit(&self, idx: u32) -> Bit {
         if idx >= self.width {
@@ -592,6 +618,16 @@ impl LogicVec {
             Bit::Zero => LogicVec::from_u64(0, 1),
             Bit::One => LogicVec::from_u64(1, 1),
             Bit::X | Bit::Z => LogicVec::x(1),
+        }
+    }
+
+    /// A vector of `width` copies of one four-state bit.
+    pub fn filled(bit: Bit, width: u32) -> LogicVec {
+        match bit {
+            Bit::Zero => LogicVec::zero(width),
+            Bit::One => LogicVec::ones(width),
+            Bit::X => LogicVec::x(width),
+            Bit::Z => LogicVec::z(width),
         }
     }
 
@@ -996,6 +1032,50 @@ impl fmt::Debug for LogicVec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditional_selects_and_merges_four_state_values() {
+        let when_true = LogicVec::parse_sized("4'b10z1").unwrap();
+        let when_false = LogicVec::parse_sized("4'b10z0").unwrap();
+        assert_eq!(
+            LogicVec::conditional(&LogicVec::from_u64(1, 1), &when_true, &when_false),
+            when_true
+        );
+        assert_eq!(
+            LogicVec::conditional(&LogicVec::zero(1), &when_true, &when_false),
+            when_false
+        );
+        let merged = LogicVec::conditional(&LogicVec::x(1), &when_true, &when_false);
+        assert_eq!(merged.get_bit(0), Bit::X);
+        assert_eq!(merged.get_bit(1), Bit::Z);
+        assert_eq!(merged.get_bit(2), Bit::Zero);
+        assert_eq!(merged.get_bit(3), Bit::One);
+
+        let equal_unknown = LogicVec::conditional(
+            &LogicVec::z(2),
+            &LogicVec::parse_sized("2'bxz").unwrap(),
+            &LogicVec::parse_sized("2'bxz").unwrap(),
+        );
+        assert_eq!(equal_unknown.get_bit(0), Bit::Z);
+        assert_eq!(equal_unknown.get_bit(1), Bit::X);
+
+        let unequal_width = LogicVec::conditional(
+            &LogicVec::x(1),
+            &LogicVec::from_u64(1, 1),
+            &LogicVec::from_u64(0b1010, 4),
+        );
+        assert_eq!(unequal_width.width(), 4);
+        assert_eq!(unequal_width.get_bit(0), Bit::X);
+        assert_eq!(unequal_width.get_bit(1), Bit::X);
+        assert_eq!(unequal_width.get_bit(2), Bit::Zero);
+        assert_eq!(unequal_width.get_bit(3), Bit::X);
+
+        let partly_unknown_true = LogicVec::parse_sized("2'bx1").unwrap();
+        assert_eq!(
+            LogicVec::conditional(&partly_unknown_true, &when_true, &when_false),
+            when_true
+        );
+    }
 
     #[test]
     fn logicvec_stays_small() {

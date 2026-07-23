@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 176 tests.
+- `cargo test --workspace` passes all 181 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -99,6 +99,11 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   transitions complete independently, changed requests cancel only their bit,
   identical requests retain their deadlines, and fully canceled events are
   pruned before time advancement. Zero-delay bits apply immediately.
+- Integral conditional expressions implement four-state branch merging and
+  lazy known-branch execution. Unbased unsized `'0`/`'1`/`'x`/`'z` fills
+  destination context. Static continuous drivers withdraw by producing Z;
+  strict tests cover tri-state contention, takeover, implicit-pull fallback,
+  strengths, direct withdrawal, and delayed inertial cancellation.
 - Internal net declarations accept the same one-, two-, and three-value delay
   forms as known nonnegative parameter expressions. A distinct post-resolution
   net-delay stage tracks inertial generations per bit, so multi-driver
@@ -137,9 +142,10 @@ not claimed.
 
 ## Next Priorities
 
-1. Extend continuous connectivity with driver release and cross-resolution port
-  bridges. Then extend module parameters into parameter-dependent packed widths
-  and complete value typing/coercion.
+1. Extend continuous connectivity with cross-resolution port bridges. Then
+  extend module parameters into parameter-dependent packed widths and complete
+  value typing/coercion. Keep procedural `assign/deassign` and `force/release`
+  as separate runtime milestones; static Z withdrawal is already supported.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime

@@ -218,7 +218,8 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
         }
         validate_continuous_expr(module, rhs)?;
         let target_width = module_signal_width(module, &lhs.name).expect("validated net target");
-        let Some(rhs_width) = continuous_expr_width(module, rhs) else {
+        let Some(rhs_width) = continuous_expr_width_with_context(module, rhs, Some(target_width))
+        else {
             return unsupported(format!(
                 "continuous assignment expression width is not statically known in module '{}'",
                 module.name
@@ -246,34 +247,63 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
 }
 
 fn continuous_expr_width(module: &Module, expr: &Expr) -> Option<u32> {
+    continuous_expr_width_with_context(module, expr, None)
+}
+
+fn continuous_expr_width_with_context(
+    module: &Module,
+    expr: &Expr,
+    context_width: Option<u32>,
+) -> Option<u32> {
     match expr {
         Expr::Literal(value) => Some(value.width()),
+        Expr::Fill(_) => context_width,
         Expr::Ref(name) => module_signal_width(module, name),
         Expr::Unary { op, operand } => match op {
             UnaryOp::LogNot | UnaryOp::ReduceAnd | UnaryOp::ReduceOr | UnaryOp::ReduceXor => {
                 Some(1)
             }
             UnaryOp::BitNot | UnaryOp::Neg | UnaryOp::Plus => {
-                continuous_expr_width(module, operand)
+                continuous_expr_width_with_context(module, operand, context_width)
             }
         },
-        Expr::Binary { op, lhs, rhs } => {
-            let left = continuous_expr_width(module, lhs)?;
-            let right = continuous_expr_width(module, rhs)?;
-            Some(match op {
-                BinOp::Eq
-                | BinOp::Neq
-                | BinOp::Lt
-                | BinOp::Gt
-                | BinOp::Le
-                | BinOp::Ge
-                | BinOp::LogAnd
-                | BinOp::LogOr => 1,
-                BinOp::Shl | BinOp::Shr => left,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor => {
-                    left.max(right)
-                }
-            })
+        Expr::Binary { op, lhs, rhs } => match op {
+            BinOp::Eq
+            | BinOp::Neq
+            | BinOp::Lt
+            | BinOp::Gt
+            | BinOp::Le
+            | BinOp::Ge
+            | BinOp::LogAnd
+            | BinOp::LogOr => {
+                let left = continuous_expr_width(module, lhs);
+                let right = continuous_expr_width(module, rhs);
+                let operand_width = match (left, right) {
+                    (Some(left), Some(right)) => left.max(right),
+                    (Some(width), None) | (None, Some(width)) => width,
+                    (None, None) => 1,
+                };
+                continuous_expr_width_with_context(module, lhs, Some(operand_width))?;
+                continuous_expr_width_with_context(module, rhs, Some(operand_width))?;
+                Some(1)
+            }
+            BinOp::Shl | BinOp::Shr => {
+                continuous_expr_width_with_context(module, lhs, context_width)
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor => {
+                let left = continuous_expr_width_with_context(module, lhs, context_width)?;
+                let right = continuous_expr_width_with_context(module, rhs, context_width)?;
+                Some(left.max(right))
+            }
+        },
+        Expr::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => {
+            let when_true = continuous_expr_width_with_context(module, when_true, context_width)?;
+            let when_false = continuous_expr_width_with_context(module, when_false, context_width)?;
+            (when_true == when_false).then_some(when_true)
         }
         Expr::Index { .. } => Some(1),
         Expr::PartSelect { left, right, .. } => {
@@ -297,7 +327,7 @@ fn continuous_expr_width(module: &Module, expr: &Expr) -> Option<u32> {
 
 fn validate_continuous_expr(module: &Module, expr: &Expr) -> Result<(), ElabError> {
     match expr {
-        Expr::Literal(_) => Ok(()),
+        Expr::Literal(_) | Expr::Fill(_) => Ok(()),
         Expr::Ref(name)
             if module_signal_width(module, name).is_some()
                 && !module_signal_signed(module, name) =>
@@ -308,6 +338,24 @@ fn validate_continuous_expr(module: &Module, expr: &Expr) -> Result<(), ElabErro
         Expr::Binary { lhs, rhs, .. } => {
             validate_continuous_expr(module, lhs)?;
             validate_continuous_expr(module, rhs)
+        }
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            validate_continuous_expr(module, condition)?;
+            validate_continuous_expr(module, when_true)?;
+            validate_continuous_expr(module, when_false)?;
+            let true_width = continuous_expr_width(module, when_true);
+            let false_width = continuous_expr_width(module, when_false);
+            if true_width.is_some() && false_width.is_some() && true_width != false_width {
+                return unsupported(format!(
+                    "continuous conditional branch width mismatch in module '{}'",
+                    module.name
+                ));
+            }
+            Ok(())
         }
         Expr::Index { base, index } => {
             validate_continuous_expr(module, base)?;
@@ -860,6 +908,23 @@ fn validate_expr(expr: &Expr) -> Result<(), ElabError> {
             validate_expr(lhs)?;
             validate_expr(rhs)?;
         }
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            if !is_integral_conditional_operand(condition)
+                || !is_integral_conditional_operand(when_true)
+                || !is_integral_conditional_operand(when_false)
+            {
+                return unsupported(
+                    "non-integral conditional expressions are unsupported".to_string(),
+                );
+            }
+            validate_expr(condition)?;
+            validate_expr(when_true)?;
+            validate_expr(when_false)?;
+        }
         Expr::Call { args, .. } | Expr::New { args } => validate_exprs(args)?,
         Expr::Field { obj, .. } => validate_expr(obj)?,
         Expr::MethodCall { obj, args, .. } => {
@@ -896,9 +961,49 @@ fn validate_expr(expr: &Expr) -> Result<(), ElabError> {
             validate_exprs(args)?;
         }
         Expr::StaticRef { class_name, .. } => validate_type(Some(class_name))?,
-        Expr::Literal(_) | Expr::Str(_) | Expr::Ref(_) | Expr::Null => {}
+        Expr::Literal(_) | Expr::Fill(_) | Expr::Str(_) | Expr::Ref(_) | Expr::Null => {}
     }
     Ok(())
+}
+
+fn is_integral_conditional_operand(expression: &Expr) -> bool {
+    match expression {
+        Expr::Literal(_) | Expr::Fill(_) | Expr::Ref(_) => true,
+        Expr::Unary { operand, .. } => is_integral_conditional_operand(operand),
+        Expr::Binary { lhs, rhs, .. } => {
+            is_integral_conditional_operand(lhs) && is_integral_conditional_operand(rhs)
+        }
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            is_integral_conditional_operand(condition)
+                && is_integral_conditional_operand(when_true)
+                && is_integral_conditional_operand(when_false)
+        }
+        Expr::Call { args, .. } => args.iter().all(is_integral_conditional_operand),
+        Expr::Index { base, index } => {
+            is_integral_conditional_operand(base) && is_integral_conditional_operand(index)
+        }
+        Expr::PartSelect { base, left, right } => {
+            is_integral_conditional_operand(base)
+                && is_integral_conditional_operand(left)
+                && is_integral_conditional_operand(right)
+        }
+        Expr::Concat(parts) => parts.iter().all(is_integral_conditional_operand),
+        Expr::SysCall { name, args } => {
+            matches!(name.as_str(), "$realtime" | "$time" | "$stime" | "$cast")
+                && args.iter().all(is_integral_conditional_operand)
+        }
+        Expr::Str(_)
+        | Expr::Field { .. }
+        | Expr::MethodCall { .. }
+        | Expr::StaticCall { .. }
+        | Expr::StaticRef { .. }
+        | Expr::New { .. }
+        | Expr::Null => false,
+    }
 }
 
 fn validate_exprs(expressions: &[Expr]) -> Result<(), ElabError> {
@@ -910,13 +1015,22 @@ fn validate_exprs(expressions: &[Expr]) -> Result<(), ElabError> {
 
 fn is_constant_expr(expr: &Expr, module_parameters: Option<&HashSet<&str>>) -> bool {
     match expr {
-        Expr::Literal(_) => true,
+        Expr::Literal(_) | Expr::Fill(_) => true,
         Expr::Ref(name) => {
             module_parameters.is_some_and(|parameters| parameters.contains(name.as_str()))
         }
         Expr::Unary { operand, .. } => is_constant_expr(operand, module_parameters),
         Expr::Binary { lhs, rhs, .. } => {
             is_constant_expr(lhs, module_parameters) && is_constant_expr(rhs, module_parameters)
+        }
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            is_constant_expr(condition, module_parameters)
+                && is_constant_expr(when_true, module_parameters)
+                && is_constant_expr(when_false, module_parameters)
         }
         Expr::PartSelect { base, left, right } => {
             is_constant_expr(base, module_parameters)
@@ -932,11 +1046,20 @@ fn is_constant_expr(expr: &Expr, module_parameters: Option<&HashSet<&str>>) -> b
 
 fn is_parameter_constant_expr(expr: &Expr, visible: &HashSet<&str>) -> bool {
     match expr {
-        Expr::Literal(_) => true,
+        Expr::Literal(_) | Expr::Fill(_) => true,
         Expr::Ref(name) => visible.contains(name.as_str()),
         Expr::Unary { operand, .. } => is_parameter_constant_expr(operand, visible),
         Expr::Binary { lhs, rhs, .. } => {
             is_parameter_constant_expr(lhs, visible) && is_parameter_constant_expr(rhs, visible)
+        }
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            is_parameter_constant_expr(condition, visible)
+                && is_parameter_constant_expr(when_true, visible)
+                && is_parameter_constant_expr(when_false, visible)
         }
         Expr::PartSelect { base, left, right } => {
             is_parameter_constant_expr(base, visible)

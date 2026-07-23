@@ -14,7 +14,7 @@
 //! * `children` arrays contain `null` holes (`kids` skips them).
 
 use eevee_ast::*;
-use eevee_core::LogicVec;
+use eevee_core::{Bit, LogicVec};
 use std::collections::HashMap;
 
 use crate::cst::{const_int, find, find_deep, kids, leaf_op, tag, text};
@@ -62,6 +62,7 @@ fn lower_module_item(
     item: &Value,
     out: &mut Vec<ModuleItem>,
     strengths: &HashMap<u64, DriveStrengthSpec>,
+    constants: &mut HashMap<String, LogicVec>,
 ) {
     match tag(item) {
         "kDataDeclaration" => {
@@ -88,7 +89,8 @@ fn lower_module_item(
         "kClassDeclaration" => out.push(ModuleItem::Class(Box::new(lower_class(item)))),
         // `localparam`/`parameter NAME = value;` -> a named constant.
         "kParamDeclaration" => {
-            if let Some((name, value)) = param_const_pair(item) {
+            if let Some((name, value)) = param_const_pair(item, constants) {
+                constants.insert(name.clone(), value.clone());
                 out.push(ModuleItem::EnumConst { name, value });
             }
         }
@@ -97,7 +99,13 @@ fn lower_module_item(
         // class (see `lower_struct_typedef`); `typedef <Class>#(...) <alias>;`
         // contributes a type alias.
         "kTypeDeclaration" => {
+            let before = out.len();
             lower_enum_consts(item, out);
+            for item in &out[before..] {
+                if let ModuleItem::EnumConst { name, value } = item {
+                    constants.insert(name.clone(), value.clone());
+                }
+            }
             if let Some(sd) = lower_struct_typedef(item) {
                 out.push(ModuleItem::Class(Box::new(sd)));
             } else if let Some(alias) = lower_class_typedef(item) {
@@ -107,7 +115,7 @@ fn lower_module_item(
         // List wrappers — descend.
         "kModuleItemList" | "kPackageItemList" | "kClassItems" => {
             for it in kids(item) {
-                lower_module_item(it, out, strengths);
+                lower_module_item(it, out, strengths, constants);
             }
         }
         _ => {} // unsupported item — skipped for this subset
@@ -202,17 +210,22 @@ fn enum_const_pairs(n: &Value) -> Vec<(String, LogicVec)> {
 /// Evaluate the initializer expression rather than taking its first numeric
 /// leaf: UVM's operation flags are parameters such as `(1 << 6)`, and reducing
 /// every one to `1` makes unrelated bit flags alias each other at runtime.
-fn param_const_pair(n: &Value) -> Option<(String, LogicVec)> {
+fn param_const_pair(
+    n: &Value,
+    constants: &HashMap<String, LogicVec>,
+) -> Option<(String, LogicVec)> {
     let pt = find(n, "kParamType")?;
     let name = find(pt, "SymbolIdentifier").map(text)?.to_string();
     if name.is_empty() {
         return None;
     }
-    let value = find_deep(n, "kTrailingAssign")
+    let expression = find_deep(n, "kTrailingAssign")
         .and_then(|assign| find(assign, "kExpression"))
-        .map(lower_expr)
+        .map(lower_expr);
+    let (width, signed) = module_parameter_type(pt).unwrap_or((32, false));
+    let value = expression
         .as_ref()
-        .and_then(eval_const_expr)
+        .and_then(|expression| eval_const_expr_at_width(expression, constants, width, signed))
         .or_else(|| const_int(n).map(|value| LogicVec::from_i64(value, 32)))
         .unwrap_or_else(|| LogicVec::zero(32));
     Some((name, value))
@@ -223,11 +236,13 @@ fn param_const_pair(n: &Value) -> Option<(String, LogicVec)> {
 /// dependency resolution belongs in a later constant-table pass), but literal,
 /// unary, arithmetic, bitwise, shift, comparison, and logical expressions are
 /// exact and retain four-state behavior through [`LogicVec`].
-fn eval_const_expr(expr: &Expr) -> Option<LogicVec> {
+fn eval_const_expr(expr: &Expr, constants: &HashMap<String, LogicVec>) -> Option<LogicVec> {
     match expr {
         Expr::Literal(value) => Some(value.clone()),
+        Expr::Fill(bit) => Some(LogicVec::filled(*bit, 32)),
+        Expr::Ref(name) => constants.get(name).cloned(),
         Expr::Unary { op, operand } => {
-            let value = eval_const_expr(operand)?;
+            let value = eval_const_expr(operand, constants)?;
             Some(match op {
                 UnaryOp::BitNot => value.bitnot(),
                 UnaryOp::LogNot => value.lognot(),
@@ -239,8 +254,8 @@ fn eval_const_expr(expr: &Expr) -> Option<LogicVec> {
             })
         }
         Expr::Binary { op, lhs, rhs } => {
-            let left = eval_const_expr(lhs)?;
-            let right = eval_const_expr(rhs)?;
+            let left = eval_const_expr(lhs, constants)?;
+            let right = eval_const_expr(rhs, constants)?;
             Some(match op {
                 BinOp::Add => left.add(&right),
                 BinOp::Sub => left.sub(&right),
@@ -260,7 +275,37 @@ fn eval_const_expr(expr: &Expr) -> Option<LogicVec> {
                 BinOp::LogOr => LogicVec::from_u64((left.is_true() || right.is_true()) as u64, 1),
             })
         }
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => Some(LogicVec::conditional(
+            &eval_const_expr(condition, constants)?,
+            &eval_const_expr(when_true, constants)?,
+            &eval_const_expr(when_false, constants)?,
+        )),
         _ => None,
+    }
+}
+
+fn eval_const_expr_at_width(
+    expression: &Expr,
+    constants: &HashMap<String, LogicVec>,
+    width: u32,
+    signed: bool,
+) -> Option<LogicVec> {
+    match expression {
+        Expr::Fill(bit) => Some(LogicVec::filled(*bit, width)),
+        Expr::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => Some(LogicVec::conditional(
+            &eval_const_expr(condition, constants)?,
+            &eval_const_expr_at_width(when_true, constants, width, signed)?,
+            &eval_const_expr_at_width(when_false, constants, width, signed)?,
+        )),
+        _ => Some(eval_const_expr(expression, constants)?.resize(width, signed)),
     }
 }
 
@@ -272,9 +317,10 @@ fn lower_module(n: &Value, strengths: &HashMap<u64, DriveStrengthSpec>) -> Modul
         .to_string();
 
     let mut items = Vec::new();
+    let mut constants = HashMap::new();
     if let Some(list) = find(n, "kModuleItemList") {
         for item in kids(list) {
-            lower_module_item(item, &mut items, strengths);
+            lower_module_item(item, &mut items, strengths, &mut constants);
         }
     }
 
@@ -434,12 +480,13 @@ fn lower_package(n: &Value, strengths: &HashMap<u64, DriveStrengthSpec>) -> Pack
         .unwrap_or_default()
         .to_string();
     let mut items = Vec::new();
+    let mut constants = HashMap::new();
     for item in kids(n) {
         // Skip the header/keywords; lower everything else (items are direct
         // children of the package declaration, possibly under a list wrapper).
         match tag(item) {
             "kPackageHeader" | "package" | "endpackage" | ";" => {}
-            _ => lower_module_item(item, &mut items, strengths),
+            _ => lower_module_item(item, &mut items, strengths, &mut constants),
         }
     }
     Package { name, items }
@@ -943,6 +990,7 @@ fn lower_class(n: &Value) -> ClassDecl {
     let mut type_aliases = Vec::new();
     let mut collection_aliases: Vec<CollectionAlias> = Vec::new();
     let mut consts: Vec<(String, LogicVec)> = Vec::new();
+    let mut constant_env: HashMap<String, LogicVec> = HashMap::new();
     if let Some(items) = find(n, "kClassItems") {
         for item in kids(items) {
             match tag(item) {
@@ -991,10 +1039,17 @@ fn lower_class(n: &Value) -> ClassDecl {
                         type_aliases.push(alias);
                     }
                     // `typedef enum {...}` members are class-scoped constants.
-                    consts.extend(enum_const_pairs(item));
+                    let members = enum_const_pairs(item);
+                    constant_env.extend(members.iter().cloned());
+                    consts.extend(members);
                 }
                 // `localparam`/`parameter NAME = value;` -> a named constant.
-                "kParamDeclaration" => consts.extend(param_const_pair(item)),
+                "kParamDeclaration" => {
+                    if let Some((name, value)) = param_const_pair(item, &constant_env) {
+                        constant_env.insert(name.clone(), value.clone());
+                        consts.push((name, value));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1683,7 +1738,16 @@ pub fn lower_expr(n: &Value) -> Expr {
             .next()
             .map(lower_expr)
             .unwrap_or(Expr::Literal(LogicVec::zero(32))),
-        "kNumber" => Expr::Literal(lower_number(n)),
+        "kNumber" => find(n, "TK_UnBasedNumber")
+            .and_then(|token| match text(token) {
+                "'0" => Some(Bit::Zero),
+                "'1" => Some(Bit::One),
+                "'x" | "'X" => Some(Bit::X),
+                "'z" | "'Z" => Some(Bit::Z),
+                _ => None,
+            })
+            .map(Expr::Fill)
+            .unwrap_or_else(|| Expr::Literal(lower_number(n))),
         "TK_StringLiteral" => Expr::Str(unquote(text(n))),
         // The `null` class-handle literal.
         "null" => Expr::Null,
@@ -1737,6 +1801,14 @@ pub fn lower_expr(n: &Value) -> Expr {
             } else {
                 // n-ary chain a+b+c... fold left-associatively.
                 fold_binary(&cs)
+            }
+        }
+        "kConditionExpression" => {
+            let children: Vec<_> = kids(n).collect();
+            Expr::Conditional {
+                condition: Box::new(lower_expr(children[0])),
+                when_true: Box::new(lower_expr(children[2])),
+                when_false: Box::new(lower_expr(children[4])),
             }
         }
         "kUnaryPrefixExpression" => {

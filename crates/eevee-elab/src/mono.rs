@@ -411,6 +411,15 @@ impl Mono {
                 self.subst_expr(lhs);
                 self.subst_expr(rhs);
             }
+            Expr::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                self.subst_expr(condition);
+                self.subst_expr(when_true);
+                self.subst_expr(when_false);
+            }
             Expr::Call { args, .. } => {
                 for a in args {
                     self.subst_expr(a);
@@ -447,7 +456,7 @@ impl Mono {
                     self.subst_expr(a);
                 }
             }
-            Expr::Literal(_) | Expr::Str(_) | Expr::Null => {}
+            Expr::Literal(_) | Expr::Fill(_) | Expr::Str(_) | Expr::Null => {}
         }
     }
 }

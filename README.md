@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 23, 2026:
 
-- 176 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 181 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -91,6 +91,11 @@ Validated on July 23, 2026:
 - Continuous assignments park on deduplicated RHS net read sets, so unrelated
   writes do not wake them. Generic multi-net waits invalidate and remove sibling
   registrations after the first source fires.
+- Integral conditional expressions implement four-state truth and branch-bit
+  merging. Unbased unsized `'0`/`'1`/`'x`/`'z` literals fill destination
+  context. A continuous driver can therefore withdraw by evaluating to Z;
+  contention, pull fallback, strengths, and delayed inertial withdrawal are
+  validated end to end.
 - Known nonnegative timescale-relative continuous assignment delays support
   one common value, rise/fall values, or rise/fall/turn-off values. Transition
   selection is per bit, two-value turn-off uses `min(rise, fall)`, short pulses
@@ -117,7 +122,8 @@ The current implementation includes:
 - Blocking/nonblocking assignments, delays, edge/event waits, and event-driven
   `wait(condition)` read sets, including procedural NBA expression events.
 - Packed bit/part selects, numeric concatenation, `do...while`, `break`, and
-  `continue` control flow.
+  `continue` control flow, integral conditional expressions, and context-filling
+  unbased unsized literals.
 - Register bytecode with suspendable process frames and recursive function/task
   calls.
 - Verible JSON-CST front end and recursive SystemVerilog preprocessing
@@ -151,6 +157,9 @@ The current implementation includes:
 - One-, two-, and three-value inertial continuous assignment delays with
   per-instance parameter expressions, per-bit transition selection, and
   zero-delay immediate application.
+- Static continuous-driver withdrawal by producing Z, including conditional
+  tri-state buses, multi-driver takeover, implicit-pull fallback, and delayed
+  inertial cancellation.
 - One-, two-, and three-value internal net-declaration delays applied after
   resolution, including mixed immediate/delayed bits and composition with
   continuous-assignment delays.
@@ -265,8 +274,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-     driver release, cross-resolution port bridges, hierarchical references,
-     and generate `if`/`case`/`for`.
+     cross-resolution port bridges, hierarchical references, and generate
+     `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -289,7 +298,7 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 5. **Concurrency and runtime primitives**
    - Full process handles/status/control, disable fork/named blocks, event
      trigger variants, wait fork/order, semaphore/mailbox fairness, named
-     events, force/release, procedural continuous assignment, and all scheduler
+     events, procedural `assign/deassign`, `force/release`, and all scheduler
      regions including observed/reactive/postponed behavior.
 
 6. **Randomization and constraints**
@@ -334,7 +343,9 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   procedural net writes, implicit width conversion, signed operands/targets,
   charge strengths, nondefault wired-net strengths, explicit-unit delay literals,
   dynamic/out-of-range RHS selects, partial/hierarchical targets, and driver
-  release remain unsupported in conformance mode.
+  mutation outside static continuous assignments remain unsupported in
+  conformance mode. Static drivers can withdraw by evaluating to Z; procedural
+  `assign/deassign` and `force/release` remain unsupported.
 - Module parameter support is limited to explicit or inherited bare 32-bit
   `int` value parameters in the module header, each with a default. Type
   parameters, non-`int` types, module-body parameter/localparam declarations,

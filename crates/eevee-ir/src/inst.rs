@@ -67,6 +67,13 @@ pub enum Inst {
     LoadConst { dst: Reg, k: ConstId },
     /// `dst = src`.
     Mov { dst: Reg, src: Reg },
+    /// Resize an integral value to a fixed width.
+    Resize {
+        dst: Reg,
+        src: Reg,
+        width: u32,
+        signed: bool,
+    },
     /// `dst = src` at an SV assignment boundary (arrays copy by value).
     Assign { dst: Reg, src: Reg },
     /// Queue `dst <= src` for the procedural-variable NBA region.
@@ -110,6 +117,15 @@ pub enum Inst {
     LogAnd { dst: Reg, a: Reg, b: Reg },
     /// `dst = a || b` — 1-bit logical OR (either operand truthy).
     LogOr { dst: Reg, a: Reg, b: Reg },
+    /// Four-state conditional selection and indeterminate branch merge.
+    Select {
+        dst: Reg,
+        condition: Reg,
+        when_true: Reg,
+        when_false: Reg,
+    },
+    /// `dst = !$isunknown(a)` as a one-bit internal predicate.
+    IsKnown { dst: Reg, a: Reg },
     /// `dst = !a` — 1-bit logical negation.
     LogNot { dst: Reg, a: Reg },
     /// `dst = -a` — two's-complement negation.
