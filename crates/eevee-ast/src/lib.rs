@@ -93,6 +93,23 @@ pub enum ContinuousDelay {
     },
 }
 
+/// One explicit drive-strength level in a continuous assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrengthLevel {
+    HighZ,
+    Weak,
+    Pull,
+    Strong,
+    Supply,
+}
+
+/// Separate strengths used when a continuous driver produces 0 or 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriveStrengthSpec {
+    pub zero: StrengthLevel,
+    pub one: StrengthLevel,
+}
+
 /// An item inside a module body.
 #[derive(Debug, Clone)]
 pub enum ModuleItem {
@@ -103,6 +120,7 @@ pub enum ModuleItem {
         lhs: Lvalue,
         rhs: Expr,
         delay: Option<ContinuousDelay>,
+        strength: Option<DriveStrengthSpec>,
     },
     Always(AlwaysBlock),
     Initial(Stmt),

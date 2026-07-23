@@ -218,7 +218,9 @@ fn parses_continuous_assignments() {
         .items
         .iter()
         .filter_map(|item| match item {
-            ModuleItem::ContinuousAssign { lhs, rhs, delay } => Some((lhs, rhs, delay)),
+            ModuleItem::ContinuousAssign {
+                lhs, rhs, delay, ..
+            } => Some((lhs, rhs, delay)),
             _ => None,
         })
         .collect();
@@ -300,7 +302,7 @@ fn parses_resolved_net_types() {
 }
 
 #[test]
-fn conformance_mode_accepts_resolved_and_implicit_strength_nets() {
+fn conformance_mode_accepts_resolved_nets_and_explicit_drive_strengths() {
     let supported = "module top; tri t; wand wa; triand ta; wor wo; trior to;\n\
                      tri0 t0; tri1 t1; supply0 s0; supply1 s1; endmodule";
     parse_source_conformant(supported).expect("resolved and implicit-strength nets supported");
@@ -313,21 +315,65 @@ fn conformance_mode_accepts_resolved_and_implicit_strength_nets() {
         FeError::UnsupportedSyntax { ref construct, .. } if construct == "tri"
     ));
 
-    let strength = "module top; logic source; wire result;\n\
-                    assign (strong1, strong0) result = source; endmodule";
-    let error = parse_source_conformant(strength).expect_err("drive strengths unsupported");
-    assert!(matches!(
-        error,
-        FeError::UnsupportedSyntax { ref construct, .. } if construct == "strong1"
-    ));
+    let strength_source = "module top; logic source; wire a, b, c, d, e;\n\
+            assign (strong1, pull0) a = source, e = source;\n\
+      assign (pull0, strong1) b = source;\n\
+      assign (supply1, supply0) c = source;\n\
+      assign (highz1, strong0) d = source;\n\
+    endmodule";
+    let file = parse_source_conformant(strength_source).expect("explicit strengths are supported");
+    let strengths: Vec<_> = module(&file)
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::ContinuousAssign { strength, .. } => *strength,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        strengths,
+        vec![
+            DriveStrengthSpec {
+                zero: StrengthLevel::Pull,
+                one: StrengthLevel::Strong,
+            },
+            DriveStrengthSpec {
+                zero: StrengthLevel::Pull,
+                one: StrengthLevel::Strong,
+            },
+            DriveStrengthSpec {
+                zero: StrengthLevel::Pull,
+                one: StrengthLevel::Strong,
+            },
+            DriveStrengthSpec {
+                zero: StrengthLevel::Supply,
+                one: StrengthLevel::Supply,
+            },
+            DriveStrengthSpec {
+                zero: StrengthLevel::Strong,
+                one: StrengthLevel::HighZ,
+            },
+        ]
+    );
 
-    let supply_strength = "module top; logic source; wire result;\n\
-                           assign (supply1, supply0) result = source; endmodule";
-    let error = parse_source_conformant(supply_strength)
-        .expect_err("supply drive strengths remain unsupported");
+    let permissive = parse_source(strength_source).expect("permissive strengths parse");
+    assert!(module(&permissive).items.iter().any(|item| matches!(
+        item,
+        ModuleItem::ContinuousAssign {
+            strength: Some(DriveStrengthSpec {
+                zero: StrengthLevel::Pull,
+                one: StrengthLevel::Strong,
+            }),
+            ..
+        }
+    )));
+
+    let charge_strength = "module top; trireg (small) stored; endmodule";
+    let error =
+        parse_source_conformant(charge_strength).expect_err("charge strengths remain unsupported");
     assert!(matches!(
         error,
-        FeError::UnsupportedSyntax { ref construct, .. } if construct == "supply1"
+        FeError::UnsupportedSyntax { ref construct, .. } if construct == "small"
     ));
 }
 

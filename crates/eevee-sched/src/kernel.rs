@@ -22,7 +22,9 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use eevee_core::{Bit, LogicVec, Region, SimTime, Timescale};
 
-use crate::net::{detect_edge, DriveDelay, DriveStrength, Net, NetDelay, NetResolution, Waiter};
+use crate::net::{
+    detect_edge, DriveDelay, DriveStrength, DriverStrengths, Net, NetDelay, NetResolution, Waiter,
+};
 use crate::process::{DriverId, EdgeKind, EventId, ForkJoin, NetId, ProcId, Process, Wait};
 
 #[derive(Clone, Copy)]
@@ -233,14 +235,27 @@ impl Kernel {
 
     /// Register a continuous driver with one symmetric 0/1 strength.
     pub fn new_driver_with_strength(&mut self, net: NetId, strength: DriveStrength) -> DriverId {
+        self.new_driver_with_strengths(net, strength, strength)
+    }
+
+    /// Register a continuous driver with separate logic-0 and logic-1 strengths.
+    pub fn new_driver_with_strengths(
+        &mut self,
+        net: NetId,
+        zero: DriveStrength,
+        one: DriveStrength,
+    ) -> DriverId {
         assert!(
-            self.nets[net.0].resolution == NetResolution::Wire || strength == DriveStrength::Strong,
+            self.nets[net.0].resolution == NetResolution::Wire
+                || (zero == DriveStrength::Strong && one == DriveStrength::Strong),
             "wired-AND/OR drivers currently require default strong strength"
         );
         let width = self.nets[net.0].value.width();
         let slot = self.nets[net.0].driver_values.len();
         self.nets[net.0].driver_values.push(LogicVec::z(width));
-        self.nets[net.0].driver_strengths.push(strength);
+        self.nets[net.0]
+            .driver_strengths
+            .push(DriverStrengths { zero, one });
         let id = DriverId(self.drivers.len());
         self.drivers.push(DriverTarget {
             net,
@@ -757,7 +772,7 @@ impl Kernel {
 
 fn resolve_drivers(
     drivers: &[LogicVec],
-    strengths: &[DriveStrength],
+    strengths: &[DriverStrengths],
     width: u32,
     resolution: NetResolution,
 ) -> LogicVec {
@@ -773,27 +788,167 @@ fn resolve_drivers(
     resolved
 }
 
-fn resolve_wire_bit(drivers: &[LogicVec], strengths: &[DriveStrength], bit: u32) -> Bit {
-    let mut zero: Option<DriveStrength> = None;
-    let mut one: Option<DriveStrength> = None;
-    for (driver, &strength) in drivers.iter().zip(strengths) {
-        match driver.get_bit(bit) {
-            Bit::Zero => zero = Some(zero.map_or(strength, |old| old.max(strength))),
-            Bit::One => one = Some(one.map_or(strength, |old| old.max(strength))),
-            Bit::X => {
-                zero = Some(zero.map_or(strength, |old| old.max(strength)));
-                one = Some(one.map_or(strength, |old| old.max(strength)));
-            }
-            Bit::Z => {}
+fn resolve_wire_bit(drivers: &[LogicVec], strengths: &[DriverStrengths], bit: u32) -> Bit {
+    drivers
+        .iter()
+        .zip(strengths)
+        .fold(StrengthValue::HIGH_Z, |resolved, (driver, strengths)| {
+            resolved.resolve(StrengthValue::new(driver.get_bit(bit), *strengths))
+        })
+        .bit()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StrengthPoint {
+    one: bool,
+    strength: u8,
+}
+
+impl StrengthPoint {
+    const HIGH_Z: Self = Self {
+        one: false,
+        strength: 0,
+    };
+
+    fn coordinate(self) -> i8 {
+        if self.one {
+            self.strength as i8
+        } else {
+            -(self.strength as i8)
         }
     }
-    match (zero, one) {
-        (None, None) => Bit::Z,
-        (Some(_), None) => Bit::Zero,
-        (None, Some(_)) => Bit::One,
-        (Some(zero), Some(one)) if zero > one => Bit::Zero,
-        (Some(zero), Some(one)) if one > zero => Bit::One,
-        _ => Bit::X,
+
+    fn from_coordinate(coordinate: i8) -> Self {
+        Self {
+            one: coordinate > 0,
+            strength: coordinate.unsigned_abs(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+// An X drive is a strength-qualified interval between its possible 0 and 1.
+// Resolution must retain both endpoints until the final four-state reduction.
+struct StrengthValue {
+    toward_zero: StrengthPoint,
+    toward_one: StrengthPoint,
+}
+
+impl StrengthValue {
+    const HIGH_Z: Self = Self {
+        toward_zero: StrengthPoint::HIGH_Z,
+        toward_one: StrengthPoint::HIGH_Z,
+    };
+
+    fn new(bit: Bit, strengths: DriverStrengths) -> Self {
+        let zero = strengths.zero as u8;
+        let one = strengths.one as u8;
+        if zero == 0 && one == 0 {
+            return Self::HIGH_Z;
+        }
+        let zero = StrengthPoint {
+            one: false,
+            strength: zero,
+        };
+        let one = StrengthPoint {
+            one: true,
+            strength: one,
+        };
+        match bit {
+            Bit::Zero => Self {
+                toward_zero: zero,
+                toward_one: zero,
+            },
+            Bit::One => Self {
+                toward_zero: one,
+                toward_one: one,
+            },
+            Bit::X => Self {
+                toward_zero: zero,
+                toward_one: one,
+            },
+            Bit::Z => Self::HIGH_Z,
+        }
+    }
+
+    fn bit(self) -> Bit {
+        if self.is_high_z() {
+            Bit::Z
+        } else if self.toward_zero.one == self.toward_one.one {
+            if self.toward_zero.one {
+                Bit::One
+            } else {
+                Bit::Zero
+            }
+        } else {
+            Bit::X
+        }
+    }
+
+    fn is_high_z(self) -> bool {
+        self.toward_zero.strength == 0 && self.toward_one.strength == 0
+    }
+
+    fn is_unambiguous(self) -> bool {
+        self.toward_zero == self.toward_one
+    }
+
+    fn resolve(self, other: Self) -> Self {
+        if self.is_high_z() {
+            return other;
+        }
+        if other.is_high_z() || self == other {
+            return self;
+        }
+        if self.is_unambiguous() && other.is_unambiguous() {
+            if other.toward_zero.strength > self.toward_zero.strength {
+                return other;
+            }
+            if other.toward_zero.strength == self.toward_zero.strength {
+                let (toward_zero, toward_one) = if self.toward_zero.one {
+                    (other.toward_zero, self.toward_one)
+                } else {
+                    (self.toward_zero, other.toward_one)
+                };
+                return Self {
+                    toward_zero,
+                    toward_one,
+                };
+            }
+            return self;
+        }
+        if self.is_unambiguous() {
+            return Self {
+                toward_zero: if self.toward_zero.strength > other.toward_zero.strength {
+                    self.toward_zero
+                } else {
+                    other.toward_zero
+                },
+                toward_one: if self.toward_one.strength > other.toward_one.strength {
+                    self.toward_one
+                } else {
+                    other.toward_one
+                },
+            };
+        }
+        if other.is_unambiguous() {
+            return other.resolve(self);
+        }
+
+        let coordinates = [
+            self.toward_zero.coordinate(),
+            self.toward_one.coordinate(),
+            other.toward_zero.coordinate(),
+            other.toward_one.coordinate(),
+        ];
+        Self {
+            toward_zero: StrengthPoint::from_coordinate(
+                *coordinates.iter().min().expect("four endpoints"),
+            ),
+            toward_one: StrengthPoint::from_coordinate(
+                *coordinates.iter().max().expect("four endpoints"),
+            ),
+        }
     }
 }
 

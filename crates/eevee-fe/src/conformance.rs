@@ -1,11 +1,20 @@
+use std::collections::{HashMap, HashSet};
+
 use serde_json::Value;
 
-use eevee_ast::Expr;
+use eevee_ast::{DriveStrengthSpec, Expr, StrengthLevel};
 
 use crate::cst::{const_int, find, find_deep, kids, leaf_op, tag, text, FeError};
 use crate::lower::lower_expr;
 
-pub(crate) fn validate(tree: &Value, tokens: &[Value], source: &str) -> Result<(), FeError> {
+pub(crate) type StrengthAnnotations = HashMap<u64, DriveStrengthSpec>;
+
+pub(crate) fn validate(
+    tree: &Value,
+    tokens: &[Value],
+    source: &str,
+) -> Result<StrengthAnnotations, FeError> {
+    let (strengths, consumed) = strength_annotations(tree, tokens, source)?;
     if let Some(strength) = tokens.iter().find(|token| {
         let token_tag = tag(token);
         matches!(
@@ -23,12 +32,105 @@ pub(crate) fn validate(tree: &Value, tokens: &[Value], source: &str) -> Result<(
                 | "large"
                 | "medium"
                 | "small"
-        ) && !(matches!(token_tag, "supply0" | "supply1")
-            && is_internal_supply_net_token(tree, token))
+        ) && !token
+            .get("start")
+            .and_then(Value::as_u64)
+            .is_some_and(|start| consumed.contains(&start))
+            && !(matches!(token_tag, "supply0" | "supply1")
+                && is_internal_supply_net_token(tree, token))
     }) {
         return unsupported(strength, source);
     }
-    validate_node(tree, source)
+    validate_node(tree, source)?;
+    Ok(strengths)
+}
+
+pub(crate) fn strength_annotations(
+    tree: &Value,
+    tokens: &[Value],
+    source: &str,
+) -> Result<(StrengthAnnotations, HashSet<u64>), FeError> {
+    let mut assign_offsets = HashSet::new();
+    collect_continuous_assign_offsets(tree, &mut assign_offsets);
+    let mut annotations = HashMap::new();
+    let mut consumed = HashSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Some(assign_start) = token.get("start").and_then(Value::as_u64) else {
+            continue;
+        };
+        if tag(token) != "assign" || !assign_offsets.contains(&assign_start) {
+            continue;
+        }
+        let Some(pair) = tokens.get(index + 1..index + 6) else {
+            continue;
+        };
+        if tag(&pair[0]) != "("
+            || tag(&pair[2]) != ","
+            || tag(&pair[4]) != ")"
+            || !is_drive_strength_token(&pair[1])
+            || !is_drive_strength_token(&pair[3])
+        {
+            continue;
+        }
+        let first = parse_strength_token(&pair[1]).expect("validated strength token");
+        let second = parse_strength_token(&pair[3]).expect("validated strength token");
+        if first.0 == second.0
+            || (first.1 == StrengthLevel::HighZ && second.1 == StrengthLevel::HighZ)
+        {
+            return unsupported(&pair[3], source);
+        }
+        let (zero, one) = if first.0 == 0 {
+            (first.1, second.1)
+        } else {
+            (second.1, first.1)
+        };
+        annotations.insert(assign_start, DriveStrengthSpec { zero, one });
+        consumed.insert(pair[1].get("start").and_then(Value::as_u64).unwrap());
+        consumed.insert(pair[3].get("start").and_then(Value::as_u64).unwrap());
+    }
+    Ok((annotations, consumed))
+}
+
+fn collect_continuous_assign_offsets(node: &Value, offsets: &mut HashSet<u64>) {
+    if tag(node) == "kContinuousAssignmentStatement" {
+        if let Some(start) = find(node, "assign").and_then(|token| token.get("start")) {
+            if let Some(start) = start.as_u64() {
+                offsets.insert(start);
+            }
+        }
+    }
+    for child in kids(node) {
+        collect_continuous_assign_offsets(child, offsets);
+    }
+}
+
+fn is_drive_strength_token(token: &Value) -> bool {
+    parse_strength_token(token).is_some()
+}
+
+fn parse_strength_token(token: &Value) -> Option<(u8, StrengthLevel)> {
+    let token_tag = tag(token);
+    let logic = if token_tag.ends_with('0') {
+        0
+    } else if token_tag.ends_with('1') {
+        1
+    } else {
+        return None;
+    };
+    let level = if token_tag.starts_with("supply") {
+        StrengthLevel::Supply
+    } else if token_tag.starts_with("strong") {
+        StrengthLevel::Strong
+    } else if token_tag.starts_with("pull") {
+        StrengthLevel::Pull
+    } else if token_tag.starts_with("weak") {
+        StrengthLevel::Weak
+    } else if token_tag.starts_with("highz") {
+        StrengthLevel::HighZ
+    } else {
+        return None;
+    };
+    Some((logic, level))
 }
 
 fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
@@ -86,9 +188,6 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
         "kContinuousAssignmentStatement" => {
             if let Some(delay) = find(node, "kDelay") {
                 validate_assignment_delay(delay, source)?;
-            }
-            if let Some(strength) = find(node, "kDriveStrength") {
-                return unsupported(strength, source);
             }
             let Some(assignments) = find(node, "kAssignmentList") else {
                 return unsupported(node, source);

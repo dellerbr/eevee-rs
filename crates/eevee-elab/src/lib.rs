@@ -1394,7 +1394,12 @@ fn elaborate_module_instance(
                 .gen_initial(body);
                 sim.add_process(backend.instantiate(Rc::new(prog), g.linkage.clone()));
             }
-            ModuleItem::ContinuousAssign { lhs, rhs, delay } => {
+            ModuleItem::ContinuousAssign {
+                lhs,
+                rhs,
+                delay,
+                strength,
+            } => {
                 if lhs.receiver.is_some() || lhs.index.is_some() || lhs.scope.is_some() {
                     panic!("continuous assignment requires a whole module net");
                 }
@@ -1404,7 +1409,14 @@ fn elaborate_module_instance(
                 let &(net, _) = scope.get(&lhs.name).unwrap_or_else(|| {
                     panic!("continuous assignment target '{}' is unknown", lhs.name)
                 });
-                let driver = sim.kernel().new_driver(net);
+                let driver = match strength {
+                    Some(strength) => sim.kernel().new_driver_with_strengths(
+                        net,
+                        scheduler_strength(strength.zero),
+                        scheduler_strength(strength.one),
+                    ),
+                    None => sim.kernel().new_driver(net),
+                };
                 let delay = delay
                     .as_ref()
                     .map(|delay| compile_continuous_delay(delay, &consts, ts));
@@ -1455,6 +1467,16 @@ fn elaborate_module_instance(
             sim,
             backend,
         );
+    }
+}
+
+fn scheduler_strength(strength: StrengthLevel) -> DriveStrength {
+    match strength {
+        StrengthLevel::HighZ => DriveStrength::HighZ,
+        StrengthLevel::Weak => DriveStrength::Weak,
+        StrengthLevel::Pull => DriveStrength::Pull,
+        StrengthLevel::Strong => DriveStrength::Strong,
+        StrengthLevel::Supply => DriveStrength::Supply,
     }
 }
 

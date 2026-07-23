@@ -167,7 +167,13 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
         }))
         .collect();
     for item in &module.items {
-        let ModuleItem::ContinuousAssign { lhs, rhs, delay } = item else {
+        let ModuleItem::ContinuousAssign {
+            lhs,
+            rhs,
+            delay,
+            strength,
+        } = item
+        else {
             continue;
         };
         if lhs.receiver.is_some()
@@ -183,6 +189,20 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
         if module_signal_signed(module, &lhs.name) {
             return unsupported(format!(
                 "signed continuous assignment target '{}.{}' is unsupported",
+                module.name, lhs.name
+            ));
+        }
+        if strength.is_some()
+            && module.items.iter().any(|item| {
+                matches!(
+                    item,
+                    ModuleItem::Net(net)
+                        if net.name == lhs.name && matches!(net.kind, eevee_ast::NetKind::Wand | eevee_ast::NetKind::Wor)
+                )
+            })
+        {
+            return unsupported(format!(
+                "explicit drive strengths on wired net '{}.{}' are unsupported",
                 module.name, lhs.name
             ));
         }
@@ -617,7 +637,9 @@ fn validate_items(
                     }
                 }
             }
-            ModuleItem::ContinuousAssign { lhs, rhs, delay } => {
+            ModuleItem::ContinuousAssign {
+                lhs, rhs, delay, ..
+            } => {
                 validate_lvalue(lhs)?;
                 validate_expr(rhs)?;
                 if let Some(delay) = delay {

@@ -140,24 +140,31 @@ pub fn parse_source(src: &str) -> Result<Value, FeError> {
 /// Parse source and reject any Verible lexical/parser recovery diagnostics.
 pub(crate) fn parse_source_strict(src: &str) -> Result<(Value, Vec<Value>), FeError> {
     let exe = find_verible().ok_or(FeError::VeribleNotFound)?;
-    parse_source_with_policy(&exe, src, true)
+    parse_source_with_policy(&exe, src, true, true)
+}
+
+/// Parse source permissively while also exporting lexical tokens.
+pub(crate) fn parse_source_with_tokens(src: &str) -> Result<(Value, Vec<Value>), FeError> {
+    let exe = find_verible().ok_or(FeError::VeribleNotFound)?;
+    parse_source_with_policy(&exe, src, false, true)
 }
 
 /// Parse using an explicit Verible binary path.
 pub fn parse_source_with(exe: &std::path::Path, src: &str) -> Result<Value, FeError> {
-    parse_source_with_policy(exe, src, false).map(|(tree, _)| tree)
+    parse_source_with_policy(exe, src, false, false).map(|(tree, _)| tree)
 }
 
 fn parse_source_with_policy(
     exe: &std::path::Path,
     src: &str,
     reject_recovery: bool,
+    print_tokens: bool,
 ) -> Result<(Value, Vec<Value>), FeError> {
     use std::io::Write;
 
     let mut command = Command::new(exe);
     command.args(["--export_json", "--printtree"]);
-    if reject_recovery {
+    if print_tokens {
         command.arg("--printtokens");
     }
     let mut child = command

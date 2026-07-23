@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 170 tests.
+- `cargo test --workspace` passes all 174 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -102,24 +102,28 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
 - Internal `tri` nets now share ordinary wire resolution;
   `wand`/`triand` and `wor`/`trior` use strengthless wired-AND and wired-OR
   resolution. Strict tests cover Z/X behavior and dominating 0/1 values.
-- Ordinary wire resolution now records one symmetric strength per driver and
-  selects the strongest driven 0/1 per bit, producing X on equal-strength
-  conflict. Scheduler tests cover weak, pull, strong, supply, X, Z, and vector
-  behavior; ordinary continuous drivers remain default strong.
+- Ordinary wire resolution records separate logic-0 and logic-1 strengths per
+  driver. Explicit continuous-assignment pairs support high-Z, weak, pull,
+  strong, and supply levels in either source order. The strength-qualified
+  interval is retained through X resolution; tests cover equal conflicts,
+  asymmetric X, supply dominance, vectors, and three-driver order independence.
+  Drivers without an explicit pair remain strong/strong.
 - Internal `tri0`/`tri1` nets elaborate with implicit full-width pull-strength
   0/1 drivers. `supply0`/`supply1` elaborate with implicit supply-strength 0/1
   drivers. A strict end-to-end test checks default values, strong overrides of
   pulls, and supply dominance over strong sources.
 - Strict parsing exports Verible tokens alongside the CST. This closes a
   Verible gap where explicit drive-strength tokens are omitted from the CST:
-  strong, pull, weak, high-Z, charge, and strength-position supply syntax is
-  rejected by token location before lowering. Declaration-position
-  `supply0`/`supply1` remains available as a supported internal net type.
+  supported drive pairs are attached to continuous assignments by the `assign`
+  token's byte offset. Permissive parsing selectively requests tokens only when
+  an exact strength keyword is present, preserving its normal tree-only UVM
+  path. Charge strengths remain rejected; declaration-position
+  `supply0`/`supply1` remains a supported internal net type.
 - Strict mode rejects net declaration assignments, procedural or signed net
-  drives, implicit width conversion, resolved net ports, explicit/asymmetric
-  strengths, explicit-unit delay literals, negative/X/Z/nonconstant delay
-  operands, dynamic/out-of-range RHS selects, partial targets, unknown RHS
-  names, and unsupported RHS calls.
+  drives, implicit width conversion, resolved net ports, explicit strengths on
+  wired-AND/OR nets, charge strengths, explicit-unit delay literals,
+  negative/X/Z/nonconstant delay operands, dynamic/out-of-range RHS selects,
+  partial targets, unknown RHS names, and unsupported RHS calls.
 
 The module connectivity model currently aliases a scheduler net. Full port
 directionality, complete net/variable port semantics, and width-converting or
@@ -127,9 +131,9 @@ expression connections are not claimed.
 
 ## Next Priorities
 
-1. Extend continuous drivers with explicit/asymmetric strengths, resolved net
-  ports, and driver release. Then extend module parameters into
-  parameter-dependent packed widths and complete value typing/coercion.
+1. Extend continuous connectivity with resolved net ports and driver release.
+  Then extend module parameters into parameter-dependent packed widths and
+  complete value typing/coercion.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime

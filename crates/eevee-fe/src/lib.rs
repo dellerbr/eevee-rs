@@ -39,14 +39,7 @@ pub fn parse_source_conformant(src: &str) -> Result<SourceFile, FeError> {
 
 /// Parse source with an explicit fallback policy.
 pub fn parse_source_with_mode(src: &str, mode: ParseMode) -> Result<SourceFile, FeError> {
-    let (tree, tokens) = match mode {
-        ParseMode::Permissive => (cst::parse_source(src)?, Vec::new()),
-        ParseMode::Conformance => cst::parse_source_strict(src)?,
-    };
-    if mode == ParseMode::Conformance {
-        conformance::validate(&tree, &tokens, src)?;
-    }
-    Ok(lower::lower_file(&tree))
+    parse_preprocessed_source(src, mode)
 }
 
 /// Preprocess (expand `` `include ``/`` `define ``/macros with the given
@@ -64,14 +57,7 @@ pub fn parse_file_with_mode(
 ) -> Result<SourceFile, FeError> {
     let mut pp = Preprocessor::new(include_dirs);
     let text = pp.process_file(path).map_err(FeError::Io)?;
-    let (tree, tokens) = match mode {
-        ParseMode::Permissive => (cst::parse_source(&text)?, Vec::new()),
-        ParseMode::Conformance => cst::parse_source_strict(&text)?,
-    };
-    if mode == ParseMode::Conformance {
-        conformance::validate(&tree, &tokens, &text)?;
-    }
-    Ok(lower::lower_file(&tree))
+    parse_preprocessed_source(&text, mode)
 }
 
 /// Preprocess a string (with include dirs) then parse it.
@@ -92,12 +78,108 @@ pub fn parse_source_with_includes_and_mode(
 ) -> Result<SourceFile, FeError> {
     let mut pp = Preprocessor::new(include_dirs);
     let text = pp.process(src, source_path);
+    parse_preprocessed_source(&text, mode)
+}
+
+fn parse_preprocessed_source(source: &str, mode: ParseMode) -> Result<SourceFile, FeError> {
     let (tree, tokens) = match mode {
-        ParseMode::Permissive => (cst::parse_source(&text)?, Vec::new()),
-        ParseMode::Conformance => cst::parse_source_strict(&text)?,
+        ParseMode::Permissive if contains_strength_keyword(source) => {
+            cst::parse_source_with_tokens(source)?
+        }
+        ParseMode::Permissive => (cst::parse_source(source)?, Vec::new()),
+        ParseMode::Conformance => cst::parse_source_strict(source)?,
     };
-    if mode == ParseMode::Conformance {
-        conformance::validate(&tree, &tokens, &text)?;
+    let strengths = if mode == ParseMode::Conformance {
+        conformance::validate(&tree, &tokens, source)?
+    } else if tokens.is_empty() {
+        Default::default()
+    } else {
+        conformance::strength_annotations(&tree, &tokens, source)
+            .map(|(annotations, _)| annotations)
+            .unwrap_or_default()
+    };
+    Ok(lower::lower_file_with_strengths(&tree, &strengths))
+}
+
+fn contains_strength_keyword(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'\\' => {
+                while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+            }
+            byte if byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$') => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+                {
+                    index += 1;
+                }
+                if matches!(
+                    &source[start..index],
+                    "supply0"
+                        | "supply1"
+                        | "strong0"
+                        | "strong1"
+                        | "pull0"
+                        | "pull1"
+                        | "weak0"
+                        | "weak1"
+                        | "highz0"
+                        | "highz1"
+                ) {
+                    return true;
+                }
+            }
+            _ => index += 1,
+        }
     }
-    Ok(lower::lower_file(&tree))
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_strength_keyword;
+
+    #[test]
+    fn strength_keyword_scan_ignores_non_syntax_text() {
+        assert!(contains_strength_keyword(
+            "assign (strong1, pull0) result = source;"
+        ));
+        assert!(!contains_strength_keyword(
+            "$display(\"strong1 is too large\"); // pull0\n/* weak1 */"
+        ));
+        assert!(!contains_strength_keyword("logic UVM_STRONG1; \\highz0 ;"));
+    }
 }

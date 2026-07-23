@@ -18,13 +18,31 @@ pub enum NetResolution {
     Wor,
 }
 
-/// Symmetric strength applied to both 0 and 1 values of one driver.
+/// One IEEE drive-strength level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
 pub enum DriveStrength {
-    Weak,
-    Pull,
-    Strong,
-    Supply,
+    HighZ = 0,
+    Weak = 3,
+    Pull = 5,
+    Strong = 6,
+    Supply = 7,
+}
+
+/// Strengths used when one driver produces logic 0 or logic 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverStrengths {
+    pub zero: DriveStrength,
+    pub one: DriveStrength,
+}
+
+impl DriverStrengths {
+    pub const fn symmetric(strength: DriveStrength) -> Self {
+        Self {
+            zero: strength,
+            one: strength,
+        }
+    }
 }
 
 /// Transition-specific delays for one continuous driver.
@@ -84,7 +102,7 @@ pub struct Net {
     pub(crate) delay_request: LogicVec,
     pub(crate) delay_generations: Vec<u64>,
     pub(crate) driver_values: Vec<LogicVec>,
-    pub(crate) driver_strengths: Vec<DriveStrength>,
+    pub(crate) driver_strengths: Vec<DriverStrengths>,
     pub(crate) waiters: Vec<Waiter>,
     pub(crate) name: String,
 }

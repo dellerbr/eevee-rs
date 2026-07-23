@@ -112,6 +112,72 @@ fn wire_resolution_honors_symmetric_driver_strengths() {
     assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
 }
 
+#[test]
+fn wire_resolution_honors_asymmetric_driver_strengths() {
+    let mut sim = Sim::with_default_timescale();
+    let net = sim.kernel().new_net("asymmetric_strength", LogicVec::z(1));
+    let asymmetric =
+        sim.kernel()
+            .new_driver_with_strengths(net, DriveStrength::Pull, DriveStrength::Strong);
+    let pull = sim
+        .kernel()
+        .new_driver_with_strength(net, DriveStrength::Pull);
+
+    sim.kernel().drive_net(asymmetric, lv(1, 1));
+    sim.kernel().drive_net(pull, lv(0, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+
+    sim.kernel().drive_net(asymmetric, lv(0, 1));
+    sim.kernel().drive_net(pull, lv(1, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::X);
+
+    let open_drain =
+        sim.kernel()
+            .new_driver_with_strengths(net, DriveStrength::HighZ, DriveStrength::Strong);
+    sim.kernel().drive_net(asymmetric, LogicVec::z(1));
+    sim.kernel().drive_net(pull, LogicVec::z(1));
+    sim.kernel().drive_net(open_drain, lv(0, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Z);
+
+    sim.kernel().drive_net(open_drain, lv(1, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::One);
+
+    sim.kernel().drive_net(open_drain, LogicVec::z(1));
+    sim.kernel().drive_net(asymmetric, LogicVec::x(1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::X);
+
+    let supply_low = sim
+        .kernel()
+        .new_driver_with_strength(net, DriveStrength::Supply);
+    sim.kernel().drive_net(supply_low, lv(0, 1));
+    assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::Zero);
+}
+
+#[test]
+fn asymmetric_strength_resolution_is_driver_order_independent() {
+    let mut sim = Sim::with_default_timescale();
+    let forward = sim.kernel().new_net("forward_strengths", LogicVec::z(1));
+    let reverse = sim.kernel().new_net("reverse_strengths", LogicVec::z(1));
+    let specifications = [
+        (DriveStrength::Pull, DriveStrength::Strong, Bit::X),
+        (DriveStrength::Supply, DriveStrength::Weak, Bit::Zero),
+        (DriveStrength::Weak, DriveStrength::Supply, Bit::One),
+    ];
+
+    for &(zero, one, value) in &specifications {
+        let driver = sim.kernel().new_driver_with_strengths(forward, zero, one);
+        sim.kernel().drive_net(driver, LogicVec::from_bit(value));
+    }
+    for &(zero, one, value) in specifications.iter().rev() {
+        let driver = sim.kernel().new_driver_with_strengths(reverse, zero, one);
+        sim.kernel().drive_net(driver, LogicVec::from_bit(value));
+    }
+
+    assert_eq!(sim.kernel().net_value(forward).get_bit(0), Bit::X);
+    let forward_value = sim.kernel().net_value(forward).clone();
+    assert_eq!(sim.kernel().net_value(reverse), &forward_value);
+}
+
 struct InertialPulseDriver {
     driver: eevee_sched::DriverId,
     phase: u8,

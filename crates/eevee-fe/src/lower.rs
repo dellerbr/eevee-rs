@@ -15,21 +15,33 @@
 
 use eevee_ast::*;
 use eevee_core::LogicVec;
+use std::collections::HashMap;
 
 use crate::cst::{const_int, find, find_deep, kids, leaf_op, tag, text};
 use serde_json::Value;
 
 /// Lower a whole file (root `kDescriptionList`) to a [`SourceFile`].
 pub fn lower_file(tree: &Value) -> SourceFile {
+    lower_file_with_strengths(tree, &HashMap::new())
+}
+
+pub(crate) fn lower_file_with_strengths(
+    tree: &Value,
+    strengths: &HashMap<u64, DriveStrengthSpec>,
+) -> SourceFile {
     let mut items = Vec::new();
-    collect_descriptions(tree, &mut items);
+    collect_descriptions(tree, &mut items, strengths);
     SourceFile { items }
 }
 
-fn collect_descriptions(n: &Value, out: &mut Vec<Item>) {
+fn collect_descriptions(
+    n: &Value,
+    out: &mut Vec<Item>,
+    strengths: &HashMap<u64, DriveStrengthSpec>,
+) {
     match tag(n) {
-        "kModuleDeclaration" => out.push(Item::Module(lower_module(n))),
-        "kPackageDeclaration" => out.push(Item::Package(lower_package(n))),
+        "kModuleDeclaration" => out.push(Item::Module(lower_module(n, strengths))),
+        "kPackageDeclaration" => out.push(Item::Package(lower_package(n, strengths))),
         // Compilation-unit-scope class / function (real testbenches use these).
         "kClassDeclaration" => out.push(Item::Class(Box::new(lower_class(n)))),
         "kFunctionDeclaration" | "kTaskDeclaration" => {
@@ -39,14 +51,18 @@ fn collect_descriptions(n: &Value, out: &mut Vec<Item>) {
         // Descend through wrappers (kDescriptionList, etc.).
         _ => {
             for c in kids(n) {
-                collect_descriptions(c, out);
+                collect_descriptions(c, out, strengths);
             }
         }
     }
 }
 
 /// Lower one module/package item, pushing any results onto `out`.
-fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
+fn lower_module_item(
+    item: &Value,
+    out: &mut Vec<ModuleItem>,
+    strengths: &HashMap<u64, DriveStrengthSpec>,
+) {
     match tag(item) {
         "kDataDeclaration" => {
             lower_enum_consts(item, out);
@@ -64,7 +80,7 @@ fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
         }
         "kAlwaysStatement" => out.push(ModuleItem::Always(lower_always(item))),
         "kInitialStatement" => out.push(ModuleItem::Initial(lower_initial(item))),
-        "kContinuousAssignmentStatement" => lower_continuous_assignments(item, out),
+        "kContinuousAssignmentStatement" => lower_continuous_assignments(item, out, strengths),
         "kFunctionDeclaration" | "kTaskDeclaration" => {
             out.push(ModuleItem::Func(lower_function(item)))
         }
@@ -91,24 +107,34 @@ fn lower_module_item(item: &Value, out: &mut Vec<ModuleItem>) {
         // List wrappers — descend.
         "kModuleItemList" | "kPackageItemList" | "kClassItems" => {
             for it in kids(item) {
-                lower_module_item(it, out);
+                lower_module_item(it, out, strengths);
             }
         }
         _ => {} // unsupported item — skipped for this subset
     }
 }
 
-fn lower_continuous_assignments(n: &Value, out: &mut Vec<ModuleItem>) {
+fn lower_continuous_assignments(
+    n: &Value,
+    out: &mut Vec<ModuleItem>,
+    strengths: &HashMap<u64, DriveStrengthSpec>,
+) {
     let Some(assignments) = find(n, "kAssignmentList") else {
         return;
     };
     let delay = find(n, "kDelay").map(lower_continuous_delay);
+    let strength = find(n, "assign")
+        .and_then(|token| token.get("start"))
+        .and_then(Value::as_u64)
+        .and_then(|start| strengths.get(&start))
+        .copied();
     for assignment in kids(assignments) {
         if tag(assignment) == "kNetVariableAssignment" {
             out.push(ModuleItem::ContinuousAssign {
                 lhs: lower_lvalue(assignment),
                 rhs: lower_rhs(assignment),
                 delay: delay.clone(),
+                strength,
             });
         }
     }
@@ -238,7 +264,7 @@ fn eval_const_expr(expr: &Expr) -> Option<LogicVec> {
     }
 }
 
-fn lower_module(n: &Value) -> Module {
+fn lower_module(n: &Value, strengths: &HashMap<u64, DriveStrengthSpec>) -> Module {
     let name = find(n, "kModuleHeader")
         .and_then(|h| find(h, "SymbolIdentifier"))
         .map(text)
@@ -248,7 +274,7 @@ fn lower_module(n: &Value) -> Module {
     let mut items = Vec::new();
     if let Some(list) = find(n, "kModuleItemList") {
         for item in kids(list) {
-            lower_module_item(item, &mut items);
+            lower_module_item(item, &mut items, strengths);
         }
     }
 
@@ -397,7 +423,7 @@ fn lower_net_kind(dtype: &Value) -> Option<NetKind> {
     })
 }
 
-fn lower_package(n: &Value) -> Package {
+fn lower_package(n: &Value, strengths: &HashMap<u64, DriveStrengthSpec>) -> Package {
     let name = find(n, "kPackageHeader")
         .and_then(|h| find(h, "SymbolIdentifier"))
         .map(text)
@@ -409,7 +435,7 @@ fn lower_package(n: &Value) -> Package {
         // children of the package declaration, possibly under a list wrapper).
         match tag(item) {
             "kPackageHeader" | "package" | "endpackage" | ";" => {}
-            _ => lower_module_item(item, &mut items),
+            _ => lower_module_item(item, &mut items, strengths),
         }
     }
     Package { name, items }

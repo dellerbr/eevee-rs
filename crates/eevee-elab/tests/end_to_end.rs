@@ -208,6 +208,61 @@ fn implicit_pull_and_supply_net_drivers_resolve_by_strength() {
 }
 
 #[test]
+fn explicit_drive_strengths_resolve_asymmetric_and_highz_values() {
+    let src = "module top;\n\
+      logic asymmetric_source = 1;\n\
+      logic pull_source = 0;\n\
+      logic open_source = 0;\n\
+      logic strong_low = 0;\n\
+      logic [1:0] vector_source = 2'b10;\n\
+      logic [1:0] vector_pull = 2'b01;\n\
+      wire asymmetric_result;\n\
+      wire open_result;\n\
+      wire supply_result;\n\
+      wire [1:0] vector_result;\n\
+      assign (strong1, pull0) #0 asymmetric_result = asymmetric_source;\n\
+      assign (pull1, pull0) asymmetric_result = pull_source;\n\
+      assign (strong1, highz0) open_result = open_source;\n\
+      assign (supply1, supply0) supply_result = 1'b1;\n\
+      assign (strong1, strong0) supply_result = strong_low;\n\
+      assign (strong1, pull0) vector_result = vector_source;\n\
+      assign (pull1, pull0) vector_result = vector_pull;\n\
+      initial begin\n\
+      #1 asymmetric_source = 0;\n\
+      pull_source = 1;\n\
+      open_source = 1;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let asymmetric = sim
+        .kernel()
+        .find_net("asymmetric_result")
+        .expect("asymmetric result");
+    let open = sim.kernel().find_net("open_result").expect("open result");
+    let supply = sim
+        .kernel()
+        .find_net("supply_result")
+        .expect("supply result");
+    let vector = sim
+        .kernel()
+        .find_net("vector_result")
+        .expect("vector result");
+
+    sim.run_until(Some(SimTime::ZERO));
+    assert_eq!(sim.kernel().net_value(asymmetric).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(open).get_bit(0), Bit::Z);
+    assert_eq!(sim.kernel().net_value(supply).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(vector).get_bit(1), Bit::One);
+    assert_eq!(sim.kernel().net_value(vector).get_bit(0), Bit::X);
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    assert_eq!(sim.kernel().net_value(asymmetric).get_bit(0), Bit::X);
+    assert_eq!(sim.kernel().net_value(open).get_bit(0), Bit::One);
+}
+
+#[test]
 fn continuous_assignment_uses_rhs_source_sensitivity() {
     let src = "module top;\n\
       logic source = 0;\n\
@@ -367,7 +422,7 @@ fn continuous_and_net_declaration_delays_compose() {
     let src = "module top;\n\
       logic source = 0;\n\
       wire #3 result;\n\
-      assign #2 result = source;\n\
+      assign (strong1, pull0) #2 result = source;\n\
       initial #10 source = 1;\n\
     endmodule\n";
     let file = parse_source_conformant(src).expect("conformant parse");
@@ -455,6 +510,10 @@ fn conformance_mode_rejects_invalid_continuous_drivers() {
         (
             "module top; logic source; wire result; assign #source result = source; endmodule",
             "delay in module 'top' is not a constant parameter expression",
+        ),
+        (
+          "module top; logic source; wand result; assign (strong1, pull0) result = source; endmodule",
+          "explicit drive strengths on wired net 'top.result' are unsupported",
         ),
         (
           "module top; logic source; wire result; assign #(1, source) result = source; endmodule",
