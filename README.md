@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 21, 2026:
 
-- 149 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 151 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -78,6 +78,9 @@ Validated on July 21, 2026:
 - Plain `wire` declarations and undelayed, strengthless whole-net continuous
   assignments execute as reactive processes. Scheduler-owned drivers resolve
   Z, X, and conflicting unsigned values across hierarchy.
+- Continuous assignments park on deduplicated RHS net read sets, so unrelated
+  writes do not wake them. Generic multi-net waits invalidate and remove sibling
+  registrations after the first source fires.
 
 ## Implemented Language Surface
 
@@ -116,6 +119,8 @@ The current implementation includes:
   value overrides with per-instance constant scopes.
 - Plain `wire` nets, reactive continuous assignment processes, and strengthless
   four-state multiple-driver resolution.
+- Precise continuous-assignment sensitivity and generation-safe multi-net wait
+  registration/cleanup.
 - Fail-closed `parse_source_conformant` and `elaborate_conformant` APIs. The
   legacy APIs remain permissive for coverage exploration.
 - UVM-oriented report formatting primitives including enum names, string
@@ -227,8 +232,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-  delayed/strength-aware drivers, source-specific sensitivity, hierarchical
-  references, and generate `if`/`case`/`for`.
+  delayed/strength-aware drivers, hierarchical references, and generate
+  `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 

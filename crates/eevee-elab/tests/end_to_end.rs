@@ -120,6 +120,39 @@ fn continuous_assignments_propagate_and_resolve_drivers() {
 }
 
 #[test]
+fn continuous_assignment_uses_rhs_source_sensitivity() {
+    let src = "module top;\n\
+      logic source = 0;\n\
+      logic unrelated = 0;\n\
+      wire result;\n\
+      assign result = source;\n\
+      initial begin\n\
+        #1 unrelated = 1;\n\
+        #1 source = 1;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+
+    let result = sim.kernel().find_net("result").expect("result net");
+    sim.run_until(Some(SimTime::ZERO));
+    let initial_resumes = sim.kernel_ref().stats().resumes;
+    assert_eq!(sim.kernel_ref().net_value(result).to_u64(), 0);
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    assert_eq!(
+        sim.kernel_ref().stats().resumes,
+        initial_resumes + 1,
+        "unrelated write must not resume continuous assignment"
+    );
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    assert_eq!(sim.kernel_ref().net_value(result).to_u64(), 1);
+    assert_eq!(sim.kernel_ref().stats().resumes, initial_resumes + 3);
+}
+
+#[test]
 fn conformance_mode_rejects_invalid_continuous_drivers() {
     let cases = [
         (

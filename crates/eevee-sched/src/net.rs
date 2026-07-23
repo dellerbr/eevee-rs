@@ -14,6 +14,7 @@ use crate::process::{EdgeKind, ProcId};
 pub(crate) struct Waiter {
     pub proc: ProcId,
     pub edge: EdgeKind,
+    pub epoch: u64,
 }
 
 /// A 4-state net with an attached sensitivity list.
@@ -42,6 +43,11 @@ impl Net {
     /// The net's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Number of currently registered sensitivity waiters.
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.len()
     }
 }
 

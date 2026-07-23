@@ -80,6 +80,8 @@ pub struct Stats {
     pub nba_applies: u64,
     /// Number of times simulation time advanced.
     pub time_advances: u64,
+    /// Number of process wait-generation records currently retained.
+    pub wait_epoch_records: usize,
 }
 
 /// The simulation kernel: time, nets, the stratified queues, and the time wheel.
@@ -116,6 +118,11 @@ pub struct Kernel {
 
     // Processes parked on IEEE named events.
     event_waiters: HashMap<EventId, Vec<ProcId>>,
+
+    // Current net-wait generation per process. Firing one source invalidates
+    // sibling registrations from the same multi-net wait.
+    wait_epochs: HashMap<ProcId, u64>,
+    net_waits: HashMap<ProcId, Vec<NetId>>,
 }
 
 impl Kernel {
@@ -138,6 +145,8 @@ impl Kernel {
             join_watches: Vec::new(),
             runtime_waiters: Vec::new(),
             event_waiters: HashMap::new(),
+            wait_epochs: HashMap::new(),
+            net_waits: HashMap::new(),
         }
     }
 
@@ -216,24 +225,44 @@ impl Kernel {
             nets,
             active,
             runtime_waiters,
+            wait_epochs,
+            net_waits,
             stats,
             ..
         } = self;
-        let n = &mut nets[net.0];
-        let old = std::mem::replace(&mut n.value, val);
-        let edges = detect_edge(&old, &n.value);
-        stats.net_writes += 1;
-        if edges.changed {
-            active.extend(runtime_waiters.drain(..));
+        let mut woken = Vec::new();
+        {
+            let n = &mut nets[net.0];
+            let old = std::mem::replace(&mut n.value, val);
+            let edges = detect_edge(&old, &n.value);
+            stats.net_writes += 1;
+            if edges.changed {
+                active.extend(runtime_waiters.drain(..));
+            }
+            if edges.changed && !n.waiters.is_empty() {
+                let mut i = 0;
+                while i < n.waiters.len() {
+                    let waiter = &n.waiters[i];
+                    let current_epoch = wait_epochs.get(&waiter.proc).copied().unwrap_or(0);
+                    if waiter.epoch != current_epoch {
+                        n.waiters.swap_remove(i);
+                    } else if edges.fires(waiter.edge) {
+                        let w = n.waiters.swap_remove(i);
+                        *wait_epochs.entry(w.proc).or_default() += 1;
+                        active.push_back(w.proc);
+                        woken.push(w.proc);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
         }
-        if edges.changed && !n.waiters.is_empty() {
-            let mut i = 0;
-            while i < n.waiters.len() {
-                if edges.fires(n.waiters[i].edge) {
-                    let w = n.waiters.swap_remove(i);
-                    active.push_back(w.proc);
-                } else {
-                    i += 1;
+        for proc in woken {
+            if let Some(waited_nets) = net_waits.remove(&proc) {
+                for waited_net in waited_nets {
+                    nets[waited_net.0]
+                        .waiters
+                        .retain(|waiter| waiter.proc != proc);
                 }
             }
         }
@@ -293,7 +322,10 @@ impl Kernel {
     /// Accumulated statistics.
     #[inline]
     pub fn stats(&self) -> Stats {
-        self.stats
+        Stats {
+            wait_epoch_records: self.wait_epochs.len(),
+            ..self.stats
+        }
     }
 
     // ---- Internal scheduling -------------------------------------------
@@ -310,8 +342,14 @@ impl Kernel {
 
     /// Park a process per the [`Wait`] it returned.
     fn arm(&mut self, pid: ProcId, wait: Wait) {
+        self.clear_net_waiters(pid);
+        let epoch = self.wait_epochs.entry(pid).or_default();
+        *epoch += 1;
+        let epoch = *epoch;
         match wait {
-            Wait::Finished => {}
+            Wait::Finished => {
+                self.wait_epochs.remove(&pid);
+            }
             Wait::Delay(fs) => {
                 let t = self.time.saturating_add_fs(fs);
                 self.push_timed(t, Region::Active, pid);
@@ -320,23 +358,38 @@ impl Kernel {
                 self.nets[net.0].waiters.push(Waiter {
                     proc: pid,
                     edge: kind,
+                    epoch,
                 });
+                self.net_waits.insert(pid, vec![net]);
             }
             Wait::Sensitivity(list) => {
+                let mut waited_nets = Vec::new();
                 for (net, kind) in list {
                     self.nets[net.0].waiters.push(Waiter {
                         proc: pid,
                         edge: kind,
+                        epoch,
                     });
+                    if !waited_nets.contains(&net) {
+                        waited_nets.push(net);
+                    }
                 }
+                self.net_waits.insert(pid, waited_nets);
             }
             Wait::Cond(nets) => {
+                let mut waited_nets = Vec::new();
                 for net in nets {
+                    if waited_nets.contains(&net) {
+                        continue;
+                    }
                     self.nets[net.0].waiters.push(Waiter {
                         proc: pid,
                         edge: EdgeKind::AnyChange,
+                        epoch,
                     });
+                    waited_nets.push(net);
                 }
+                self.net_waits.insert(pid, waited_nets);
             }
             Wait::RuntimeCond => self.runtime_waiters.push(pid),
             Wait::Nba => self.nba_waiters.push_back(pid),
@@ -346,6 +399,14 @@ impl Kernel {
                  needs the process table, which Kernel does not own) before \
                  reaching arm()"
             ),
+        }
+    }
+
+    fn clear_net_waiters(&mut self, pid: ProcId) {
+        if let Some(waited_nets) = self.net_waits.remove(&pid) {
+            for net in waited_nets {
+                self.nets[net.0].waiters.retain(|waiter| waiter.proc != pid);
+            }
         }
     }
 

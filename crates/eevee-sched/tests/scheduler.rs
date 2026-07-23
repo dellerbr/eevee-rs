@@ -37,6 +37,89 @@ fn continuous_drivers_resolve_four_state_values() {
     assert_eq!(sim.kernel().net_value(net).get_bit(0), Bit::X);
 }
 
+struct MultiNetWaiter {
+    left: NetId,
+    right: NetId,
+    quiet: NetId,
+    resumes: Rc<Cell<u64>>,
+    armed: bool,
+}
+
+impl Process for MultiNetWaiter {
+    fn resume(&mut self, _kernel: &mut Kernel) -> Wait {
+        self.resumes.set(self.resumes.get() + 1);
+        if self.armed {
+            Wait::Finished
+        } else {
+            self.armed = true;
+            Wait::Cond(vec![self.left, self.right, self.quiet])
+        }
+    }
+}
+
+struct UnrelatedThenBurst {
+    unrelated: NetId,
+    left: NetId,
+    right: NetId,
+    phase: u8,
+}
+
+impl Process for UnrelatedThenBurst {
+    fn resume(&mut self, kernel: &mut Kernel) -> Wait {
+        match self.phase {
+            0 => {
+                self.phase = 1;
+                Wait::Delay(1)
+            }
+            1 => {
+                self.phase = 2;
+                kernel.write_net(self.unrelated, lv(1, 1));
+                Wait::Delay(1)
+            }
+            _ => {
+                kernel.write_net(self.left, lv(1, 1));
+                kernel.write_net(self.right, lv(1, 1));
+                Wait::Finished
+            }
+        }
+    }
+}
+
+#[test]
+fn multi_net_wait_ignores_unrelated_and_wakes_once() {
+    let resumes = Rc::new(Cell::new(0));
+    let mut sim = Sim::with_default_timescale();
+    let left = sim.kernel().new_net("left", lv(0, 1));
+    let right = sim.kernel().new_net("right", lv(0, 1));
+    let quiet = sim.kernel().new_net("quiet", lv(0, 1));
+    let unrelated = sim.kernel().new_net("unrelated", lv(0, 1));
+    sim.add_process(Box::new(MultiNetWaiter {
+        left,
+        right,
+        quiet,
+        resumes: resumes.clone(),
+        armed: false,
+    }));
+    sim.add_process(Box::new(UnrelatedThenBurst {
+        unrelated,
+        left,
+        right,
+        phase: 0,
+    }));
+
+    sim.run_until(Some(SimTime::from_fs(1)));
+    assert_eq!(resumes.get(), 1, "unrelated write must not wake waiter");
+
+    sim.run();
+    assert_eq!(resumes.get(), 2, "two relevant writes must wake only once");
+    assert_eq!(
+        sim.kernel().net(quiet).waiter_count(),
+        0,
+        "firing one source must remove registrations from quiet siblings"
+    );
+    assert_eq!(sim.kernel().stats().wait_epoch_records, 0);
+}
+
 // ---------------------------------------------------------------------------
 // always #5 clk = ~clk  +  always_ff @(posedge clk) c <= c + 1
 // ---------------------------------------------------------------------------

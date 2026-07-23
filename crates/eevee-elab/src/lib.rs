@@ -1692,13 +1692,66 @@ impl<'a> CodeGen<'a> {
     /// time zero, then re-evaluates after signal/runtime activity.
     fn gen_continuous(&mut self, rhs: &Expr, driver: DriverId) -> Program {
         let mut pb = ProgramBuilder::new("continuous assign");
+        let mut read_set = Vec::new();
+        self.collect_net_reads(rhs, &mut read_set);
         let evaluate = pb.new_label();
         pb.bind(evaluate);
         let value = self.gen_expr(rhs, &mut pb);
         pb.emit(Inst::DriveNet { driver, src: value });
-        pb.emit(Inst::WaitRuntime);
-        pb.jump(evaluate);
+        if read_set.is_empty() {
+            pb.emit(Inst::Finish);
+        } else {
+            let nets = pb.netlist(&read_set);
+            pb.emit(Inst::WaitCond { nets });
+            pb.jump(evaluate);
+        }
         pb.build()
+    }
+
+    fn collect_net_reads(&self, expr: &Expr, read_set: &mut Vec<NetId>) {
+        match expr {
+            Expr::Ref(name) => {
+                if let Some(&(net, _)) = self.nets.get(name) {
+                    if !read_set.contains(&net) {
+                        read_set.push(net);
+                    }
+                }
+            }
+            Expr::Unary { operand, .. } | Expr::Field { obj: operand, .. } => {
+                self.collect_net_reads(operand, read_set);
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.collect_net_reads(lhs, read_set);
+                self.collect_net_reads(rhs, read_set);
+            }
+            Expr::Call { args, .. }
+            | Expr::StaticCall { args, .. }
+            | Expr::New { args }
+            | Expr::Concat(args)
+            | Expr::SysCall { args, .. } => {
+                for arg in args {
+                    self.collect_net_reads(arg, read_set);
+                }
+            }
+            Expr::MethodCall { obj, args, .. } => {
+                self.collect_net_reads(obj, read_set);
+                for arg in args {
+                    self.collect_net_reads(arg, read_set);
+                }
+            }
+            Expr::Index { base, index } => {
+                self.collect_net_reads(base, read_set);
+                self.collect_net_reads(index, read_set);
+            }
+            Expr::PartSelect {
+                base, left, right, ..
+            } => {
+                self.collect_net_reads(base, read_set);
+                self.collect_net_reads(left, read_set);
+                self.collect_net_reads(right, read_set);
+            }
+            Expr::Literal(_) | Expr::Str(_) | Expr::StaticRef { .. } | Expr::Null => {}
+        }
     }
 
     /// Compile a function/task/method body. For a method (`class_ctx` set),
