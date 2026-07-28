@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 187 tests.
+- `cargo test --workspace` passes all 190 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -89,11 +89,18 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   source-to-runtime validated. Nonconstant controls, invalid genvars, unnamed
   blocks, unknown generated modules, and generated hierarchy cycles fail
   closed.
+- Fixed unpacked unsigned integral module memories preserve one parameterized
+  nonnegative range and allocate one scheduler net per declared element.
+  Strict tests cover ascending/descending bounds, dynamic reads, blocking/NBA
+  writes, continuous-read sensitivity, hierarchy inspection, and X/ignored
+  writes for invalid indices. Dynamic packed bit reads and blocking/NBA writes
+  are also validated. Multiple/signed/negative memory dimensions and nonmodule
+  fixed arrays remain fail-closed.
 - The narrow sequential RTL core is source-to-runtime validated:
   `always #delay`, `always_ff @(posedge clk)`, nonblocking updates, and NBA old-value
   behavior execute correctly. This does not imply broad synthesizable-Verilog
-  compatibility; complete typing/sizing, memories, and full port/net semantics
-  remain major gaps.
+  compatibility; complete typing/sizing and full port/net semantics remain
+  major gaps.
 - Strict parsing/elaboration reject type or non-`int` module parameters,
   header/body localparams, module-body parameters, parameter-dependent callable
   signatures/procedural locals, unknown/duplicate/excess overrides, and
@@ -149,8 +156,8 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
 - Strict mode rejects net declaration assignments, procedural or signed net
   drives, implicit width conversion, mismatched resolved port kinds, explicit
   strengths on wired-AND/OR nets, charge strengths, explicit-unit delay literals,
-  negative/X/Z/nonconstant delay operands, dynamic/out-of-range RHS selects,
-  partial targets, unknown RHS names, and unsupported RHS calls.
+  negative/X/Z/nonconstant delay operands, dynamic part-selects, partial
+  targets, unknown RHS names, and unsupported RHS calls.
 
 The module connectivity model collapses matching resolved port kinds onto one
 scheduler net and bridges mismatched ordinary input/output kinds directionally.
@@ -160,31 +167,29 @@ expression connections are not claimed.
 
 ## Next Priorities
 
-1. Add fixed unpacked memories with dynamic reads, blocking writes, and NBA
-  writes. Extend packed dynamic selects in the same milestone.
-2. Complete expression sizing/signing and assignment/port coercion.
-3. Add hierarchical references and explicit top selection while preserving
-  scoped instance identity. Keep complete value typing/coercion as a separate
-  milestone.
-4. Carry source spans/maps through preprocessing, AST, elaboration, and runtime
+1. Complete expression sizing/signing and assignment/port coercion.
+2. Add hierarchical references and explicit top selection while preserving
+  scoped instance identity. Keep interfaces and complete port direction/type
+  semantics as separate milestones.
+3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime
   so strict semantic diagnostics are source-located rather than only
   actionable by callable or signal name.
-5. Make normal named test selection work: `run_test("my_test")` and
+4. Make normal named test selection work: `run_test("my_test")` and
    `+UVM_TESTNAME=my_test`, using the real UVM registry/factory source. Add a
    focused probe that does not manually construct `uvm_test_top`.
-6. Verify all common UVM callbacks and the final report summary. Trace any
+5. Verify all common UVM callbacks and the final report summary. Trace any
    missing callback through virtual dispatch and phase traversal rather than
    adding UVM-specific runtime behavior.
-7. Implement real IEEE `process::self`, status transitions, await/kill, and
+6. Implement real IEEE `process::self`, status transitions, await/kill, and
    phase-worker teardown. Keep process support generic and scheduler-owned.
-8. Reduce the highest UVM compile-stub buckets with focused language tests:
+7. Reduce the highest UVM compile-stub buckets with focused language tests:
    callback collection typing, `uvm_typeid_base::typename`, nested indexed
    receiver typing, collection `foreach`, process status enums, and generic
    min/max methods.
-9. Expand DPI only at the generic boundary. The UVM regex, polling, and HDL
+8. Expand DPI only at the generic boundary. The UVM regex, polling, and HDL
    backdoor symbols are currently intentionally unbound; unknown imports must
    fail explicitly rather than return a plausible zero.
-10. Continue the README roadmap through hierarchy/interfaces,
+9. Continue the README roadmap through hierarchy/interfaces,
    signedness and sizing, runtime primitives, constraints/randomization,
    assertions/coverage, files/waves, and chapter-based conformance closure.
 

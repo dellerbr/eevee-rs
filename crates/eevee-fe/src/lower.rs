@@ -720,6 +720,7 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
                 name,
                 width,
                 packed_range: dtype.and_then(lower_packed_range),
+                unpacked_range: lower_unpacked_range(rv).map(Box::new),
                 signed,
                 class_name: class_name.clone(),
                 type_scope: type_scope.clone(),
@@ -881,8 +882,9 @@ fn type_ref_of_datatype(dt: &Value) -> TypeRef {
     }
 }
 
-/// Classify the unpacked dimension of a declared variable: a queue/dynamic/
-/// fixed array (`Queue`), an associative array (`Assoc`), or a scalar (`None`).
+/// Classify the unpacked dimension of a declared variable: a queue/dynamic
+/// array (`Queue`), fixed array (`Fixed`), associative array (`Assoc`), or a
+/// scalar (`None`).
 /// Mirrors the Python front-end's `_classify_unpacked_dim`.
 fn classify_coll(rv: &Value) -> Option<CollKind> {
     let dims = find(rv, "kUnpackedDimensions")
@@ -891,10 +893,7 @@ fn classify_coll(rv: &Value) -> Option<CollKind> {
     for dim in kids(dims) {
         match tag(dim) {
             "kDimensionAssociativeType" => return Some(CollKind::Assoc),
-            "kDimensionRange" => {
-                // `[$:N]` bounded queue vs fixed `[hi:lo]` range (both list-backed).
-                return Some(CollKind::Queue);
-            }
+            "kDimensionRange" => return Some(CollKind::Fixed),
             "kDimensionScalar" => {
                 if let Some(el) = find(dim, "kExpressionList") {
                     // `[$]` queue.
@@ -915,6 +914,18 @@ fn classify_coll(rv: &Value) -> Option<CollKind> {
         }
     }
     None
+}
+
+fn lower_unpacked_range(variable: &Value) -> Option<PackedRange> {
+    let range = find(variable, "kUnpackedDimensions")
+        .and_then(|dimensions| find_deep(dimensions, "kDimensionRange"))?;
+    let mut bounds = kids(range)
+        .filter(|child| tag(child) == "kExpression")
+        .map(lower_expr);
+    Some(PackedRange {
+        left: bounds.next()?,
+        right: bounds.next()?,
+    })
 }
 
 fn assoc_key_class_name(rv: &Value) -> Option<String> {
@@ -1388,6 +1399,7 @@ fn lower_struct_typedef(n: &Value) -> Option<ClassDecl> {
             name: mname,
             width: mdtype.map(packed_width).unwrap_or(1),
             packed_range: mdtype.and_then(lower_packed_range),
+            unpacked_range: lower_unpacked_range(inner).map(Box::new),
             signed: false,
             class_name: mdtype.and_then(class_type_name),
             type_scope: mdtype.and_then(class_type_scope),

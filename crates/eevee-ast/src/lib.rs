@@ -270,6 +270,7 @@ pub struct VarDecl {
     pub name: String,
     pub width: u32,
     pub packed_range: Option<PackedRange>,
+    pub unpacked_range: Option<Box<PackedRange>>,
     pub signed: bool,
     /// `Some(class)` if this is a class handle (a reference, not a bit-vector).
     /// For a collection, this is the *element* class (if the elements are
@@ -297,8 +298,10 @@ pub struct VarDecl {
 /// The flavor of an unpacked collection declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollKind {
-    /// `[$]` queue, `[]` dynamic array, or `[N]` fixed array (all list-backed).
+    /// `[$]` queue or `[]` dynamic array.
     Queue,
+    /// One fixed unpacked range such as `[0:DEPTH-1]`.
+    Fixed,
     /// `[key_type]` associative array.
     Assoc,
 }

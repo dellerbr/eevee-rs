@@ -404,6 +404,13 @@ fn run_frame(
             Inst::NetRead { dst, net } => {
                 regs[dst as usize] = Value::Logic(k.net_value(net).clone());
             }
+            Inst::MemoryRead { dst, memory, index } => {
+                let memory = &prog.memories[memory as usize];
+                regs[dst as usize] = match memory_element(memory, &regs[index as usize]) {
+                    Some(net) => Value::Logic(k.net_value(net).clone()),
+                    None => Value::Logic(LogicVec::x(memory.element_width)),
+                };
+            }
             Inst::Not { dst, a } => {
                 let v = regs[a as usize].as_logic().bitnot();
                 regs[dst as usize] = Value::Logic(v);
@@ -531,6 +538,24 @@ fn run_frame(
             Inst::NbaWrite { net, src } => {
                 let v = regs[src as usize].as_logic().clone();
                 k.schedule_nba(net, v);
+            }
+            Inst::BlockingMemoryWrite { memory, index, src } => {
+                let memory = &prog.memories[memory as usize];
+                if let Some(net) = memory_element(memory, &regs[index as usize]) {
+                    let value = regs[src as usize]
+                        .as_logic()
+                        .resize(memory.element_width, false);
+                    k.write_net(net, value);
+                }
+            }
+            Inst::NbaMemoryWrite { memory, index, src } => {
+                let memory = &prog.memories[memory as usize];
+                if let Some(net) = memory_element(memory, &regs[index as usize]) {
+                    let value = regs[src as usize]
+                        .as_logic()
+                        .resize(memory.element_width, false);
+                    k.schedule_nba(net, value);
+                }
             }
             Inst::DriveNet { driver, src } => {
                 let value = regs[src as usize].as_logic().clone();
@@ -728,8 +753,12 @@ fn run_frame(
             Inst::IndexGet { dst, base, idx } => {
                 let v = match &regs[base as usize] {
                     Value::Logic(value) => {
-                        let i = regs[idx as usize].as_logic().to_u64() as u32;
-                        Value::Logic(LogicVec::from_bit(value.get_bit(i)))
+                        let index = regs[idx as usize].as_logic();
+                        if index.is_known() && index.to_u64() < u64::from(value.width()) {
+                            Value::Logic(LogicVec::from_bit(value.get_bit(index.to_u64() as u32)))
+                        } else {
+                            Value::Logic(LogicVec::x(1))
+                        }
                     }
                     Value::Queue(rc) => {
                         let i = regs[idx as usize].as_logic().to_u64() as usize;
@@ -766,16 +795,22 @@ fn run_frame(
             }
             Inst::IndexSet { base, idx, src } => {
                 let v = regs[src as usize].assignment_copy();
-                let key = value_to_key(&regs[idx as usize]);
+                let index_value = regs[idx as usize].clone();
+                let key = value_to_key(&index_value);
                 let i = match &key {
                     AssocKey::Int(value) => *value as usize,
                     _ => 0,
                 };
                 let changed = match &mut regs[base as usize] {
-                    Value::Logic(value) => {
-                        value.set_bit(i as u32, v.as_logic().get_bit(0));
-                        true
-                    }
+                    Value::Logic(value) => match &index_value {
+                        Value::Logic(index)
+                            if index.is_known() && index.to_u64() < u64::from(value.width()) =>
+                        {
+                            value.set_bit(index.to_u64() as u32, v.as_logic().get_bit(0));
+                            true
+                        }
+                        _ => false,
+                    },
                     Value::Queue(rc) => {
                         let mut q = rc.borrow_mut();
                         if i >= q.len() {
@@ -922,6 +957,23 @@ fn run_frame(
             }
         }
     }
+}
+
+fn memory_element(memory: &crate::inst::MemoryDef, index: &Value) -> Option<eevee_sched::NetId> {
+    let index = index.as_logic();
+    let index = i64::try_from(index.try_to_u64()?).ok()?;
+    let offset = if memory.left <= memory.right {
+        if index < memory.left || index > memory.right {
+            return None;
+        }
+        index - memory.left
+    } else {
+        if index > memory.left || index < memory.right {
+            return None;
+        }
+        memory.left - index
+    };
+    memory.elements.get(offset as usize).copied()
 }
 
 /// Format a `$display` line. `%d/%h(x)/%o/%b` format the next logic argument in

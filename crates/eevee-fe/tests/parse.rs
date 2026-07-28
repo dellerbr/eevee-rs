@@ -539,6 +539,33 @@ fn parses_generate_if_case_and_for() {
 }
 
 #[test]
+fn parses_parameterized_fixed_unpacked_memory() {
+    let source = "module top #(parameter int WIDTH = 8, DEPTH = 4);\n\
+      logic [WIDTH-1:0] memory [0:DEPTH-1];\n\
+    endmodule\n";
+    let file = parse_source_conformant(source).expect("fixed memory parses");
+    let memory = module(&file)
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ModuleItem::Var(variable) => Some(variable),
+            _ => None,
+        })
+        .expect("memory declaration");
+    assert_eq!(memory.coll, Some(CollKind::Fixed));
+    assert!(memory.packed_range.is_some());
+    assert!(memory.unpacked_range.is_some());
+
+    let error = parse_source_conformant("module top; logic [7:0] memory [0:1][0:1]; endmodule\n")
+        .expect_err("multiple unpacked dimensions are not represented yet");
+    assert!(matches!(
+        error,
+        FeError::UnsupportedSyntax { ref construct, .. }
+            if construct == "kUnpackedDimensions"
+    ));
+}
+
+#[test]
 fn conformance_mode_accepts_continuous_assignment_delay_tuples() {
     let simple =
         "module top;\n  logic source; wire result;\n  assign result = source;\nendmodule\n";

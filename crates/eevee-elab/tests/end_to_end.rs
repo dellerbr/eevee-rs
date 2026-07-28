@@ -881,10 +881,6 @@ fn conformance_mode_rejects_invalid_continuous_drivers() {
           "continuous conditional branch width mismatch",
         ),
         (
-            "module top; logic [3:0] source; wire result; assign result = source[4]; endmodule",
-            "packed index is out of range",
-        ),
-        (
             "module top; logic source; wire result; assign #(-1) result = source; endmodule",
             "delay is negative",
         ),
@@ -1067,6 +1063,129 @@ fn generate_if_case_and_for_elaborate_selected_scopes() {
             sim.kernel().find_net(absent).is_none(),
             "unexpected {absent}"
         );
+    }
+}
+
+#[test]
+fn fixed_memories_and_dynamic_selects_follow_scheduler_semantics() {
+    let source = "module top #(parameter int WIDTH = 8, DEPTH = 4);\n\
+      logic [WIDTH-1:0] memory [0:DEPTH-1];\n\
+      logic [WIDTH-1:0] reverse [DEPTH-1:0];\n\
+      logic [2:0] address = 0;\n\
+      logic [2:0] bit_index = 3;\n\
+      logic [3:0] bad_index = 9;\n\
+      logic [7:0] vector = 0;\n\
+      logic bit_value = 0;\n\
+      logic invalid_bit = 0;\n\
+      logic [WIDTH-1:0] invalid = 0;\n\
+      wire [WIDTH-1:0] observed;\n\
+      wire observed_bit;\n\
+      wire out_of_range_bit;\n\
+      assign observed = memory[address];\n\
+      assign observed_bit = vector[bit_index];\n\
+      assign out_of_range_bit = vector[bad_index];\n\
+      initial begin\n\
+        memory[0] = 8'h11;\n\
+        memory[1] = 8'h22;\n\
+        reverse[3] = 8'h33;\n\
+        reverse[0] = 8'h00;\n\
+        address = 1;\n\
+        vector[bit_index] = 1'b1;\n\
+        bit_value = vector[bit_index];\n\
+        #1;\n\
+        memory[2] <= 8'hcc;\n\
+        address = 2;\n\
+        #1;\n\
+        invalid = memory[7];\n\
+        invalid_bit = vector[bad_index];\n\
+        memory[7] = 8'hff;\n\
+        vector[7] <= 1'b1;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(source).expect("fixed memory syntax parses");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("fixed memory elaboration");
+    sim.kernel().set_echo(false);
+
+    sim.run_until(Some(SimTime::from_fs(0)));
+    for (name, value) in [
+        ("memory[0]", 0x11),
+        ("memory[1]", 0x22),
+        ("reverse[3]", 0x33),
+        ("reverse[0]", 0x00),
+        ("observed", 0x22),
+        ("vector", 0x08),
+        ("bit_value", 0x01),
+        ("observed_bit", 0x01),
+    ] {
+        let net = sim.kernel().find_net(name).expect("memory/select net");
+        assert_eq!(
+            sim.kernel().net_value(net).to_u64(),
+            value,
+            "value of {name}"
+        );
+    }
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    let memory_two = sim.kernel().find_net("memory[2]").expect("memory element");
+    let observed = sim.kernel().find_net("observed").expect("observed net");
+    assert_eq!(sim.kernel().net_value(memory_two).to_u64(), 0xcc);
+    assert_eq!(sim.kernel().net_value(observed).to_u64(), 0xcc);
+
+    sim.run_until(Some(SimTime::from_fs(2_000_000)));
+    let invalid = sim
+        .kernel()
+        .find_net("invalid")
+        .expect("invalid read result");
+    let invalid_bit = sim
+        .kernel()
+        .find_net("invalid_bit")
+        .expect("invalid packed read result");
+    let out_of_range_bit = sim
+        .kernel()
+        .find_net("out_of_range_bit")
+        .expect("continuous invalid packed read result");
+    let packed = sim.kernel().find_net("vector").expect("packed vector");
+    assert!(!sim.kernel().net_value(invalid).is_known());
+    assert!(!sim.kernel().net_value(invalid_bit).is_known());
+    assert!(!sim.kernel().net_value(out_of_range_bit).is_known());
+    assert_eq!(sim.kernel().net_value(memory_two).to_u64(), 0xcc);
+    assert_eq!(sim.kernel().net_value(packed).to_u64(), 0x88);
+}
+
+#[test]
+fn conformance_mode_rejects_unsupported_fixed_memory_forms() {
+    let cases = [
+        (
+            "module top; logic [7:0] dynamic_memory[]; endmodule\n",
+            "module collection 'dynamic_memory' is not a fixed unpacked memory",
+        ),
+        (
+            "module top; logic signed [7:0] memory[0:1]; endmodule\n",
+            "fixed memory 'memory' must have an unsigned integral element type",
+        ),
+        (
+            "module top; initial begin logic [7:0] local_memory[0:1]; end endmodule\n",
+            "procedural fixed unpacked array 'local_memory' is unsupported",
+        ),
+        (
+            "class holder; logic [7:0] memory[0:1]; endclass module top; endmodule\n",
+            "fixed unpacked array 'memory' is only supported for module memories",
+        ),
+        (
+            "module top; logic [7:0] memory[-1:1]; endmodule\n",
+            "fixed memory bounds must be nonnegative",
+        ),
+    ];
+    for (source, expected) in cases {
+        let file = parse_source_conformant(source).expect("fixed-array syntax parses");
+        let error = match elaborate_conformant(&file, &Interp) {
+            Ok(_) => panic!("unsupported fixed-array form must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+          error,
+          ElabError::UnsupportedSemantic { ref message } if message.contains(expected)
+        ));
     }
 }
 

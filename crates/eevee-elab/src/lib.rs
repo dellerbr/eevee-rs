@@ -658,7 +658,7 @@ fn build_global(
         let id = statics_defaults.len() as u32;
         let default = match v.coll {
             Some(CollKind::Assoc) => Value::new_assoc(),
-            Some(CollKind::Queue) => Value::new_queue(),
+            Some(CollKind::Queue | CollKind::Fixed) => Value::new_queue(),
             None => default_value(v, &consts),
         };
         statics_defaults.push(default);
@@ -800,6 +800,7 @@ fn build_global(
     // A body that hits an unsupported construct panics inside the codegen; we
     // catch it and substitute a stub so the rest of the library still loads.
     let empty_scope: HashMap<String, (NetId, u32)> = HashMap::new();
+    let empty_memories = HashMap::new();
     let gv = GlobalVars {
         vars: &globals,
         widths: &global_widths,
@@ -829,6 +830,7 @@ fn build_global(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             CodeGen::new(
                 &empty_scope,
+                &empty_memories,
                 &func_ids,
                 &class_ids,
                 &class_infos,
@@ -1088,7 +1090,7 @@ fn build_class_info(
             let id = statics_defaults.len() as u32;
             let default = match fld.coll {
                 Some(CollKind::Assoc) => Value::new_assoc(),
-                Some(CollKind::Queue) => Value::new_queue(),
+                Some(CollKind::Queue | CollKind::Fixed) => Value::new_queue(),
                 None => default_value(fld, consts),
             };
             statics_defaults.push(default);
@@ -1369,6 +1371,7 @@ fn elaborate_module_instance(
         scope,
         scope_kinds,
         drivable,
+        HashMap::new(),
         &consts,
         modules,
         g,
@@ -1385,6 +1388,7 @@ fn elaborate_module_items(
     mut scope: HashMap<String, (NetId, u32)>,
     mut scope_kinds: HashMap<String, Option<NetKind>>,
     mut drivable: HashSet<String>,
+    mut memories: HashMap<String, MemoryInfo>,
     consts: &HashMap<String, LogicVec>,
     modules: &HashMap<&str, &Module>,
     g: &Global,
@@ -1414,6 +1418,46 @@ fn elaborate_module_items(
     for it in items {
         if let ModuleItem::Var(v) = it {
             let width = resolve_declared_width(v.width, v.packed_range.as_ref(), consts);
+            if let Some(range) = &v.unpacked_range {
+                assert_eq!(v.coll, Some(CollKind::Fixed));
+                assert!(v.init.is_none(), "fixed memory initializer is unsupported");
+                let (left, right) = resolve_range_bounds(range, consts, "fixed memory");
+                assert!(
+                    left >= 0 && right >= 0,
+                    "fixed memory bounds must be nonnegative"
+                );
+                let count = left
+                    .abs_diff(right)
+                    .checked_add(1)
+                    .and_then(|count| usize::try_from(count).ok())
+                    .unwrap_or_else(|| panic!("fixed memory is too large"));
+                assert!(
+                    count <= 1_000_000,
+                    "fixed memory exceeds one million elements"
+                );
+                let mut elements = Vec::with_capacity(count);
+                for offset in 0..count {
+                    let index = if left <= right {
+                        left + offset as i64
+                    } else {
+                        left - offset as i64
+                    };
+                    elements.push(sim.kernel().new_net(
+                        scoped_name(path, &format!("{}[{index}]", v.name)),
+                        LogicVec::x(width),
+                    ));
+                }
+                memories.insert(
+                    v.name.clone(),
+                    MemoryInfo {
+                        elements,
+                        left,
+                        right,
+                        element_width: width,
+                    },
+                );
+                continue;
+            }
             let init = match &v.init {
                 Some(e) => {
                     try_const_eval_at_width(e, consts, width, v.signed).unwrap_or_else(|| {
@@ -1448,6 +1492,7 @@ fn elaborate_module_items(
             ModuleItem::Always(a) => {
                 let prog = CodeGen::new(
                     &scope,
+                    &memories,
                     &g.func_ids,
                     &g.class_ids,
                     &g.class_infos,
@@ -1461,6 +1506,7 @@ fn elaborate_module_items(
             ModuleItem::Initial(body) => {
                 let prog = CodeGen::new(
                     &scope,
+                    &memories,
                     &g.func_ids,
                     &g.class_ids,
                     &g.class_infos,
@@ -1499,6 +1545,7 @@ fn elaborate_module_items(
                     .map(|delay| compile_continuous_delay(delay, consts, ts));
                 let prog = CodeGen::new(
                     &scope,
+                    &memories,
                     &g.func_ids,
                     &g.class_ids,
                     &g.class_infos,
@@ -1533,6 +1580,7 @@ fn elaborate_module_items(
             &scope,
             &scope_kinds,
             &drivable,
+            &memories,
             consts,
             modules,
             g,
@@ -1611,6 +1659,7 @@ fn elaborate_generate_construct(
     scope: &HashMap<String, (NetId, u32)>,
     scope_kinds: &HashMap<String, Option<NetKind>>,
     drivable: &HashSet<String>,
+    memories: &HashMap<String, MemoryInfo>,
     consts: &HashMap<String, LogicVec>,
     modules: &HashMap<&str, &Module>,
     global: &Global,
@@ -1638,6 +1687,7 @@ fn elaborate_generate_construct(
                     scope,
                     scope_kinds,
                     drivable,
+                    memories,
                     consts,
                     modules,
                     global,
@@ -1673,6 +1723,7 @@ fn elaborate_generate_construct(
                     scope,
                     scope_kinds,
                     drivable,
+                    memories,
                     consts,
                     modules,
                     global,
@@ -1712,6 +1763,7 @@ fn elaborate_generate_construct(
                     scope,
                     scope_kinds,
                     drivable,
+                    memories,
                     &iteration_consts,
                     modules,
                     global,
@@ -1738,6 +1790,7 @@ fn elaborate_generate_block(
     parent_scope: &HashMap<String, (NetId, u32)>,
     parent_scope_kinds: &HashMap<String, Option<NetKind>>,
     parent_drivable: &HashSet<String>,
+    parent_memories: &HashMap<String, MemoryInfo>,
     consts: &HashMap<String, LogicVec>,
     modules: &HashMap<&str, &Module>,
     global: &Global,
@@ -1759,6 +1812,7 @@ fn elaborate_generate_block(
         parent_scope.clone(),
         parent_scope_kinds.clone(),
         parent_drivable.clone(),
+        parent_memories.clone(),
         consts,
         modules,
         global,
@@ -1813,14 +1867,7 @@ fn resolve_declared_width(
     let Some(packed_range) = packed_range else {
         return fallback;
     };
-    let evaluate = |expression: &Expr| {
-        let value = try_const_eval_with(expression, consts)
-            .unwrap_or_else(|| panic!("packed range bound is not a constant expression"));
-        assert!(value.is_known(), "packed range bound contains X or Z");
-        value.to_i64()
-    };
-    let left = evaluate(&packed_range.left);
-    let right = evaluate(&packed_range.right);
+    let (left, right) = resolve_range_bounds(packed_range, consts, "packed range");
     let width = left
         .abs_diff(right)
         .checked_add(1)
@@ -1828,6 +1875,20 @@ fn resolve_declared_width(
         .unwrap_or_else(|| panic!("packed range width exceeds simulator limits"));
     assert!(width > 0, "packed range width must be positive");
     width
+}
+
+fn resolve_range_bounds(
+    range: &PackedRange,
+    consts: &HashMap<String, LogicVec>,
+    context: &str,
+) -> (i64, i64) {
+    let evaluate = |expression: &Expr| {
+        let value = try_const_eval_with(expression, consts)
+            .unwrap_or_else(|| panic!("{context} bound is not a constant expression"));
+        assert!(value.is_known(), "{context} bound contains X or Z");
+        value.to_i64()
+    };
+    (evaluate(&range.left), evaluate(&range.right))
 }
 
 fn add_port_bridge(
@@ -2145,8 +2206,17 @@ fn compile_continuous_delay(
     }
 }
 
+#[derive(Clone)]
+struct MemoryInfo {
+    elements: Vec<NetId>,
+    left: i64,
+    right: i64,
+    element_width: u32,
+}
+
 struct CodeGen<'a> {
     nets: &'a HashMap<String, (NetId, u32)>,
+    memories: &'a HashMap<String, MemoryInfo>,
     funcs: &'a HashMap<String, u32>,
     class_ids: &'a HashMap<String, u32>,
     classes: &'a [ClassInfo],
@@ -2190,8 +2260,10 @@ struct GlobalVars<'a> {
 }
 
 impl<'a> CodeGen<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         nets: &'a HashMap<String, (NetId, u32)>,
+        memories: &'a HashMap<String, MemoryInfo>,
         funcs: &'a HashMap<String, u32>,
         class_ids: &'a HashMap<String, u32>,
         classes: &'a [ClassInfo],
@@ -2201,6 +2273,7 @@ impl<'a> CodeGen<'a> {
     ) -> CodeGen<'a> {
         CodeGen {
             nets,
+            memories,
             funcs,
             class_ids,
             classes,
@@ -2317,6 +2390,17 @@ impl<'a> CodeGen<'a> {
                 }
             }
             Expr::Index { base, index } => {
+                if let Expr::Ref(name) = base.as_ref() {
+                    if let Some(memory) = self.memories.get(name) {
+                        for &net in &memory.elements {
+                            if !read_set.contains(&net) {
+                                read_set.push(net);
+                            }
+                        }
+                        self.collect_net_reads(index, read_set);
+                        return;
+                    }
+                }
                 self.collect_net_reads(base, read_set);
                 self.collect_net_reads(index, read_set);
             }
@@ -2384,7 +2468,14 @@ impl<'a> CodeGen<'a> {
                 (Some(width), None) | (None, Some(width)) => Some(width),
                 (None, None) => None,
             },
-            Expr::Index { .. } => Some(1),
+            Expr::Index { base, .. } => match base.as_ref() {
+                Expr::Ref(name) => self
+                    .memories
+                    .get(name)
+                    .map(|memory| memory.element_width)
+                    .or(Some(1)),
+                _ => Some(1),
+            },
             Expr::PartSelect { left, right, .. } => {
                 let Expr::Literal(left) = left.as_ref() else {
                     return None;
@@ -2930,7 +3021,7 @@ impl<'a> CodeGen<'a> {
                     self.local_colls.insert(v.name.clone(), info);
                     match info.kind {
                         CollKind::Assoc => pb.emit(Inst::NewAssoc { dst: reg }),
-                        CollKind::Queue => pb.emit(Inst::NewQueue { dst: reg }),
+                        CollKind::Queue | CollKind::Fixed => pb.emit(Inst::NewQueue { dst: reg }),
                     }
                 } else if let Some(cn) = &v.class_name {
                     // Class handle: record its declared class so later member
@@ -3377,6 +3468,8 @@ impl<'a> CodeGen<'a> {
                 } else if self.method_of_ctx(name) {
                     // Unqualified zero-arg method of the current class -> this.m().
                     self.gen_method_on_this(name, &[], pb)
+                } else if self.memories.contains_key(name) {
+                    panic!("fixed memory '{name}' requires an element index")
                 } else {
                     let net = self.net(name);
                     let dst = pb.new_reg();
@@ -3600,6 +3693,20 @@ impl<'a> CodeGen<'a> {
                 panic!("no field '{field}' on the receiver class")
             }
             Expr::Index { base, index } => {
+                if let Expr::Ref(name) = base.as_ref() {
+                    if let Some(memory) = self.memories.get(name) {
+                        let memory = pb.memory(
+                            &memory.elements,
+                            memory.left,
+                            memory.right,
+                            memory.element_width,
+                        );
+                        let index = self.gen_expr(index, pb);
+                        let dst = pb.new_reg();
+                        pb.emit(Inst::MemoryRead { dst, memory, index });
+                        return dst;
+                    }
+                }
                 // String indexing: str[i] -> byte value at position i.
                 if let Expr::Ref(name) = base.as_ref() {
                     if self.is_string_local(name) {
@@ -4297,6 +4404,39 @@ impl<'a> CodeGen<'a> {
         pb: &mut ProgramBuilder,
     ) {
         if let Some(index) = &lhs.index {
+            if lhs.receiver.is_none() && lhs.scope.is_none() {
+                if let Some(memory) = self.memories.get(&lhs.name) {
+                    let memory = pb.memory(
+                        &memory.elements,
+                        memory.left,
+                        memory.right,
+                        memory.element_width,
+                    );
+                    let index = self.gen_expr(index, pb);
+                    if nonblocking {
+                        pb.emit(Inst::NbaMemoryWrite { memory, index, src });
+                    } else {
+                        pb.emit(Inst::BlockingMemoryWrite { memory, index, src });
+                    }
+                    return;
+                }
+                if let Some(&(net, _)) = self.nets.get(&lhs.name) {
+                    let current = pb.new_reg();
+                    pb.emit(Inst::NetRead { dst: current, net });
+                    let index = self.gen_expr(index, pb);
+                    pb.emit(Inst::IndexSet {
+                        base: current,
+                        idx: index,
+                        src,
+                    });
+                    if nonblocking {
+                        pb.emit(Inst::NbaWrite { net, src: current });
+                    } else {
+                        pb.emit(Inst::BlockingWrite { net, src: current });
+                    }
+                    return;
+                }
+            }
             // `base[index] = src` — element write through the shared collection
             // handle (mutates the underlying storage).
             let base_expr = match &lhs.scope {
@@ -4355,6 +4495,14 @@ impl<'a> CodeGen<'a> {
 
     fn lvalue_width(&self, lhs: &Lvalue) -> Option<u32> {
         if lhs.index.is_some() {
+            if lhs.receiver.is_none() && lhs.scope.is_none() {
+                if let Some(memory) = self.memories.get(&lhs.name) {
+                    return Some(memory.element_width);
+                }
+                if self.nets.contains_key(&lhs.name) {
+                    return Some(1);
+                }
+            }
             return None;
         }
         if let Some(scope) = &lhs.scope {

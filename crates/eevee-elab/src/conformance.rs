@@ -325,7 +325,10 @@ fn continuous_expr_width_with_context(
             let when_false = continuous_expr_width_with_context(module, when_false, context_width)?;
             (when_true == when_false).then_some(when_true)
         }
-        Expr::Index { .. } => Some(1),
+        Expr::Index { base, .. } => match base.as_ref() {
+            Expr::Ref(name) => module_memory_element_width(module, name).or(Some(1)),
+            _ => Some(1),
+        },
         Expr::PartSelect { left, right, .. } => {
             let Expr::Literal(left) = left.as_ref() else {
                 return None;
@@ -378,20 +381,14 @@ fn validate_continuous_expr(module: &Module, expr: &Expr) -> Result<(), ElabErro
             Ok(())
         }
         Expr::Index { base, index } => {
-            validate_continuous_expr(module, base)?;
-            let Expr::Literal(index) = index.as_ref() else {
-                return unsupported(format!(
-                    "continuous packed index must be a constant in module '{}'",
-                    module.name
-                ));
-            };
-            let width = continuous_expr_width(module, base).unwrap_or(0);
-            if !index.is_known() || index.to_u64() >= u64::from(width) {
-                return unsupported(format!(
-                    "continuous packed index is out of range in module '{}'",
-                    module.name
-                ));
+            if let Expr::Ref(name) = base.as_ref() {
+                if module_memory_element_width(module, name).is_some() {
+                    validate_continuous_expr(module, index)?;
+                    return Ok(());
+                }
             }
+            validate_continuous_expr(module, base)?;
+            validate_continuous_expr(module, index)?;
             Ok(())
         }
         Expr::PartSelect { base, left, right } => {
@@ -589,7 +586,9 @@ fn module_signal_width(module: &Module, name: &str) -> Option<u32> {
         .map(|port| port.width)
         .or_else(|| {
             module.items.iter().find_map(|item| match item {
-                ModuleItem::Var(var) if var.name == name => Some(var.width),
+                ModuleItem::Var(var) if var.name == name && var.unpacked_range.is_none() => {
+                    Some(var.width)
+                }
                 ModuleItem::Net(net) if net.name == name => Some(net.width),
                 _ => None,
             })
@@ -607,6 +606,13 @@ fn module_signal_has_packed_range(module: &Module, name: &str) -> bool {
             ModuleItem::Net(net) if net.name == name => net.packed_range.is_some(),
             _ => false,
         })
+}
+
+fn module_memory_element_width(module: &Module, name: &str) -> Option<u32> {
+    module.items.iter().find_map(|item| match item {
+        ModuleItem::Var(var) if var.name == name && var.unpacked_range.is_some() => Some(var.width),
+        _ => None,
+    })
 }
 
 fn module_signal_net_kind(module: &Module, name: &str) -> Option<NetKind> {
@@ -924,6 +930,32 @@ fn validate_static_var(
     if let Some(range) = &var.packed_range {
         validate_packed_range(range, module_parameters, &var.name)?;
     }
+    if let Some(range) = &var.unpacked_range {
+        if module_parameters.is_none() || var.coll != Some(eevee_ast::CollKind::Fixed) {
+            return unsupported(format!(
+                "fixed unpacked array '{}' is only supported for module memories",
+                var.name
+            ));
+        }
+        if var.class_name.is_some() || var.is_string || var.is_event || var.signed {
+            return unsupported(format!(
+                "fixed memory '{}' must have an unsigned integral element type",
+                var.name
+            ));
+        }
+        validate_packed_range(range, module_parameters, &var.name)?;
+        if var.init.is_some() {
+            return unsupported(format!(
+                "fixed memory '{}' initializer is unsupported",
+                var.name
+            ));
+        }
+    } else if module_parameters.is_some() && var.coll.is_some() {
+        return unsupported(format!(
+            "module collection '{}' is not a fixed unpacked memory",
+            var.name
+        ));
+    }
     let Some(init) = &var.init else {
         return Ok(());
     };
@@ -1006,6 +1038,12 @@ fn validate_stmt(stmt: &Stmt, module_parameters: Option<&HashSet<&str>>) -> Resu
             }
         }
         Stmt::VarDecl(var) => {
+            if var.unpacked_range.is_some() {
+                return unsupported(format!(
+                    "procedural fixed unpacked array '{}' is unsupported",
+                    var.name
+                ));
+            }
             if let Some(range) = &var.packed_range {
                 validate_packed_range(range, None, &var.name)?;
             }

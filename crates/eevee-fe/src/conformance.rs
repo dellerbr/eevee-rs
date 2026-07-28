@@ -287,8 +287,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
             let Some(lhs) = find(node, "kLPValue") else {
                 return unsupported(node, source);
             };
-            if find_deep(lhs, "kDimensionScalar").is_some()
-                || find_deep(lhs, "kDimensionRange").is_some()
+            if find_deep(lhs, "kDimensionRange").is_some()
                 || find_deep(lhs, "kDimensionSlice").is_some()
                 || find_deep(lhs, "kHierarchyExtension").is_some()
                 || find_deep(lhs, "kQualifiedId").is_some()
@@ -298,6 +297,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
             }
         }
         "kPackedDimensions" => validate_packed_dimensions(node, source)?,
+        "kUnpackedDimensions" => validate_fixed_unpacked_dimensions(node, source)?,
         "kSystemTFCall" => {
             let identifier = find_deep(node, "SystemTFIdentifier")
                 .expect("Verible system call without an identifier");
@@ -588,6 +588,21 @@ fn validate_packed_dimensions(node: &Value, source: &str) -> Result<(), FeError>
         } else {
             validate_packed_dimensions(child, source)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_fixed_unpacked_dimensions(node: &Value, source: &str) -> Result<(), FeError> {
+    let Some(dimensions) = find(node, "kDeclarationDimensions") else {
+        return Ok(());
+    };
+    let dimensions: Vec<_> = kids(dimensions).collect();
+    if dimensions
+        .iter()
+        .any(|dimension| tag(dimension) == "kDimensionRange")
+        && dimensions.len() != 1
+    {
+        return unsupported(node, source);
     }
     Ok(())
 }

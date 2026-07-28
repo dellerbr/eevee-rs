@@ -33,6 +33,8 @@ pub type Reg = u32;
 pub type ConstId = u32;
 /// Index into [`Program::netlists`].
 pub type NetListId = u32;
+/// Index into [`Program::memories`].
+pub type MemoryId = u32;
 /// A code address (index into [`Program::code`]).
 pub type CodeAddr = u32;
 /// Index into [`Program::arglists`].
@@ -81,6 +83,12 @@ pub enum Inst {
 
     /// `dst = <value of net>` (read the net's current value).
     NetRead { dst: Reg, net: NetId },
+    /// Dynamically read one scheduler-backed fixed-memory element.
+    MemoryRead {
+        dst: Reg,
+        memory: MemoryId,
+        index: Reg,
+    },
 
     // --- 4-state ALU (operands and result are logic) ---
     /// `dst = ~a`.
@@ -142,6 +150,18 @@ pub enum Inst {
     BlockingWrite { net: NetId, src: Reg },
     /// Non-blocking assign: schedule the net update for the NBA region.
     NbaWrite { net: NetId, src: Reg },
+    /// Dynamically write one fixed-memory element in the Active region.
+    BlockingMemoryWrite {
+        memory: MemoryId,
+        index: Reg,
+        src: Reg,
+    },
+    /// Dynamically schedule one fixed-memory element update in the NBA region.
+    NbaMemoryWrite {
+        memory: MemoryId,
+        index: Reg,
+        src: Reg,
+    },
     /// Update one continuous driver; the scheduler resolves all drivers.
     DriveNet { driver: DriverId, src: Reg },
     /// Schedule an inertial continuous-driver update after `delay_fs`.
@@ -341,6 +361,8 @@ pub struct Program {
     pub consts: Vec<Value>,
     /// Net read-sets for `WaitCond` (and future multi-signal sensitivity).
     pub netlists: Vec<Box<[NetId]>>,
+    /// Scheduler-backed fixed unpacked memories used by this program.
+    pub memories: Vec<MemoryDef>,
     /// Argument register lists for `Display` (and future calls).
     pub arglists: Vec<Box<[Reg]>>,
     /// Programs compiled for `fork` branches, referenced by `fork_groups`.
@@ -359,6 +381,15 @@ pub struct Program {
     pub arg_modes: Box<[ArgMode]>,
     /// Human-readable label (debug/trace/VCD).
     pub label: String,
+}
+
+/// One fixed unpacked memory in declaration order from `left` toward `right`.
+#[derive(Clone, Debug)]
+pub struct MemoryDef {
+    pub elements: Box<[NetId]>,
+    pub left: i64,
+    pub right: i64,
+    pub element_width: u32,
 }
 
 /// A class definition: its name, the default value of each field (used to
@@ -469,6 +500,7 @@ pub struct ProgramBuilder {
     code: Vec<Inst>,
     consts: Vec<Value>,
     netlists: Vec<Box<[NetId]>>,
+    memories: Vec<MemoryDef>,
     arglists: Vec<Box<[Reg]>>,
     forks: Vec<Rc<Program>>,
     fork_captures: Vec<Box<[(Reg, Reg)]>>,
@@ -489,6 +521,7 @@ impl ProgramBuilder {
             code: Vec::new(),
             consts: Vec::new(),
             netlists: Vec::new(),
+            memories: Vec::new(),
             arglists: Vec::new(),
             forks: Vec::new(),
             fork_captures: Vec::new(),
@@ -530,6 +563,24 @@ impl ProgramBuilder {
     pub fn netlist(&mut self, nets: &[NetId]) -> NetListId {
         let id = self.netlists.len() as u32;
         self.netlists.push(nets.to_vec().into_boxed_slice());
+        id
+    }
+
+    /// Intern one scheduler-backed fixed memory.
+    pub fn memory(
+        &mut self,
+        elements: &[NetId],
+        left: i64,
+        right: i64,
+        element_width: u32,
+    ) -> MemoryId {
+        let id = self.memories.len() as u32;
+        self.memories.push(MemoryDef {
+            elements: elements.to_vec().into_boxed_slice(),
+            left,
+            right,
+            element_width,
+        });
         id
     }
 
@@ -630,6 +681,7 @@ impl ProgramBuilder {
             code: self.code,
             consts: self.consts,
             netlists: self.netlists,
+            memories: self.memories,
             arglists: self.arglists,
             forks: self.forks,
             fork_captures: self.fork_captures,

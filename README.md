@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 28, 2026:
 
-- 187 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 190 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -90,6 +90,11 @@ Validated on July 28, 2026:
   scopes from integral parameter/genvar expressions. Generated declarations,
   nested generate blocks, child instances, parameter overrides, and continuous
   assignments execute with indexed hierarchy names such as `lane[1].value`.
+- One fixed unpacked memory dimension on unsigned integral module variables is
+  scheduler-backed per element. Parameterized ascending/descending nonnegative
+  bounds, dynamic reads, blocking/NBA writes, continuous-read sensitivity, and
+  out-of-range/X-index read/write behavior are validated end to end. Packed
+  dynamic bit reads and procedural blocking/NBA bit writes are also supported.
 - A source-level synchronous counter validates `always #delay`,
   `always_ff @(posedge clk)`, nonblocking assignment, and NBA settling. Focused
   swap tests confirm simultaneous NBAs read old values. This is a usable narrow
@@ -163,6 +168,8 @@ The current implementation includes:
   packed widths on module ports, variables, and nets.
 - Generate `if`/`case`/`for`, declared or inline genvars, named generated
   scopes, and generated module instances/processes.
+- Scheduler-backed fixed unpacked module memories with dynamic element access,
+  plus dynamic packed bit reads and procedural writes.
 - Plain `wire`/`tri`, implicit `tri0`/`tri1` and `supply0`/`supply1`,
   `wand`/`triand`, and `wor`/`trior` nets; reactive continuous assignment
   processes; and symmetric or explicit/asymmetric strength-aware ordinary-net
@@ -288,9 +295,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
      machine-readable evidence without publishing a whole-standard percentage.
 
 2. **Core elaboration and hierarchy**
-   - Build on the ANSI-port/child-instance/integral-parameter/generate slice
-     with fixed unpacked memories, dynamic selects, and hierarchical
-     references.
+   - Complete expression sizing/signing and assignment/port coercion, then add
+     hierarchical references and explicit top selection.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -362,7 +368,7 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   three-value timescale-relative inertial delays. Net declaration assignments,
   procedural net writes, implicit width conversion, signed operands/targets,
   charge strengths, nondefault wired-net strengths, explicit-unit delay literals,
-  dynamic/out-of-range RHS selects, partial/hierarchical targets, and driver
+  dynamic part-selects, partial/hierarchical targets, and driver
   mutation outside static continuous assignments remain unsupported in
   conformance mode. Static drivers can withdraw by evaluating to Z; procedural
   `assign/deassign` and `force/release` remain unsupported.
@@ -373,6 +379,12 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   parameter-dependent callable signatures/procedural locals, and complete
   sizing/signing/coercion remain unsupported in conformance mode. One packed
   range on module ports, variables, and nets may use module parameters.
+- Fixed-memory support is limited to one nonnegative ascending or descending
+  unpacked range on unsigned integral module variables. Multiple dimensions,
+  signed/class/string/event elements, declaration initializers, procedural or
+  class/package fixed arrays, dynamic module arrays, memory ports, whole-memory
+  assignment, and signed/negative indices remain unsupported in conformance
+  mode.
 - The passing phase probe constructs `uvm_test_top` directly and calls
   `run_test("")`; named test selection and plusarg-driven factory registration
   are not yet complete.
