@@ -1278,13 +1278,55 @@ fn arg_mode(dir: PortDir) -> ArgMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortConnectionMode {
+    Alias,
+    InputBridge,
+    OutputBridge,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PortBinding {
+    Alias(NetId),
+    InputBridge(NetId),
+    OutputBridge(NetId),
+}
+
+fn bridgeable_resolution(kind: NetKind) -> bool {
+    matches!(kind, NetKind::Wire | NetKind::Wand | NetKind::Wor)
+}
+
+fn port_connection_mode(port: &Port, actual_kind: Option<NetKind>) -> Option<PortConnectionMode> {
+    let Some(port_kind) = port.net_kind else {
+        return Some(PortConnectionMode::Alias);
+    };
+    if actual_kind == Some(port_kind) {
+        return Some(PortConnectionMode::Alias);
+    }
+    match port.dir {
+        PortDir::Input
+            if bridgeable_resolution(port_kind)
+                && actual_kind.map_or(true, bridgeable_resolution) =>
+        {
+            Some(PortConnectionMode::InputBridge)
+        }
+        PortDir::Output
+            if bridgeable_resolution(port_kind)
+                && actual_kind.is_some_and(bridgeable_resolution) =>
+        {
+            Some(PortConnectionMode::OutputBridge)
+        }
+        PortDir::Input | PortDir::Output | PortDir::Inout | PortDir::Ref => None,
+    }
+}
+
 /// Build one module instance's nets and processes, then recursively elaborate
 /// its child instances. Connected ports alias parent nets by `NetId`.
 #[allow(clippy::too_many_arguments)]
 fn elaborate_module_instance(
     m: &Module,
     path: &str,
-    port_bindings: &HashMap<String, (NetId, u32)>,
+    port_bindings: &HashMap<String, PortBinding>,
     parameter_overrides: &[ParameterOverride],
     parent_consts: &HashMap<String, LogicVec>,
     modules: &HashMap<&str, &Module>,
@@ -1297,27 +1339,25 @@ fn elaborate_module_instance(
     let mut scope: HashMap<String, (NetId, u32)> = HashMap::new();
     let mut drivable = HashSet::new();
     for port in &m.ports {
-        if let Some(&(net, _)) = port_bindings.get(&port.name) {
-            // A collapsed port reuses the parent net, including any implicit
-            // pull/supply driver installed when that net was created.
-            scope.insert(port.name.clone(), (net, port.width));
-        } else {
-            let net = match port.net_kind {
-                Some(kind) => {
-                    let net = sim.kernel().new_net_with_resolution(
-                        scoped_name(path, &port.name),
-                        LogicVec::z(port.width),
-                        scheduler_resolution(kind),
-                    );
-                    add_implicit_net_driver(sim, net, kind, port.width);
-                    net
-                }
-                None => sim
-                    .kernel()
-                    .new_net(scoped_name(path, &port.name), LogicVec::zero(port.width)),
-            };
-            scope.insert(port.name.clone(), (net, port.width));
-        }
+        let local_net = match port_bindings.get(&port.name).copied() {
+            Some(PortBinding::Alias(net)) => {
+                // A collapsed port reuses the parent net, including any implicit
+                // pull/supply driver installed when that net was created.
+                net
+            }
+            Some(PortBinding::InputBridge(source)) => {
+                let net = new_port_storage(sim, path, port);
+                add_port_bridge(source, net, sim, backend, g);
+                net
+            }
+            Some(PortBinding::OutputBridge(destination)) => {
+                let net = new_port_storage(sim, path, port);
+                add_port_bridge(net, destination, sim, backend, g);
+                net
+            }
+            None => new_port_storage(sim, path, port),
+        };
+        scope.insert(port.name.clone(), (local_net, port.width));
         if port.net_kind.is_some() && matches!(port.dir, PortDir::Output | PortDir::Inout) {
             drivable.insert(port.name.clone());
         }
@@ -1458,7 +1498,7 @@ fn elaborate_module_instance(
                     instance.module_name, instance.name
                 )
             });
-        let bindings = bind_instance_ports(instance, child, &scope);
+        let bindings = bind_instance_ports(instance, child, m, &scope);
         elaborate_module_instance(
             child,
             &scoped_name(path, &instance.name),
@@ -1481,6 +1521,47 @@ fn scheduler_resolution(kind: NetKind) -> NetResolution {
         NetKind::Wand => NetResolution::Wand,
         NetKind::Wor => NetResolution::Wor,
     }
+}
+
+fn new_port_storage(sim: &mut Sim, path: &str, port: &Port) -> NetId {
+    match port.net_kind {
+        Some(kind) => {
+            let net = sim.kernel().new_net_with_resolution(
+                scoped_name(path, &port.name),
+                LogicVec::z(port.width),
+                scheduler_resolution(kind),
+            );
+            add_implicit_net_driver(sim, net, kind, port.width);
+            net
+        }
+        None => sim
+            .kernel()
+            .new_net(scoped_name(path, &port.name), LogicVec::zero(port.width)),
+    }
+}
+
+fn add_port_bridge(
+    source: NetId,
+    destination: NetId,
+    sim: &mut Sim,
+    backend: &dyn ExecBackend,
+    global: &Global,
+) {
+    let driver = sim.kernel().new_driver(destination);
+    let mut builder = ProgramBuilder::new("port bridge");
+    let evaluate = builder.new_label();
+    builder.bind(evaluate);
+    let value = builder.new_reg();
+    builder.emit(Inst::NetRead {
+        dst: value,
+        net: source,
+    });
+    builder.emit(Inst::DriveNet { driver, src: value });
+    let nets = builder.netlist(&[source]);
+    builder.emit(Inst::WaitCond { nets });
+    builder.jump(evaluate);
+    let program = builder.build();
+    sim.add_process(backend.instantiate(Rc::new(program), global.linkage.clone()));
 }
 
 fn add_implicit_net_driver(sim: &mut Sim, net: NetId, kind: NetKind, width: u32) {
@@ -1579,8 +1660,9 @@ fn bind_module_parameters(
 fn bind_instance_ports(
     instance: &ModuleInstance,
     child: &Module,
+    parent: &Module,
     parent_scope: &HashMap<String, (NetId, u32)>,
-) -> HashMap<String, (NetId, u32)> {
+) -> HashMap<String, PortBinding> {
     let mut bindings = HashMap::new();
     for (position, connection) in instance.connections.iter().enumerate() {
         let port = match &connection.port {
@@ -1607,15 +1689,41 @@ fn bind_instance_ports(
                 instance.name, port.name, connection.expr
             );
         };
-        let &(net, width) = parent_scope.get(actual).unwrap_or_else(|| {
+        let &(net, _) = parent_scope.get(actual).unwrap_or_else(|| {
             panic!(
                 "unknown signal '{}' connected to '{}.{}'",
                 actual, instance.name, port.name
             )
         });
-        bindings.insert(port.name.clone(), (net, width));
+        let actual_kind = module_signal_net_kind(parent, actual);
+        let mode = port_connection_mode(port, actual_kind).unwrap_or_else(|| {
+            panic!(
+                "unsupported port resolution bridge for '{}.{}'",
+                instance.name, port.name
+            )
+        });
+        let binding = match mode {
+            PortConnectionMode::Alias => PortBinding::Alias(net),
+            PortConnectionMode::InputBridge => PortBinding::InputBridge(net),
+            PortConnectionMode::OutputBridge => PortBinding::OutputBridge(net),
+        };
+        bindings.insert(port.name.clone(), binding);
     }
     bindings
+}
+
+fn module_signal_net_kind(module: &Module, name: &str) -> Option<NetKind> {
+    module
+        .ports
+        .iter()
+        .find(|port| port.name == name)
+        .and_then(|port| port.net_kind)
+        .or_else(|| {
+            module.items.iter().find_map(|item| match item {
+                ModuleItem::Net(net) if net.name == name => Some(net.kind),
+                _ => None,
+            })
+        })
 }
 
 fn scoped_name(path: &str, name: &str) -> String {

@@ -5,7 +5,7 @@ use eevee_ast::{
     PortDir, SourceFile, Stmt, TimingControl, UnaryOp, VarDecl,
 };
 
-use crate::ElabError;
+use crate::{port_connection_mode, ElabError, PortConnectionMode};
 
 pub(crate) fn validate(file: &SourceFile) -> Result<(), ElabError> {
     validate_hierarchy(file)?;
@@ -103,25 +103,27 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
                 }
                 if let Some(port_kind) = port.net_kind {
                     let actual_kind = module_signal_net_kind(module, actual);
-                    if matches!(port.dir, PortDir::Output | PortDir::Inout) {
-                        let Some(actual_kind) = actual_kind else {
+                    if port.dir == PortDir::Inout && actual_kind != Some(port_kind) {
+                        return unsupported(format!(
+                            "cross-resolution inout port '{}.{}' is unsupported",
+                            instance.name, port.name
+                        ));
+                    }
+                    let Some(mode) = port_connection_mode(port, actual_kind) else {
+                        if matches!(port.dir, PortDir::Output | PortDir::Inout)
+                            && actual_kind.is_none()
+                        {
                             return unsupported(format!(
                                 "net port '{}.{}' must connect to a parent net",
                                 instance.name, port.name
                             ));
-                        };
-                        if actual_kind != port_kind {
-                            return unsupported(format!(
-                                "port resolution mismatch for '{}.{}': port is {:?}, actual '{}' is {:?}",
-                                instance.name, port.name, port_kind, actual, actual_kind
-                            ));
                         }
-                    } else if port_kind != NetKind::Wire && actual_kind != Some(port_kind) {
                         return unsupported(format!(
-                            "resolved input port '{}.{}' requires a matching parent net",
-                            instance.name, port.name
+                            "unsupported port resolution bridge for '{}.{}': port is {:?}, actual '{}' is {:?}",
+                            instance.name, port.name, port_kind, actual, actual_kind
                         ));
-                    }
+                    };
+                    debug_assert!(port.dir != PortDir::Inout || mode == PortConnectionMode::Alias);
                 }
             }
         }

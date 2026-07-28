@@ -150,18 +150,109 @@ fn resolved_net_ports_collapse_with_matching_parent_nets() {
 }
 
 #[test]
+fn cross_resolution_input_and_output_ports_bridge_resolved_values() {
+    let src = "module child(input wire variable_in, input wand resolved_in,\n\
+                            output wor any, output wire plain,\n\
+                            output wire variable_seen, output wire resolved_seen);\n\
+      assign any = 1'b0;\n\
+      assign any = resolved_in;\n\
+      assign plain = resolved_in;\n\
+      assign variable_seen = variable_in;\n\
+      assign resolved_seen = resolved_in;\n\
+    endmodule\n\
+    module top;\n\
+      logic variable_source = 1;\n\
+      logic left = 0;\n\
+      logic right = 0;\n\
+      wor resolved_source;\n\
+      wire any;\n\
+      wand plain;\n\
+      wire variable_seen;\n\
+      wire resolved_seen;\n\
+      assign resolved_source = left;\n\
+      assign resolved_source = right;\n\
+      assign any = 1'b0;\n\
+      assign plain = 1'b1;\n\
+      child dut(.variable_in(variable_source), .resolved_in(resolved_source),\n\
+                .any(any), .plain(plain),\n\
+                .variable_seen(variable_seen), .resolved_seen(resolved_seen));\n\
+      initial begin\n\
+        #1 variable_source = 0;\n\
+        right = 1;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    let any = sim.kernel().find_net("any").expect("ordinary parent net");
+    let plain = sim.kernel().find_net("plain").expect("wand parent net");
+    let variable_seen = sim
+        .kernel()
+        .find_net("variable_seen")
+        .expect("variable input observer");
+    let resolved_seen = sim
+        .kernel()
+        .find_net("resolved_seen")
+        .expect("resolved input observer");
+    let child_variable = sim
+        .kernel()
+        .find_net("dut.variable_in")
+        .expect("local bridged wire input");
+    let child_resolved = sim
+        .kernel()
+        .find_net("dut.resolved_in")
+        .expect("local bridged wand input");
+    let child_any = sim
+        .kernel()
+        .find_net("dut.any")
+        .expect("local bridged wor output");
+    let child_plain = sim
+        .kernel()
+        .find_net("dut.plain")
+        .expect("local bridged wire output");
+    let variable_source = sim
+        .kernel()
+        .find_net("variable_source")
+        .expect("parent variable");
+    let resolved_source = sim
+        .kernel()
+        .find_net("resolved_source")
+        .expect("parent wor net");
+
+    sim.run_until(Some(SimTime::ZERO));
+    assert_eq!(sim.kernel().net_value(any).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(plain).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(variable_source).get_bit(0), Bit::One);
+    assert_eq!(
+        sim.kernel().net_value(resolved_source).get_bit(0),
+        Bit::Zero
+    );
+    assert_eq!(sim.kernel().net_value(child_variable).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(child_resolved).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(child_any).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(child_plain).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(variable_seen).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(resolved_seen).get_bit(0), Bit::Zero);
+
+    sim.run_until(Some(SimTime::from_fs(1_000_000)));
+    assert_eq!(sim.kernel().net_value(any).get_bit(0), Bit::X);
+    assert_eq!(sim.kernel().net_value(plain).get_bit(0), Bit::One);
+    assert_eq!(
+        sim.kernel().net_value(variable_source).get_bit(0),
+        Bit::Zero
+    );
+    assert_eq!(sim.kernel().net_value(resolved_source).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(child_variable).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(child_resolved).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(child_any).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(child_plain).get_bit(0), Bit::One);
+    assert_eq!(sim.kernel().net_value(variable_seen).get_bit(0), Bit::Zero);
+    assert_eq!(sim.kernel().net_value(resolved_seen).get_bit(0), Bit::One);
+}
+
+#[test]
 fn conformance_mode_rejects_resolved_port_mismatches() {
     let cases = [
-        (
-            "module child(output wand value); assign value = 1'b1; endmodule\n\
-         module top; wire value; child dut(.value(value)); endmodule",
-            "port resolution mismatch",
-        ),
-        (
-            "module child(input wor value); endmodule\n\
-         module top; logic value; child dut(.value(value)); endmodule",
-            "requires a matching parent net",
-        ),
         (
             "module top(output wand value);\n\
            assign (strong1, pull0) value = 1'b1; endmodule",
@@ -170,12 +261,22 @@ fn conformance_mode_rejects_resolved_port_mismatches() {
         (
             "module child(output tri0 value); assign value = 1'bz; endmodule\n\
          module top; wire value; child dut(.value(value)); endmodule",
-            "port resolution mismatch",
+            "unsupported port resolution bridge",
         ),
         (
-            "module child(output wand value); assign value = 1'b1; endmodule\n\
-         module top; wor value; child dut(.value(value)); endmodule",
-            "port resolution mismatch",
+            "module child(input tri1 value); endmodule\n\
+       module top; logic value; child dut(.value(value)); endmodule",
+            "unsupported port resolution bridge",
+        ),
+        (
+            "module child(input wire value); endmodule\n\
+         module top; tri1 value; child dut(.value(value)); endmodule",
+            "unsupported port resolution bridge",
+        ),
+        (
+            "module child(inout wand value); endmodule\n\
+       module top; wor value; child dut(.value(value)); endmodule",
+            "cross-resolution inout port",
         ),
     ];
     for (source, expected) in cases {

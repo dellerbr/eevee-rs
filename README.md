@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 23, 2026:
 
-- 181 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 182 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -75,6 +75,9 @@ Validated on July 23, 2026:
   `wor`/`trior`, `tri0`/`tri1`, and `supply0`/`supply1` kinds. Ports collapse
   onto parent nets with the same canonical resolution across nested and
   repeated instances; incompatible resolution fails before allocation.
+- Mismatched ordinary `wire`/`wand`/`wor` input and output ports use one-way
+  reactive bridges, preserving independent parent and child resolution.
+  Variable-to-net input bridges are isolated from reverse child influence.
 - Explicit/inherited bare 32-bit `int` module value parameters support
   declaration-order defaults plus named and positional instance overrides.
   Per-instance values drive constant initializers, `initial`/`always`
@@ -145,7 +148,8 @@ The current implementation includes:
   `input`/`output`/`inout` value transfer.
 - ANSI module port metadata, root-module discovery, recursively scoped child
   instances, named/positional whole-signal binding, and matching-resolution
-  collapsed net ports with implicit root pull/supply drivers.
+  collapsed net ports with implicit root pull/supply drivers, plus one-way
+  ordinary cross-resolution input/output bridges.
 - Explicit/inherited bare `int` module parameter defaults and named/positional
   value overrides with per-instance constant scopes.
 - Plain `wire`/`tri`, implicit `tri0`/`tri1` and `supply0`/`supply1`,
@@ -274,7 +278,7 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-     cross-resolution port bridges, hierarchical references, and generate
+     parameter-dependent widths, hierarchical references, and generate
      `if`/`case`/`for`.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
@@ -331,9 +335,10 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   simulator.
 - The current hierarchy slice supports ANSI packed/scalar ports and simple
   whole-signal named/positional connections. Matching canonical resolved net
-  kinds collapse onto one scheduler net. Complete directionality, net/variable
-  distinctions, cross-resolution port bridges, width conversion, expression
-  actuals, hierarchy references, and generate remain unsupported.
+  kinds collapse onto one scheduler net; mismatched ordinary input/output kinds
+  use directional bridges. Complete directionality, net/variable distinctions,
+  cross-resolution inout and implicit pull/supply bridges, width conversion,
+  expression actuals, hierarchy references, and generate remain unsupported.
 - Continuous assignment support is limited to internal unsigned `wire`/`tri`,
   `tri0`/`tri1`, `supply0`/`supply1`, `wand`/`triand`, and `wor`/`trior` nets;
   whole-net LHS targets; exact-width represented unsigned signal/literal RHS

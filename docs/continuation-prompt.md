@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 181 tests.
+- `cargo test --workspace` passes all 182 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -65,6 +65,11 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   pull/supply kinds collapse onto the parent `NetId`; tests cross two sibling
   instances and a grandchild. Unbound root ports install one implicit driver.
   Resolution mismatches and non-net output/inout actuals fail preflight.
+- Mismatched ordinary `wire`/`wand`/`wor` input and output ports allocate local
+  formal-side storage plus one directional reactive bridge. Strict tests prove
+  independent parent/child resolution, variable-actual isolation, startup, and
+  timed propagation. Cross-resolution inout and implicit pull/supply bridges
+  remain rejected to avoid feedback and strength loss.
 - Constant initialization evaluates every unary/binary operator represented by
   the current AST instead of returning an operand for unsupported cases.
 - Explicit/inherited bare 32-bit `int` module value parameters now support
@@ -136,16 +141,17 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   partial targets, unknown RHS names, and unsupported RHS calls.
 
 The module connectivity model collapses matching resolved port kinds onto one
-scheduler net. Full port directionality, cross-resolution bridges, complete
-net/variable port semantics, and width-converting or expression connections are
-not claimed.
+scheduler net and bridges mismatched ordinary input/output kinds directionally.
+Full port directionality, cross-resolution inout and implicit pull/supply
+bridges, complete net/variable port semantics, and width-converting or
+expression connections are not claimed.
 
 ## Next Priorities
 
-1. Extend continuous connectivity with cross-resolution port bridges. Then
-  extend module parameters into parameter-dependent packed widths and complete
-  value typing/coercion. Keep procedural `assign/deassign` and `force/release`
-  as separate runtime milestones; static Z withdrawal is already supported.
+1. Extend module parameters into parameter-dependent packed widths and complete
+  value typing/coercion. Keep cross-resolution inout/implicit-strength bridges,
+  procedural `assign/deassign`, and `force/release` as separate runtime
+  milestones.
 2. Add hierarchical references and generate `if`/`case`/`for`, preserving
   scoped instance identity and adding explicit top selection.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime
