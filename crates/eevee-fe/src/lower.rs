@@ -422,6 +422,7 @@ fn lower_module_ports(n: &Value) -> Vec<Port> {
                 name,
                 dir,
                 width: dtype.map(packed_width).unwrap_or(1),
+                packed_range: dtype.and_then(lower_packed_range),
                 signed: find_deep(declaration, "signed").is_some(),
                 net_kind: kids(declaration).find_map(lower_net_kind_token),
             }
@@ -448,6 +449,7 @@ fn lower_net_decl(n: &Value) -> Vec<NetDecl> {
             Some(NetDecl {
                 name,
                 width,
+                packed_range: dtype.and_then(lower_packed_range),
                 signed,
                 kind,
                 delay: delay.clone(),
@@ -548,6 +550,7 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
             out.push(VarDecl {
                 name,
                 width,
+                packed_range: dtype.and_then(lower_packed_range),
                 signed,
                 class_name: class_name.clone(),
                 type_scope: type_scope.clone(),
@@ -830,6 +833,17 @@ fn packed_width(dtype: &Value) -> u32 {
     1
 }
 
+fn lower_packed_range(dtype: &Value) -> Option<PackedRange> {
+    let range = find(dtype, "kPackedDimensions")
+        .and_then(|dimensions| find_deep(dimensions, "kDimensionRange"))?;
+    let mut bounds = kids(range)
+        .filter(|child| tag(child) == "kExpression")
+        .map(lower_expr);
+    let left = bounds.next()?;
+    let right = bounds.next()?;
+    Some(PackedRange { left, right })
+}
+
 fn lower_initial(n: &Value) -> Stmt {
     // [initial keyword, body statement]
     kids(n).nth(1).map(lower_stmt).unwrap_or(Stmt::Null)
@@ -899,6 +913,7 @@ fn lower_function(n: &Value) -> FuncDecl {
     FuncDecl {
         name,
         ret_width,
+        ret_packed_range: ret_dtype.and_then(lower_packed_range).map(Box::new),
         ret_class,
         class_scope,
         dpi_name: None,
@@ -958,6 +973,7 @@ fn lower_port_item(n: &Value) -> Param {
         name,
         dir,
         width,
+        packed_range: dtype.and_then(lower_packed_range).map(Box::new),
         class_name,
         type_scope,
         type_args,
@@ -1202,6 +1218,7 @@ fn lower_struct_typedef(n: &Value) -> Option<ClassDecl> {
         fields.push(VarDecl {
             name: mname,
             width: mdtype.map(packed_width).unwrap_or(1),
+            packed_range: mdtype.and_then(lower_packed_range),
             signed: false,
             class_name: mdtype.and_then(class_type_name),
             type_scope: mdtype.and_then(class_type_scope),
@@ -1244,6 +1261,7 @@ fn lower_constructor(n: &Value) -> FuncDecl {
     FuncDecl {
         name: "new".to_string(),
         ret_width: 0,
+        ret_packed_range: None,
         ret_class: None,
         class_scope: None,
         dpi_name: None,

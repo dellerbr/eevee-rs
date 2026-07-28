@@ -41,8 +41,49 @@ pub(crate) fn validate(
     }) {
         return unsupported(strength, source);
     }
+    validate_symbolic_packed_dimension_context(tree, source, false)?;
     validate_node(tree, source)?;
     Ok(strengths)
+}
+
+fn validate_symbolic_packed_dimension_context(
+    node: &Value,
+    source: &str,
+    range_is_preserved: bool,
+) -> Result<(), FeError> {
+    let declaration_preserves_range = match tag(node) {
+        "kDataDeclaration" => find_deep(node, "kTypeDeclaration").is_none(),
+        node_tag => matches!(
+            node_tag,
+            "kPortDeclaration"
+                | "kNetDeclaration"
+                | "kFunctionHeader"
+                | "kTaskHeader"
+                | "kPortItem"
+                | "kStructUnionMember"
+        ),
+    };
+    let range_is_preserved = range_is_preserved || declaration_preserves_range;
+    if tag(node) == "kPackedDimensions" && !range_is_preserved {
+        if let Some(range) = symbolic_dimension_range(node) {
+            return unsupported(range, source);
+        }
+    }
+    for child in kids(node) {
+        validate_symbolic_packed_dimension_context(child, source, range_is_preserved)?;
+    }
+    Ok(())
+}
+
+fn symbolic_dimension_range(node: &Value) -> Option<&Value> {
+    if tag(node) == "kDimensionRange"
+        && kids(node)
+            .filter(|child| tag(child) == "kExpression")
+            .any(|expression| kids(expression).next().map(tag) != Some("kNumber"))
+    {
+        return Some(node);
+    }
+    kids(node).find_map(symbolic_dimension_range)
 }
 
 pub(crate) fn strength_annotations(
@@ -251,7 +292,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                 return unsupported(lhs, source);
             }
         }
-        "kPackedDimensions" => validate_literal_packed_dimensions(node, source)?,
+        "kPackedDimensions" => validate_packed_dimensions(node, source)?,
         "kSystemTFCall" => {
             let identifier = find_deep(node, "SystemTFIdentifier")
                 .expect("Verible system call without an identifier");
@@ -527,21 +568,20 @@ fn validate_module_parameter_list(node: &Value, source: &str) -> Result<(), FeEr
     Ok(())
 }
 
-fn validate_literal_packed_dimensions(node: &Value, source: &str) -> Result<(), FeError> {
+fn validate_packed_dimensions(node: &Value, source: &str) -> Result<(), FeError> {
     for child in kids(node) {
         if tag(child) == "kDimensionRange" {
             let expressions: Vec<_> = kids(child)
                 .filter(|candidate| tag(candidate) == "kExpression")
                 .collect();
-            if expressions.len() != 2
-                || expressions
-                    .iter()
-                    .any(|expression| kids(expression).next().map(tag) != Some("kNumber"))
-            {
+            if expressions.len() != 2 {
                 return unsupported(child, source);
             }
+            for expression in expressions {
+                validate_node(expression, source)?;
+            }
         } else {
-            validate_literal_packed_dimensions(child, source)?;
+            validate_packed_dimensions(child, source)?;
         }
     }
     Ok(())

@@ -38,9 +38,9 @@ interpreter, or scheduler.
 
 ## Current Status
 
-Validated on July 23, 2026:
+Validated on July 28, 2026:
 
-- 182 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 184 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -82,6 +82,10 @@ Validated on July 23, 2026:
   declaration-order defaults plus named and positional instance overrides.
   Per-instance values drive constant initializers, `initial`/`always`
   expressions, and delays.
+- Module parameter expressions size one packed dimension on module ports,
+  module variables, and module nets per instance. Strict tests specialize the
+  same child to independent 4-bit and 8-bit storage and reject resolved-width
+  conversion or undeclared bound constants.
 - A source-level synchronous counter validates `always #delay`,
   `always_ff @(posedge clk)`, nonblocking assignment, and NBA settling. Focused
   swap tests confirm simultaneous NBAs read old values. This is a usable narrow
@@ -151,7 +155,8 @@ The current implementation includes:
   collapsed net ports with implicit root pull/supply drivers, plus one-way
   ordinary cross-resolution input/output bridges.
 - Explicit/inherited bare `int` module parameter defaults and named/positional
-  value overrides with per-instance constant scopes.
+  value overrides with per-instance constant scopes and parameter-dependent
+  packed widths on module ports, variables, and nets.
 - Plain `wire`/`tri`, implicit `tri0`/`tri1` and `supply0`/`supply1`,
   `wand`/`triand`, and `wor`/`trior` nets; reactive continuous assignment
   processes; and symmetric or explicit/asymmetric strength-aware ordinary-net
@@ -278,8 +283,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 
 2. **Core elaboration and hierarchy**
    - Build on the ANSI-port/child-instance/integral-parameter slice with
-     parameter-dependent widths, hierarchical references, and generate
-     `if`/`case`/`for`.
+     generate `if`/`case`/`for`, hierarchical references, and fixed unpacked
+     memories.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -354,9 +359,10 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
 - Module parameter support is limited to explicit or inherited bare 32-bit
   `int` value parameters in the module header, each with a default. Type
   parameters, non-`int` types, module-body parameter/localparam declarations,
-  header localparams, omitted actuals, `defparam`, nonliteral packed declaration
-  bounds, and parameter-dependent packed widths remain unsupported in
-  conformance mode.
+  header localparams, omitted actuals, `defparam`, multiple packed dimensions,
+  parameter-dependent callable signatures/procedural locals, and complete
+  sizing/signing/coercion remain unsupported in conformance mode. One packed
+  range on module ports, variables, and nets may use module parameters.
 - The passing phase probe constructs `uvm_test_top` directly and calls
   `run_test("")`; named test selection and plusarg-driven factory registration
   are not yet complete.

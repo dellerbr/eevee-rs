@@ -336,6 +336,7 @@ fn builtin_classes() -> Vec<ClassDecl> {
         FuncDecl {
             name: name.to_string(),
             ret_width: 32,
+            ret_packed_range: None,
             ret_class: ret_class.map(str::to_string),
             class_scope: None,
             dpi_name: None,
@@ -350,6 +351,7 @@ fn builtin_classes() -> Vec<ClassDecl> {
             name: name.to_string(),
             dir: PortDir::Input,
             width: 32,
+            packed_range: None,
             class_name: None,
             type_scope: None,
             type_args: Vec::new(),
@@ -1339,6 +1341,7 @@ fn elaborate_module_instance(
     let mut scope: HashMap<String, (NetId, u32)> = HashMap::new();
     let mut drivable = HashSet::new();
     for port in &m.ports {
+        let width = resolve_declared_width(port.width, port.packed_range.as_ref(), &consts);
         let local_net = match port_bindings.get(&port.name).copied() {
             Some(PortBinding::Alias(net)) => {
                 // A collapsed port reuses the parent net, including any implicit
@@ -1346,44 +1349,46 @@ fn elaborate_module_instance(
                 net
             }
             Some(PortBinding::InputBridge(source)) => {
-                let net = new_port_storage(sim, path, port);
+                let net = new_port_storage(sim, path, port, width);
                 add_port_bridge(source, net, sim, backend, g);
                 net
             }
             Some(PortBinding::OutputBridge(destination)) => {
-                let net = new_port_storage(sim, path, port);
+                let net = new_port_storage(sim, path, port, width);
                 add_port_bridge(net, destination, sim, backend, g);
                 net
             }
-            None => new_port_storage(sim, path, port),
+            None => new_port_storage(sim, path, port, width),
         };
-        scope.insert(port.name.clone(), (local_net, port.width));
+        scope.insert(port.name.clone(), (local_net, width));
         if port.net_kind.is_some() && matches!(port.dir, PortDir::Output | PortDir::Inout) {
             drivable.insert(port.name.clone());
         }
     }
     for item in &m.items {
         if let ModuleItem::Net(net) = item {
+            let width = resolve_declared_width(net.width, net.packed_range.as_ref(), &consts);
             let delay = net
                 .delay
                 .as_ref()
                 .map(|delay| compile_continuous_delay(delay, &consts, ts).as_net_delay());
             let id = sim.kernel().new_net_with_resolution_and_delay(
                 scoped_name(path, &net.name),
-                LogicVec::z(net.width),
+                LogicVec::z(width),
                 scheduler_resolution(net.kind),
                 delay,
             );
-            scope.insert(net.name.clone(), (id, net.width));
+            scope.insert(net.name.clone(), (id, width));
             drivable.insert(net.name.clone());
-            add_implicit_net_driver(sim, id, net.kind, net.width);
+            add_implicit_net_driver(sim, id, net.kind, width);
         }
     }
     for it in &m.items {
         if let ModuleItem::Var(v) = it {
+            let width = resolve_declared_width(v.width, v.packed_range.as_ref(), &consts);
             let init = match &v.init {
                 Some(e) => {
-                    try_const_eval_at_width(e, &consts, v.width, v.signed).unwrap_or_else(|| {
+                    try_const_eval_at_width(e, &consts, width, v.signed).unwrap_or_else(|| {
                         panic!(
                             "module variable '{}{}{}' initializer is not a constant expression",
                             path,
@@ -1392,10 +1397,10 @@ fn elaborate_module_instance(
                         )
                     })
                 }
-                None => LogicVec::zero(v.width),
+                None => LogicVec::zero(width),
             };
             let net = sim.kernel().new_net(scoped_name(path, &v.name), init);
-            scope.insert(v.name.clone(), (net, v.width));
+            scope.insert(v.name.clone(), (net, width));
         }
     }
 
@@ -1498,7 +1503,8 @@ fn elaborate_module_instance(
                     instance.module_name, instance.name
                 )
             });
-        let bindings = bind_instance_ports(instance, child, m, &scope);
+        let child_consts = bind_module_parameters(child, &instance.parameters, &consts, &g.consts);
+        let bindings = bind_instance_ports(instance, child, m, &scope, &child_consts);
         elaborate_module_instance(
             child,
             &scoped_name(path, &instance.name),
@@ -1523,21 +1529,46 @@ fn scheduler_resolution(kind: NetKind) -> NetResolution {
     }
 }
 
-fn new_port_storage(sim: &mut Sim, path: &str, port: &Port) -> NetId {
+fn new_port_storage(sim: &mut Sim, path: &str, port: &Port, width: u32) -> NetId {
     match port.net_kind {
         Some(kind) => {
             let net = sim.kernel().new_net_with_resolution(
                 scoped_name(path, &port.name),
-                LogicVec::z(port.width),
+                LogicVec::z(width),
                 scheduler_resolution(kind),
             );
-            add_implicit_net_driver(sim, net, kind, port.width);
+            add_implicit_net_driver(sim, net, kind, width);
             net
         }
         None => sim
             .kernel()
-            .new_net(scoped_name(path, &port.name), LogicVec::zero(port.width)),
+            .new_net(scoped_name(path, &port.name), LogicVec::zero(width)),
     }
+}
+
+fn resolve_declared_width(
+    fallback: u32,
+    packed_range: Option<&PackedRange>,
+    consts: &HashMap<String, LogicVec>,
+) -> u32 {
+    let Some(packed_range) = packed_range else {
+        return fallback;
+    };
+    let evaluate = |expression: &Expr| {
+        let value = try_const_eval_with(expression, consts)
+            .unwrap_or_else(|| panic!("packed range bound is not a constant expression"));
+        assert!(value.is_known(), "packed range bound contains X or Z");
+        value.to_i64()
+    };
+    let left = evaluate(&packed_range.left);
+    let right = evaluate(&packed_range.right);
+    let width = left
+        .abs_diff(right)
+        .checked_add(1)
+        .and_then(|width| u32::try_from(width).ok())
+        .unwrap_or_else(|| panic!("packed range width exceeds simulator limits"));
+    assert!(width > 0, "packed range width must be positive");
+    width
 }
 
 fn add_port_bridge(
@@ -1662,6 +1693,7 @@ fn bind_instance_ports(
     child: &Module,
     parent: &Module,
     parent_scope: &HashMap<String, (NetId, u32)>,
+    child_consts: &HashMap<String, LogicVec>,
 ) -> HashMap<String, PortBinding> {
     let mut bindings = HashMap::new();
     for (position, connection) in instance.connections.iter().enumerate() {
@@ -1689,12 +1721,19 @@ fn bind_instance_ports(
                 instance.name, port.name, connection.expr
             );
         };
-        let &(net, _) = parent_scope.get(actual).unwrap_or_else(|| {
+        let &(net, actual_width) = parent_scope.get(actual).unwrap_or_else(|| {
             panic!(
                 "unknown signal '{}' connected to '{}.{}'",
                 actual, instance.name, port.name
             )
         });
+        let port_width =
+            resolve_declared_width(port.width, port.packed_range.as_ref(), child_consts);
+        assert_eq!(
+            actual_width, port_width,
+            "port width conversion is unsupported for '{}.{}': actual '{}' is {} bits, port is {} bits",
+            instance.name, port.name, actual, actual_width, port_width
+        );
         let actual_kind = module_signal_net_kind(parent, actual);
         let mode = port_connection_mode(port, actual_kind).unwrap_or_else(|| {
             panic!(

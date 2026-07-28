@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 182 tests.
+- `cargo test --workspace` passes all 184 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -76,16 +76,21 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   ordered defaults and named/positional overrides. Parent-parameter
   expressions feed child overrides; per-instance constants drive net
   initialization, `initial`/`always` expressions, and delays.
+- One packed range on module ports, module variables, and module nets preserves
+  its bound expressions through the frontend and resolves from each instance's
+  parameter scope. Strict tests specialize sibling children to 4 and 8 bits,
+  exercise resolved storage and propagation, and reject override-induced width
+  conversion or undeclared bound constants. Parameter-dependent callable
+  signatures and procedural locals remain fail-closed.
 - The narrow sequential RTL core is source-to-runtime validated:
   `always #delay`, `always_ff @(posedge clk)`, nonblocking updates, and NBA old-value
   behavior execute correctly. This does not imply broad synthesizable-Verilog
   compatibility; generate, complete typing/sizing, memories, and full port/net
   semantics remain major gaps.
 - Strict parsing/elaboration reject type or non-`int` module parameters,
-  header/body localparams, module-body parameters,
-  nonliteral/parameter-dependent packed widths,
-  unknown/duplicate/excess overrides, and unresolved/nonconstant parameter
-  expressions.
+  header/body localparams, module-body parameters, parameter-dependent callable
+  signatures/procedural locals, unknown/duplicate/excess overrides, and
+  unresolved/nonconstant parameter expressions.
 - Default-strong whole-net continuous assignments over the supported internal
   net types execute as reactive IR processes with optional one-, two-, or
   three-value inertial delays.
@@ -148,12 +153,11 @@ expression connections are not claimed.
 
 ## Next Priorities
 
-1. Extend module parameters into parameter-dependent packed widths and complete
-  value typing/coercion. Keep cross-resolution inout/implicit-strength bridges,
-  procedural `assign/deassign`, and `force/release` as separate runtime
-  milestones.
-2. Add hierarchical references and generate `if`/`case`/`for`, preserving
-  scoped instance identity and adding explicit top selection.
+1. Add generate `if`/`case`/`for` over module parameter constants while
+  preserving generated-scope identity. Follow with fixed unpacked memories.
+2. Add hierarchical references and explicit top selection while preserving
+  scoped instance identity. Keep complete value typing/coercion as a separate
+  milestone.
 3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime
   so strict semantic diagnostics are source-located rather than only
   actionable by callable or signal name.

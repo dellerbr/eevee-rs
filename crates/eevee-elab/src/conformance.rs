@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use eevee_ast::{
     BinOp, ClassDecl, ContinuousDelay, Expr, FuncDecl, Item, Lvalue, Module, ModuleItem, NetKind,
-    PortDir, SourceFile, Stmt, TimingControl, UnaryOp, VarDecl,
+    PackedRange, PortDir, SourceFile, Stmt, TimingControl, UnaryOp, VarDecl,
 };
 
 use crate::{port_connection_mode, ElabError, PortConnectionMode};
@@ -38,6 +38,20 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
         }
         validate_module_scope(module)?;
         validate_module_parameters(module)?;
+        let module_parameters: HashSet<&str> = module
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect();
+        for port in &module.ports {
+            if let Some(range) = &port.packed_range {
+                validate_packed_range(
+                    range,
+                    Some(&module_parameters),
+                    &format!("{}.{}", module.name, port.name),
+                )?;
+            }
+        }
         validate_net_declaration_delays(module)?;
         validate_continuous_assignments(module)?;
         validate_procedural_net_writes(module)?;
@@ -95,7 +109,10 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
                         actual, instance.name, port.name
                     ));
                 };
-                if actual_width != port.width {
+                if actual_width != port.width
+                    && port.packed_range.is_none()
+                    && !module_signal_has_packed_range(module, actual)
+                {
                     return unsupported(format!(
                         "port width conversion is unsupported for '{}.{}': actual '{}' is {} bits, port is {} bits",
                         instance.name, port.name, actual, actual_width, port.width
@@ -578,6 +595,19 @@ fn module_signal_width(module: &Module, name: &str) -> Option<u32> {
         })
 }
 
+fn module_signal_has_packed_range(module: &Module, name: &str) -> bool {
+    module
+        .ports
+        .iter()
+        .find(|port| port.name == name)
+        .is_some_and(|port| port.packed_range.is_some())
+        || module.items.iter().any(|item| match item {
+            ModuleItem::Var(var) if var.name == name => var.packed_range.is_some(),
+            ModuleItem::Net(net) if net.name == name => net.packed_range.is_some(),
+            _ => false,
+        })
+}
+
 fn module_signal_net_kind(module: &Module, name: &str) -> Option<NetKind> {
     module
         .ports
@@ -683,6 +713,9 @@ fn validate_items(
         match item {
             ModuleItem::Var(var) => validate_static_var(var, module_parameters)?,
             ModuleItem::Net(net) => {
+                if let Some(range) = &net.packed_range {
+                    validate_packed_range(range, module_parameters, &net.name)?;
+                }
                 if let Some(delay) = &net.delay {
                     for expression in continuous_delay_expressions(delay) {
                         validate_expr(expression)?;
@@ -741,6 +774,9 @@ fn validate_static_var(
     module_parameters: Option<&HashSet<&str>>,
 ) -> Result<(), ElabError> {
     validate_type(var.class_name.as_deref())?;
+    if let Some(range) = &var.packed_range {
+        validate_packed_range(range, module_parameters, &var.name)?;
+    }
     let Some(init) = &var.init else {
         return Ok(());
     };
@@ -758,6 +794,23 @@ fn validate_static_var(
         ));
     }
     validate_expr(init)
+}
+
+fn validate_packed_range(
+    range: &PackedRange,
+    module_parameters: Option<&HashSet<&str>>,
+    declaration: &str,
+) -> Result<(), ElabError> {
+    if !is_constant_expr(&range.left, module_parameters)
+        || !is_constant_expr(&range.right, module_parameters)
+    {
+        return unsupported(format!(
+            "packed range for '{}' is not a constant parameter expression",
+            declaration
+        ));
+    }
+    validate_expr(&range.left)?;
+    validate_expr(&range.right)
 }
 
 fn validate_class(class: &ClassDecl) -> Result<(), ElabError> {
@@ -779,8 +832,18 @@ fn validate_function(
     module_parameters: Option<&HashSet<&str>>,
 ) -> Result<(), ElabError> {
     validate_type(function.ret_class.as_deref())?;
+    if let Some(range) = &function.ret_packed_range {
+        validate_packed_range(range, None, &format!("{} return", function.name))?;
+    }
     for parameter in &function.params {
         validate_type(parameter.class_name.as_deref())?;
+        if let Some(range) = &parameter.packed_range {
+            validate_packed_range(
+                range,
+                None,
+                &format!("{}.{}", function.name, parameter.name),
+            )?;
+        }
         if let Some(default) = &parameter.default {
             validate_expr(default)?;
         }
@@ -796,6 +859,9 @@ fn validate_stmt(stmt: &Stmt, module_parameters: Option<&HashSet<&str>>) -> Resu
             }
         }
         Stmt::VarDecl(var) => {
+            if let Some(range) = &var.packed_range {
+                validate_packed_range(range, None, &var.name)?;
+            }
             if let Some(init) = &var.init {
                 validate_expr(init)?;
             }

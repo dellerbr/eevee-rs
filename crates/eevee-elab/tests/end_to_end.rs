@@ -965,6 +965,45 @@ fn child_instances_apply_default_named_and_positional_parameters() {
 }
 
 #[test]
+fn module_parameters_control_per_instance_packed_widths() {
+    let src = "module child #(parameter int WIDTH = 4)\n\
+                 (input logic [WIDTH-1:0] value,\n\
+                  output wire [WIDTH-1:0] result);\n\
+      logic [WIDTH-1:0] storage;\n\
+      wire [WIDTH-1:0] inverted;\n\
+      initial storage = value;\n\
+      assign inverted = ~storage;\n\
+      assign result = inverted;\n\
+    endmodule\n\
+    module top;\n\
+      logic [3:0] narrow_value = 4'h5;\n\
+      wire [3:0] narrow_result;\n\
+      logic [7:0] wide_value = 8'h3c;\n\
+      wire [7:0] wide_result;\n\
+      child narrow(.value(narrow_value), .result(narrow_result));\n\
+      child #(.WIDTH(8)) wide(.value(wide_value), .result(wide_result));\n\
+    endmodule\n";
+    let file = parse_source_conformant(src).expect("conformant parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
+    sim.kernel().set_echo(false);
+    sim.run();
+
+    for (name, width, value) in [
+        ("narrow.storage", 4, 0x5),
+        ("narrow.inverted", 4, 0xa),
+        ("narrow_result", 4, 0xa),
+        ("wide.storage", 8, 0x3c),
+        ("wide.inverted", 8, 0xc3),
+        ("wide_result", 8, 0xc3),
+    ] {
+        let net = sim.kernel().find_net(name).expect("specialized-width net");
+        let result = sim.kernel().net_value(net);
+        assert_eq!(result.width(), width, "width of {name}");
+        assert_eq!(result.to_u64(), value, "value of {name}");
+    }
+}
+
+#[test]
 fn module_parameter_values_control_instance_delays() {
     let src = "module child #(parameter int VALUE = 3,\n\
                   parameter int DELAY = 5)\n\
@@ -1122,30 +1161,59 @@ fn conformance_mode_rejects_cyclic_module_hierarchy() {
 
 #[test]
 fn conformance_mode_rejects_port_width_conversion() {
-    let src = "module child(input logic [7:0] value); endmodule\n\
-      module top; logic [3:0] value; child dut(value); endmodule\n";
-    let file = parse_source_conformant(src).expect("width mismatch syntax parses");
-    let eevee_ast::Item::Module(child) = &file.items[0] else {
-        panic!("expected child module");
-    };
-    let eevee_ast::Item::Module(top) = &file.items[1] else {
-        panic!("expected top module");
-    };
-    assert_eq!(child.ports[0].width, 8);
-    assert!(matches!(&top.items[0], eevee_ast::ModuleItem::Var(var) if var.width == 4));
-    assert!(matches!(
-      &top.items[1],
-      eevee_ast::ModuleItem::Instance(instance) if instance.connections.len() == 1
-    ));
-    let error = match elaborate_conformant(&file, &Interp) {
-        Ok(_) => panic!("unsupported port width conversion must fail closed"),
-        Err(error) => error,
-    };
-    assert!(matches!(
-      error,
-      ElabError::UnsupportedSemantic { ref message }
-        if message.contains("port width conversion")
-          && message.contains("4 bits")
-          && message.contains("8 bits")
-    ));
+    for src in [
+        "module child(input logic [7:0] value); endmodule\n\
+         module top; logic [3:0] value; child dut(value); endmodule\n",
+        "module child #(parameter int WIDTH = 4)\n\
+           (input logic [WIDTH-1:0] value);\n\
+         endmodule\n\
+         module top; logic [3:0] value; child #(.WIDTH(8)) dut(value); endmodule\n",
+    ] {
+        let file = parse_source_conformant(src).expect("width mismatch syntax parses");
+        let error = match elaborate_conformant(&file, &Interp) {
+            Ok(_) => panic!("unsupported port width conversion must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+          error,
+          ElabError::UnsupportedSemantic { ref message }
+            if message.contains("port width conversion")
+              && message.contains("4 bits")
+              && message.contains("8 bits")
+        ));
+    }
+}
+
+#[test]
+fn conformance_mode_rejects_nonparameter_packed_widths() {
+    for (src, declaration) in [
+        (
+            "module child(input logic [MISSING-1:0] value); endmodule\n",
+            "child.value",
+        ),
+        (
+            "module top #(parameter int WIDTH = 4);\n\
+         function logic [WIDTH-1:0] value(); return '0; endfunction\n\
+       endmodule\n",
+            "value return",
+        ),
+        (
+            "module top #(parameter int WIDTH = 4);\n\
+         initial begin logic [WIDTH-1:0] local_value; local_value = '0; end\n\
+       endmodule\n",
+            "local_value",
+        ),
+    ] {
+        let file = parse_source_conformant(src).expect("symbolic packed range syntax parses");
+        let error = match elaborate_conformant(&file, &Interp) {
+            Ok(_) => panic!("unsupported symbolic packed width must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+          error,
+          ElabError::UnsupportedSemantic { ref message }
+          if message.contains(&format!("packed range for '{declaration}'"))
+            && message.contains("constant parameter expression")
+        ));
+    }
 }

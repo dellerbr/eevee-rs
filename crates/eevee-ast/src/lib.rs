@@ -59,12 +59,20 @@ pub struct ModuleParameter {
     pub default: Expr,
 }
 
+/// The declared bounds of one packed dimension (`[left:right]`).
+#[derive(Debug, Clone)]
+pub struct PackedRange {
+    pub left: Expr,
+    pub right: Expr,
+}
+
 /// A module port.
 #[derive(Debug, Clone)]
 pub struct Port {
     pub name: String,
     pub dir: PortDir,
     pub width: u32,
+    pub packed_range: Option<PackedRange>,
     pub signed: bool,
     pub net_kind: Option<NetKind>,
 }
@@ -148,6 +156,7 @@ pub enum ModuleItem {
 pub struct NetDecl {
     pub name: String,
     pub width: u32,
+    pub packed_range: Option<PackedRange>,
     pub signed: bool,
     pub kind: NetKind,
     pub delay: Option<ContinuousDelay>,
@@ -221,6 +230,7 @@ impl TypeRef {
 pub struct VarDecl {
     pub name: String,
     pub width: u32,
+    pub packed_range: Option<PackedRange>,
     pub signed: bool,
     /// `Some(class)` if this is a class handle (a reference, not a bit-vector).
     /// For a collection, this is the *element* class (if the elements are
@@ -317,6 +327,7 @@ pub struct ParamDecl {
 pub struct FuncDecl {
     pub name: String,
     pub ret_width: u32,
+    pub ret_packed_range: Option<Box<PackedRange>>,
     /// `Some(class)` if the function returns a class handle.
     pub ret_class: Option<String>,
     /// `Some(class)` for an out-of-body (`extern`) definition `Class::method`.
@@ -335,6 +346,7 @@ pub struct Param {
     pub name: String,
     pub dir: PortDir,
     pub width: u32,
+    pub packed_range: Option<Box<PackedRange>>,
     /// `Some(class)` if the parameter is a class handle.
     pub class_name: Option<String>,
     /// Qualifying scope of a user type, if explicitly scoped.

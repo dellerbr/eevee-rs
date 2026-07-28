@@ -676,7 +676,7 @@ fn conformance_mode_accepts_net_declaration_delay_tuples() {
 }
 
 #[test]
-fn conformance_mode_rejects_unimplemented_parameter_types_and_widths() {
+fn conformance_mode_accepts_parameter_widths_and_rejects_other_parameter_forms() {
     let non_int = "module child #(parameter byte VALUE = 1) (); endmodule";
     let error =
         parse_source_conformant(non_int).expect_err("byte parameter coercion is unsupported");
@@ -688,8 +688,15 @@ fn conformance_mode_rejects_unimplemented_parameter_types_and_widths() {
     let symbolic_width = "module child #(parameter int WIDTH = 8)\n\
                                 (input logic [WIDTH-1:0] value);\n\
                           endmodule\n";
-    let error = parse_source_conformant(symbolic_width)
-        .expect_err("parameter-dependent packed widths are unsupported");
+    let file = parse_source_conformant(symbolic_width)
+        .expect("parameter-dependent packed width expression is preserved");
+    assert!(module(&file).ports[0].packed_range.is_some());
+
+    let dropped_typedef = "module child #(parameter int WIDTH = 8);\n\
+                             typedef logic [WIDTH-1:0] word_t;\n\
+                           endmodule\n";
+    let error = parse_source_conformant(dropped_typedef)
+        .expect_err("symbolic typedef width has no preserved AST representation");
     assert!(matches!(
         error,
         FeError::UnsupportedSyntax { ref construct, .. }
