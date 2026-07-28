@@ -66,9 +66,15 @@ impl ArgMode {
 #[derive(Clone, Copy, Debug)]
 pub enum Inst {
     /// `dst = consts[k]`.
-    LoadConst { dst: Reg, k: ConstId },
+    LoadConst {
+        dst: Reg,
+        k: ConstId,
+    },
     /// `dst = src`.
-    Mov { dst: Reg, src: Reg },
+    Mov {
+        dst: Reg,
+        src: Reg,
+    },
     /// Resize an integral value to a fixed width.
     Resize {
         dst: Reg,
@@ -77,12 +83,21 @@ pub enum Inst {
         signed: bool,
     },
     /// `dst = src` at an SV assignment boundary (arrays copy by value).
-    Assign { dst: Reg, src: Reg },
+    Assign {
+        dst: Reg,
+        src: Reg,
+    },
     /// Queue `dst <= src` for the procedural-variable NBA region.
-    NbaAssign { dst: Reg, src: Reg },
+    NbaAssign {
+        dst: Reg,
+        src: Reg,
+    },
 
     /// `dst = <value of net>` (read the net's current value).
-    NetRead { dst: Reg, net: NetId },
+    NetRead {
+        dst: Reg,
+        net: NetId,
+    },
     /// Dynamically read one scheduler-backed fixed-memory element.
     MemoryRead {
         dst: Reg,
@@ -92,39 +107,133 @@ pub enum Inst {
 
     // --- 4-state ALU (operands and result are logic) ---
     /// `dst = ~a`.
-    Not { dst: Reg, a: Reg },
+    Not {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = a + b`.
-    Add { dst: Reg, a: Reg, b: Reg },
+    Add {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a - b`.
-    Sub { dst: Reg, a: Reg, b: Reg },
+    Sub {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a * b` (low `width` bits).
-    Mul { dst: Reg, a: Reg, b: Reg },
+    Mul {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a & b`.
-    And { dst: Reg, a: Reg, b: Reg },
+    And {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a | b`.
-    Or { dst: Reg, a: Reg, b: Reg },
+    Or {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a ^ b`.
-    Xor { dst: Reg, a: Reg, b: Reg },
+    Xor {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = (a == b)` — 1-bit logical equality (x if either operand has x/z).
-    Eq { dst: Reg, a: Reg, b: Reg },
+    Eq {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = (a != b)` — 1-bit logical inequality.
-    Neq { dst: Reg, a: Reg, b: Reg },
+    Neq {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = (a < b)` — 1-bit unsigned less-than.
-    Lt { dst: Reg, a: Reg, b: Reg },
+    Lt {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = (a <= b)` — 1-bit unsigned less-or-equal.
-    Le { dst: Reg, a: Reg, b: Reg },
+    Le {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = (a > b)` — 1-bit unsigned greater-than.
-    Gt { dst: Reg, a: Reg, b: Reg },
+    Gt {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = (a >= b)` — 1-bit unsigned greater-or-equal.
-    Ge { dst: Reg, a: Reg, b: Reg },
+    Ge {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// Signed two's-complement relational operators.
+    SignedLt {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    SignedLe {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    SignedGt {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    SignedGe {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a << b` (logical shift left by `b`'s value).
-    Shl { dst: Reg, a: Reg, b: Reg },
+    Shl {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a >> b` (logical shift right by `b`'s value).
-    Shr { dst: Reg, a: Reg, b: Reg },
+    Shr {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// `dst = a >>> b` (arithmetic shift right for a signed left operand).
+    Ashr {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a && b` — 1-bit logical AND (both operands reduced to truthy).
-    LogAnd { dst: Reg, a: Reg, b: Reg },
+    LogAnd {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a || b` — 1-bit logical OR (either operand truthy).
-    LogOr { dst: Reg, a: Reg, b: Reg },
+    LogOr {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// Four-state conditional selection and indeterminate branch merge.
     Select {
         dst: Reg,
@@ -133,23 +242,47 @@ pub enum Inst {
         when_false: Reg,
     },
     /// `dst = !$isunknown(a)` as a one-bit internal predicate.
-    IsKnown { dst: Reg, a: Reg },
+    IsKnown {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = !a` — 1-bit logical negation.
-    LogNot { dst: Reg, a: Reg },
+    LogNot {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = -a` — two's-complement negation.
-    Neg { dst: Reg, a: Reg },
+    Neg {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = &a` — reduction AND (1 bit).
-    ReduceAnd { dst: Reg, a: Reg },
+    ReduceAnd {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = |a` — reduction OR (1 bit).
-    ReduceOr { dst: Reg, a: Reg },
+    ReduceOr {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = ^a` — reduction XOR (1 bit).
-    ReduceXor { dst: Reg, a: Reg },
+    ReduceXor {
+        dst: Reg,
+        a: Reg,
+    },
 
     // --- net updates ---
     /// Blocking assign: write the net **now** (Active region).
-    BlockingWrite { net: NetId, src: Reg },
+    BlockingWrite {
+        net: NetId,
+        src: Reg,
+    },
     /// Non-blocking assign: schedule the net update for the NBA region.
-    NbaWrite { net: NetId, src: Reg },
+    NbaWrite {
+        net: NetId,
+        src: Reg,
+    },
     /// Dynamically write one fixed-memory element in the Active region.
     BlockingMemoryWrite {
         memory: MemoryId,
@@ -163,7 +296,10 @@ pub enum Inst {
         src: Reg,
     },
     /// Update one continuous driver; the scheduler resolves all drivers.
-    DriveNet { driver: DriverId, src: Reg },
+    DriveNet {
+        driver: DriverId,
+        src: Reg,
+    },
     /// Schedule an inertial continuous-driver update after `delay_fs`.
     ScheduleDrive {
         driver: DriverId,
@@ -179,37 +315,62 @@ pub enum Inst {
 
     // --- timing controls = process suspension points ---
     /// `#fs` — suspend for `fs` femtoseconds.
-    Delay { fs: u64 },
+    Delay {
+        fs: u64,
+    },
     /// `@(edge net)` — suspend until the edge fires.
-    WaitEdge { net: NetId, edge: EdgeKind },
+    WaitEdge {
+        net: NetId,
+        edge: EdgeKind,
+    },
     /// `wait(cond)` body: suspend until any net in `netlists[nets]` changes.
     /// The producing code re-evaluates the condition after the wakeup (a
     /// backward branch), so this is event-driven, never polled.
-    WaitCond { nets: NetListId },
+    WaitCond {
+        nets: NetListId,
+    },
     /// Suspend until runtime state changes, then re-evaluate a previously
     /// emitted `wait(cond)` condition. Used for class fields, statics, and
     /// collections whose mutation sources are not kernel nets.
     WaitRuntime,
     /// `@(value)` for a non-net expression.
-    WaitChange { value: Reg },
+    WaitChange {
+        value: Reg,
+    },
     /// Suspend until the named-event value in `event` is triggered.
-    WaitEvent { event: Reg },
+    WaitEvent {
+        event: Reg,
+    },
 
     // --- control flow ---
     /// Unconditional jump.
-    Jump { target: CodeAddr },
+    Jump {
+        target: CodeAddr,
+    },
     /// Jump if `cond` is **not** truthy (SV `is_true`).
-    BranchFalse { cond: Reg, target: CodeAddr },
+    BranchFalse {
+        cond: Reg,
+        target: CodeAddr,
+    },
     /// Jump if `cond` is truthy.
-    BranchTrue { cond: Reg, target: CodeAddr },
+    BranchTrue {
+        cond: Reg,
+        target: CodeAddr,
+    },
     /// Jump when the caller supplied formal register `arg`. This lets a
     /// callable evaluate a default expression only for an omitted argument;
     /// an explicitly supplied `null` remains distinguishable from omission.
-    BranchArgProvided { arg: Reg, target: CodeAddr },
+    BranchArgProvided {
+        arg: Reg,
+        target: CodeAddr,
+    },
 
     /// `$display(fmt, args...)`: format `consts[fmt]` (a string) with the
     /// register values in `arglists[args]` and emit a line to the kernel.
-    Display { fmt: ConstId, args: ArgListId },
+    Display {
+        fmt: ConstId,
+        args: ArgListId,
+    },
     /// Call an imported DPI-C host function named by `consts[name]`.
     DpiCall {
         dst: Reg,
@@ -234,38 +395,73 @@ pub enum Inst {
         ret: Reg,
     },
     /// Return a value from the current function/task frame to the caller.
-    Return { value: Reg },
+    Return {
+        value: Reg,
+    },
     /// Return with no value (void function / task).
     ReturnVoid,
 
     /// Allocate a class instance of `class` (fields default-initialized) and
     /// store the handle in `dst`.
-    New { dst: Reg, class: ClassId },
+    New {
+        dst: Reg,
+        class: ClassId,
+    },
     /// Allocate a fresh IEEE named-event identity.
-    NewEvent { dst: Reg },
+    NewEvent {
+        dst: Reg,
+    },
     /// Trigger the named event held in `event`.
-    TriggerEvent { event: Reg },
+    TriggerEvent {
+        event: Reg,
+    },
     /// `dst = $cast(<target class>, src)`: report whether `src` is null or its
     /// runtime class derives from `class`. Destination assignment is emitted
     /// separately so a failed cast leaves the original handle unchanged.
-    ClassCast { dst: Reg, src: Reg, class: ClassId },
+    ClassCast {
+        dst: Reg,
+        src: Reg,
+        class: ClassId,
+    },
     /// `dst = obj.fields[slot]` (object field read).
-    GetField { dst: Reg, obj: Reg, slot: u32 },
+    GetField {
+        dst: Reg,
+        obj: Reg,
+        slot: u32,
+    },
     /// `obj.fields[slot] = src` (object field write).
-    SetField { obj: Reg, slot: u32, src: Reg },
+    SetField {
+        obj: Reg,
+        slot: u32,
+        src: Reg,
+    },
 
     /// `dst = ` the value of static field `id` (shared class storage).
-    StaticGet { dst: Reg, id: u32 },
+    StaticGet {
+        dst: Reg,
+        id: u32,
+    },
     /// `static[id] = src` (write a static class field).
-    StaticSet { id: u32, src: Reg },
+    StaticSet {
+        id: u32,
+        src: Reg,
+    },
 
     /// `dst = ` a fresh empty queue / dynamic array.
-    NewQueue { dst: Reg },
+    NewQueue {
+        dst: Reg,
+    },
     /// `dst = ` a fresh empty associative array.
-    NewAssoc { dst: Reg },
+    NewAssoc {
+        dst: Reg,
+    },
     /// `dst = base[idx]` — element read of a queue/array (int index) or an
     /// associative array (int/string key), or a packed bit-select.
-    IndexGet { dst: Reg, base: Reg, idx: Reg },
+    IndexGet {
+        dst: Reg,
+        base: Reg,
+        idx: Reg,
+    },
     /// `dst = base[left:right]` — packed part-select.
     PartSelect {
         dst: Reg,
@@ -274,7 +470,11 @@ pub enum Inst {
         right: Reg,
     },
     /// `base[idx] = src` — element write (auto-grows a queue/array).
-    IndexSet { base: Reg, idx: Reg, src: Reg },
+    IndexSet {
+        base: Reg,
+        idx: Reg,
+        src: Reg,
+    },
     /// A built-in queue/array/assoc method call (`push_back`, `size`,
     /// `exists`, ...). `dst` receives the result (or `Null`/0 for void ones).
     CollMethod {
@@ -285,10 +485,15 @@ pub enum Inst {
     },
 
     /// `dst = {a, b, c}` — packed concatenation unless an operand is a string.
-    Concat { dst: Reg, args: ArgListId },
+    Concat {
+        dst: Reg,
+        args: ArgListId,
+    },
     /// `dst = ` the current simulation time as a 64-bit value (`$time`/
     /// `$realtime`).
-    SimTime { dst: Reg },
+    SimTime {
+        dst: Reg,
+    },
     /// `dst = ` a formatted string (`$sformatf`/`$swrite`/`itoa`): format
     /// `consts[fmt]` with `arglists[args]`, producing a `Str`.
     Format {
@@ -298,10 +503,17 @@ pub enum Inst {
     },
     /// `dst = ` the enum member name for `src`'s value, via the value->name
     /// table `enum_tables[table]`; falls back to the decimal value.
-    EnumName { dst: Reg, src: Reg, table: u32 },
+    EnumName {
+        dst: Reg,
+        src: Reg,
+        table: u32,
+    },
 
     /// `dst = src.len()` — number of characters in the string `src`.
-    StringLen { dst: Reg, src: Reg },
+    StringLen {
+        dst: Reg,
+        src: Reg,
+    },
     /// `dst = src.substr(lo, hi)` — characters from index `lo` to `hi` (inclusive).
     StringSub {
         dst: Reg,
@@ -310,13 +522,26 @@ pub enum Inst {
         hi: Reg,
     },
     /// `dst = src[idx]` — byte value (8-bit) of the character at index `idx`.
-    StringIndex { dst: Reg, src: Reg, idx: Reg },
+    StringIndex {
+        dst: Reg,
+        src: Reg,
+        idx: Reg,
+    },
     /// `dst = src.toupper()` — uppercase copy of the string.
-    StringToUpper { dst: Reg, src: Reg },
+    StringToUpper {
+        dst: Reg,
+        src: Reg,
+    },
     /// `dst = src.tolower()` — lowercase copy of the string.
-    StringToLower { dst: Reg, src: Reg },
+    StringToLower {
+        dst: Reg,
+        src: Reg,
+    },
     /// `dst = src.atoi()` — integer value parsed from the string.
-    StringAtoi { dst: Reg, src: Reg },
+    StringAtoi {
+        dst: Reg,
+        src: Reg,
+    },
 
     /// `fork ... join/join_any/join_none` (LRM 9.3.2): spawn each program in
     /// `fork_groups[group]` (indices into `Program::forks`) as an independent
@@ -326,7 +551,10 @@ pub enum Inst {
     /// forked method call sees the same object the parent method did. Per
     /// `join`, execution of the current frame parks here until the children
     /// satisfy `join`'s completion rule (see [`eevee_sched::Wait::Fork`]).
-    Fork { group: ForkGroupId, join: ForkJoin },
+    Fork {
+        group: ForkGroupId,
+        join: ForkJoin,
+    },
 
     /// End the process (`Wait::Finished`).
     Finish,

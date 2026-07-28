@@ -868,19 +868,6 @@ fn conformance_mode_rejects_invalid_continuous_drivers() {
             "unsupported continuous assignment expression",
         ),
         (
-            "module top; logic signed source; wire [7:0] result; assign result = source; endmodule",
-            "unsupported continuous assignment expression",
-        ),
-        (
-            "module top; logic source; wire [7:0] result; assign result = source; endmodule",
-            "width conversion is unsupported",
-        ),
-        (
-          "module top; logic enable; logic [1:0] source; wire [1:0] result;\n\
-           assign result = enable ? source : 1'bz; endmodule",
-          "continuous conditional branch width mismatch",
-        ),
-        (
             "module top; logic source; wire result; assign #(-1) result = source; endmodule",
             "delay is negative",
         ),
@@ -1153,6 +1140,141 @@ fn fixed_memories_and_dynamic_selects_follow_scheduler_semantics() {
 }
 
 #[test]
+fn integral_sizing_signing_and_port_coercion_are_context_correct() {
+    let source = "module input_child(input logic signed [7:0] value); endmodule\n\
+    module output_child(output logic signed [3:0] value);\n\
+      initial value = 4'shf;\n\
+    endmodule\n\
+    module top;\n\
+      logic signed [3:0] signed_small = 4'sh8;\n\
+      logic [3:0] unsigned_small = 4'hf;\n\
+      logic [7:0] assigned_signed = 0;\n\
+      logic [7:0] assigned_unsigned = 0;\n\
+      logic [7:0] signed_sum = 0;\n\
+      logic [7:0] mixed_sum = 0;\n\
+      logic [7:0] signed_shift = 0;\n\
+      logic [7:0] unsigned_shift = 0;\n\
+      logic [3:0] truncated = 0;\n\
+      logic [63:0] unsized_negative = 0;\n\
+      logic signed [3:0] minus_one = 4'shf;\n\
+      logic signed [3:0] plus_one = 4'sh1;\n\
+      logic signed_less = 0;\n\
+      logic mixed_less = 0;\n\
+      logic [7:0] output_expanded;\n\
+      wire [7:0] continuous_signed;\n\
+      wire [7:0] continuous_unsigned;\n\
+      input_child in_dut(.value(minus_one));\n\
+      output_child out_dut(.value(output_expanded));\n\
+      assign continuous_signed = signed_small;\n\
+      assign continuous_unsigned = unsigned_small;\n\
+      initial begin\n\
+        assigned_signed = signed_small;\n\
+        assigned_unsigned = unsigned_small;\n\
+        signed_sum = signed_small + 4'sh1;\n\
+        mixed_sum = signed_small + 4'h1;\n\
+        signed_shift = signed_small >>> 2;\n\
+        unsigned_shift = unsigned_small >>> 2;\n\
+        truncated = 8'hab;\n\
+        unsized_negative = -1;\n\
+        signed_less = minus_one < plus_one;\n\
+        mixed_less = minus_one < 4'h1;\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(source).expect("coercion syntax parses");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("coercion elaboration");
+    sim.kernel().set_echo(false);
+    sim.run();
+
+    for (name, width, value) in [
+        ("assigned_signed", 8, 0xf8),
+        ("assigned_unsigned", 8, 0x0f),
+        ("signed_sum", 8, 0xf9),
+        ("mixed_sum", 8, 0x09),
+        ("signed_shift", 8, 0xfe),
+        ("unsigned_shift", 8, 0x03),
+        ("truncated", 4, 0x0b),
+        ("signed_less", 1, 1),
+        ("mixed_less", 1, 0),
+        ("continuous_signed", 8, 0xf8),
+        ("continuous_unsigned", 8, 0x0f),
+        ("in_dut.value", 8, 0xff),
+        ("output_expanded", 8, 0xff),
+    ] {
+        let net = sim.kernel().find_net(name).expect("coercion net");
+        let result = sim.kernel().net_value(net);
+        assert_eq!(result.width(), width, "width of {name}");
+        assert_eq!(result.to_u64(), value, "value of {name}");
+    }
+    let unsized_negative = sim
+        .kernel()
+        .find_net("unsized_negative")
+        .expect("unsized negative net");
+    assert_eq!(sim.kernel().net_value(unsized_negative).width(), 64);
+    assert_eq!(sim.kernel().net_value(unsized_negative).to_u64(), u64::MAX);
+}
+
+#[test]
+fn signed_locals_fields_and_function_returns_coerce() {
+    let source = "function logic signed [3:0] narrow_free();\n\
+      return 4'she;\n\
+    endfunction\n\
+    class holder;\n\
+      logic signed [3:0] narrow_value;\n\
+      logic [7:0] expanded;\n\
+      function new();\n\
+        narrow_value = 4'sh8;\n\
+        expanded = narrow_value;\n\
+      endfunction\n\
+      function logic signed [7:0] widen(input logic signed [3:0] value);\n\
+        return value;\n\
+      endfunction\n\
+      function logic signed [3:0] narrow();\n\
+        return 4'shf;\n\
+      endfunction\n\
+    endclass\n\
+    module top;\n\
+      logic [7:0] local_result = 0;\n\
+      logic [7:0] field_result = 0;\n\
+      logic [7:0] function_result = 0;\n\
+      logic [7:0] narrow_result = 0;\n\
+      logic [7:0] free_result = 0;\n\
+      initial begin\n\
+        logic signed [3:0] local_narrow;\n\
+        logic [7:0] local_wide;\n\
+        holder object;\n\
+        local_narrow = 4'sh9;\n\
+        local_wide = local_narrow;\n\
+        object = new();\n\
+        local_result = local_wide;\n\
+        field_result = object.expanded;\n\
+        function_result = object.widen(4'shf);\n\
+        narrow_result = object.narrow();\n\
+        free_result = narrow_free();\n\
+      end\n\
+    endmodule\n";
+    let file = parse_source_conformant(source).expect("signed class/local syntax parses");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("signed class/local elaboration");
+    sim.kernel().set_echo(false);
+    sim.run();
+
+    for (name, value) in [
+        ("local_result", 0xf9),
+        ("field_result", 0xf8),
+        ("function_result", 0xff),
+        ("narrow_result", 0xff),
+        ("free_result", 0xfe),
+    ] {
+        let net = sim.kernel().find_net(name).expect("signed coercion net");
+        assert_eq!(sim.kernel().net_value(net).width(), 8);
+        assert_eq!(
+            sim.kernel().net_value(net).to_u64(),
+            value,
+            "value of {name}"
+        );
+    }
+}
+
+#[test]
 fn conformance_mode_rejects_unsupported_fixed_memory_forms() {
     let cases = [
         (
@@ -1331,15 +1453,30 @@ fn conformant_constant_initializers_apply_all_supported_operators() {
       logic less = (2 < 1);\n\
       logic [3:0] shifted = (1 << 2);\n\
       logic negated = !1;\n\
+      logic signed_less = (4'shf < 4'sh1);\n\
+      logic mixed_less = (4'shf < 4'h1);\n\
+      logic [7:0] signed_shift = (4'sh8 >>> 2);\n\
     endmodule\n";
     let file = parse_source_conformant(src).expect("conformant parse");
     let mut sim = elaborate_conformant(&file, &Interp).expect("conformant elaboration");
     let less = sim.kernel().find_net("less").expect("less net");
     let shifted = sim.kernel().find_net("shifted").expect("shifted net");
     let negated = sim.kernel().find_net("negated").expect("negated net");
+    let signed_less = sim
+        .kernel()
+        .find_net("signed_less")
+        .expect("signed less net");
+    let mixed_less = sim.kernel().find_net("mixed_less").expect("mixed less net");
+    let signed_shift = sim
+        .kernel()
+        .find_net("signed_shift")
+        .expect("signed shift net");
     assert_eq!(sim.kernel().net_value(less).to_u64(), 0);
     assert_eq!(sim.kernel().net_value(shifted).to_u64(), 4);
     assert_eq!(sim.kernel().net_value(negated).to_u64(), 0);
+    assert_eq!(sim.kernel().net_value(signed_less).to_u64(), 1);
+    assert_eq!(sim.kernel().net_value(mixed_less).to_u64(), 0);
+    assert_eq!(sim.kernel().net_value(signed_shift).to_u64(), 0xfe);
 }
 
 #[test]
@@ -1379,12 +1516,12 @@ fn conformance_mode_rejects_cyclic_module_hierarchy() {
 }
 
 #[test]
-fn conformance_mode_rejects_port_width_conversion() {
+fn conformance_mode_rejects_inout_and_ref_port_width_conversion() {
     for src in [
-        "module child(input logic [7:0] value); endmodule\n\
-         module top; logic [3:0] value; child dut(value); endmodule\n",
+        "module child(inout wire [7:0] value); endmodule\n\
+         module top; wire [3:0] value; child dut(value); endmodule\n",
         "module child #(parameter int WIDTH = 4)\n\
-           (input logic [WIDTH-1:0] value);\n\
+           (ref logic [WIDTH-1:0] value);\n\
          endmodule\n\
          module top; logic [3:0] value; child #(.WIDTH(8)) dut(value); endmodule\n",
     ] {

@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 28, 2026:
 
-- 190 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 193 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -66,8 +66,9 @@ Validated on July 28, 2026:
   exits normally.
 - Conformance parsing rejects Verible recovery trees, known unsupported CST
   paths, and unknown system calls with line/column diagnostics; conformant
-  elaboration rejects semantic fallbacks, hierarchy cycles/width conversion,
-  panics, placeholder builtins, and every resilient callable stub.
+  elaboration rejects semantic fallbacks, hierarchy cycles, unsupported
+  bidirectional width conversion, panics, placeholder builtins, and every
+  resilient callable stub.
 - ANSI packed/scalar ports and recursive child module instances elaborate with
   named or positional whole-signal connectivity. A strict end-to-end test
   validates delayed parent-to-child-to-parent propagation through both forms.
@@ -95,6 +96,12 @@ Validated on July 28, 2026:
   bounds, dynamic reads, blocking/NBA writes, continuous-read sensitivity, and
   out-of-range/X-index read/write behavior are validated end to end. Packed
   dynamic bit reads and procedural blocking/NBA bit writes are also supported.
+- Integral declarations preserve signedness across module signals, procedural
+  locals, class/static/package fields, and callable returns. Assignment and
+  continuous-driver boundaries truncate or extend from source signedness;
+  input/output port width conversion uses directional bridges. Signed/mixed
+  arithmetic and comparisons, unsized decimal literals, and signed `>>>` are
+  validated at runtime and during constant folding.
 - A source-level synchronous counter validates `always #delay`,
   `always_ff @(posedge clk)`, nonblocking assignment, and NBA settling. Focused
   swap tests confirm simultaneous NBAs read old values. This is a usable narrow
@@ -295,8 +302,8 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
      machine-readable evidence without publishing a whole-standard percentage.
 
 2. **Core elaboration and hierarchy**
-   - Complete expression sizing/signing and assignment/port coercion, then add
-     hierarchical references and explicit top selection.
+   - Add hierarchical references and explicit top selection, then continue
+     with process/synchronization primitives and scheduler regions.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -354,20 +361,21 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   whole-signal named/positional connections. Matching canonical resolved net
   kinds collapse onto one scheduler net; mismatched ordinary input/output kinds
   use directional bridges. Complete directionality, net/variable distinctions,
-  cross-resolution inout and implicit pull/supply bridges, width conversion,
-  expression actuals, and hierarchy references remain unsupported. Generate
+  cross-resolution inout and implicit pull/supply bridges, inout/ref width
+  conversion, expression actuals, and hierarchy references remain unsupported. Generate
   support currently requires named blocks and integral constant expressions;
   implicit `genblk` naming, generate-local parameters, arrays of instances,
   interfaces, and hierarchical references into generated scopes remain
   unsupported.
-- Continuous assignment support is limited to internal unsigned `wire`/`tri`,
+- Continuous assignment support is limited to internal integral `wire`/`tri`,
   `tri0`/`tri1`, `supply0`/`supply1`, `wand`/`triand`, and `wor`/`trior` nets;
-  whole-net LHS targets; exact-width represented unsigned signal/literal RHS
-  expressions; default or explicit `highz`/`weak`/`pull`/`strong`/`supply`
+  whole-net LHS targets; represented integral signal/literal RHS expressions
+  with signed/unsigned width coercion; default or explicit
+  `highz`/`weak`/`pull`/`strong`/`supply`
   strengths on ordinary continuous drivers; and optional one-, two-, or
   three-value timescale-relative inertial delays. Net declaration assignments,
-  procedural net writes, implicit width conversion, signed operands/targets,
-  charge strengths, nondefault wired-net strengths, explicit-unit delay literals,
+  procedural net writes, charge strengths, nondefault wired-net strengths,
+  explicit-unit delay literals,
   dynamic part-selects, partial/hierarchical targets, and driver
   mutation outside static continuous assignments remain unsupported in
   conformance mode. Static drivers can withdraw by evaluating to Z; procedural
@@ -376,8 +384,9 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   `int` value parameters in the module header, each with a default. Type
   parameters, non-`int` types, module-body parameter/localparam declarations,
   header localparams, omitted actuals, `defparam`, multiple packed dimensions,
-  parameter-dependent callable signatures/procedural locals, and complete
-  sizing/signing/coercion remain unsupported in conformance mode. One packed
+  parameter-dependent callable signatures/procedural locals, integral casts,
+  callable argument copy-in/out coercion, and complete IEEE type propagation
+  remain unsupported in conformance mode. One packed
   range on module ports, variables, and nets may use module parameters.
 - Fixed-memory support is limited to one nonnegative ascending or descending
   unpacked range on unsigned integral module variables. Multiple dimensions,

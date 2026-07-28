@@ -5,6 +5,7 @@ use eevee_ast::{
     Lvalue, Module, ModuleItem, NetKind, PackedRange, PortDir, SourceFile, Stmt, TimingControl,
     UnaryOp, VarDecl,
 };
+use eevee_core::LogicVec;
 
 use crate::{port_connection_mode, ElabError, PortConnectionMode};
 
@@ -113,6 +114,7 @@ fn validate_hierarchy(file: &SourceFile) -> Result<(), ElabError> {
                 if actual_width != port.width
                     && port.packed_range.is_none()
                     && !module_signal_has_packed_range(module, actual)
+                    && matches!(port.dir, PortDir::Inout | PortDir::Ref)
                 {
                     return unsupported(format!(
                         "port width conversion is unsupported for '{}.{}': actual '{}' is {} bits, port is {} bits",
@@ -219,12 +221,6 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
                 module.name, lhs.name
             ));
         }
-        if module_signal_signed(module, &lhs.name) {
-            return unsupported(format!(
-                "signed continuous assignment target '{}.{}' is unsupported",
-                module.name, lhs.name
-            ));
-        }
         if strength.is_some()
             && matches!(
                 module_signal_net_kind(module, &lhs.name),
@@ -238,19 +234,13 @@ fn validate_continuous_assignments(module: &Module) -> Result<(), ElabError> {
         }
         validate_continuous_expr(module, rhs)?;
         let target_width = module_signal_width(module, &lhs.name).expect("validated net target");
-        let Some(rhs_width) = continuous_expr_width_with_context(module, rhs, Some(target_width))
+        let Some(_rhs_width) = continuous_expr_width_with_context(module, rhs, Some(target_width))
         else {
             return unsupported(format!(
                 "continuous assignment expression width is not statically known in module '{}'",
                 module.name
             ));
         };
-        if rhs_width != target_width {
-            return unsupported(format!(
-                "continuous assignment width conversion is unsupported for '{}.{}': RHS is {} bits, target is {} bits",
-                module.name, lhs.name, rhs_width, target_width
-            ));
-        }
         if let Some(delay) = delay {
             for expression in continuous_delay_expressions(delay) {
                 if !is_parameter_constant_expr(expression, &module_parameters) {
@@ -276,7 +266,7 @@ fn continuous_expr_width_with_context(
     context_width: Option<u32>,
 ) -> Option<u32> {
     match expr {
-        Expr::Literal(value) => Some(value.width()),
+        Expr::Literal(value) | Expr::SignedLiteral(value) => Some(value.width()),
         Expr::Fill(_) => context_width,
         Expr::Ref(name) => module_signal_width(module, name),
         Expr::Unary { op, operand } => match op {
@@ -307,7 +297,7 @@ fn continuous_expr_width_with_context(
                 continuous_expr_width_with_context(module, rhs, Some(operand_width))?;
                 Some(1)
             }
-            BinOp::Shl | BinOp::Shr => {
+            BinOp::Shl | BinOp::Shr | BinOp::Sar => {
                 continuous_expr_width_with_context(module, lhs, context_width)
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor => {
@@ -330,12 +320,8 @@ fn continuous_expr_width_with_context(
             _ => Some(1),
         },
         Expr::PartSelect { left, right, .. } => {
-            let Expr::Literal(left) = left.as_ref() else {
-                return None;
-            };
-            let Expr::Literal(right) = right.as_ref() else {
-                return None;
-            };
+            let left = literal_logic(left)?;
+            let right = literal_logic(right)?;
             if !left.is_known() || !right.is_known() {
                 return None;
             }
@@ -350,13 +336,8 @@ fn continuous_expr_width_with_context(
 
 fn validate_continuous_expr(module: &Module, expr: &Expr) -> Result<(), ElabError> {
     match expr {
-        Expr::Literal(_) | Expr::Fill(_) => Ok(()),
-        Expr::Ref(name)
-            if module_signal_width(module, name).is_some()
-                && !module_signal_signed(module, name) =>
-        {
-            Ok(())
-        }
+        Expr::Literal(_) | Expr::SignedLiteral(_) | Expr::Fill(_) => Ok(()),
+        Expr::Ref(name) if module_signal_width(module, name).is_some() => Ok(()),
         Expr::Unary { operand, .. } => validate_continuous_expr(module, operand),
         Expr::Binary { lhs, rhs, .. } => {
             validate_continuous_expr(module, lhs)?;
@@ -370,14 +351,6 @@ fn validate_continuous_expr(module: &Module, expr: &Expr) -> Result<(), ElabErro
             validate_continuous_expr(module, condition)?;
             validate_continuous_expr(module, when_true)?;
             validate_continuous_expr(module, when_false)?;
-            let true_width = continuous_expr_width(module, when_true);
-            let false_width = continuous_expr_width(module, when_false);
-            if true_width.is_some() && false_width.is_some() && true_width != false_width {
-                return unsupported(format!(
-                    "continuous conditional branch width mismatch in module '{}'",
-                    module.name
-                ));
-            }
             Ok(())
         }
         Expr::Index { base, index } => {
@@ -393,8 +366,7 @@ fn validate_continuous_expr(module: &Module, expr: &Expr) -> Result<(), ElabErro
         }
         Expr::PartSelect { base, left, right } => {
             validate_continuous_expr(module, base)?;
-            let (Expr::Literal(left), Expr::Literal(right)) = (left.as_ref(), right.as_ref())
-            else {
+            let (Some(left), Some(right)) = (literal_logic(left), literal_logic(right)) else {
                 return unsupported(format!(
                     "continuous part-select bounds must be constant in module '{}'",
                     module.name
@@ -423,6 +395,13 @@ fn validate_continuous_expr(module: &Module, expr: &Expr) -> Result<(), ElabErro
             "unsupported continuous assignment expression in module '{}': {expr:?}",
             module.name
         )),
+    }
+}
+
+fn literal_logic(expression: &Expr) -> Option<&LogicVec> {
+    match expression {
+        Expr::Literal(value) | Expr::SignedLiteral(value) => Some(value),
+        _ => None,
     }
 }
 
@@ -627,22 +606,6 @@ fn module_signal_net_kind(module: &Module, name: &str) -> Option<NetKind> {
                 _ => None,
             })
         })
-}
-
-fn module_signal_signed(module: &Module, name: &str) -> bool {
-    module
-        .ports
-        .iter()
-        .find(|port| port.name == name)
-        .map(|port| port.signed)
-        .or_else(|| {
-            module.items.iter().find_map(|item| match item {
-                ModuleItem::Var(var) if var.name == name => Some(var.signed),
-                ModuleItem::Net(net) if net.name == name => Some(net.signed),
-                _ => None,
-            })
-        })
-        .unwrap_or(false)
 }
 
 fn validate_module_scope(module: &Module) -> Result<(), ElabError> {
@@ -1214,14 +1177,19 @@ fn validate_expr(expr: &Expr) -> Result<(), ElabError> {
             validate_exprs(args)?;
         }
         Expr::StaticRef { class_name, .. } => validate_type(Some(class_name))?,
-        Expr::Literal(_) | Expr::Fill(_) | Expr::Str(_) | Expr::Ref(_) | Expr::Null => {}
+        Expr::Literal(_)
+        | Expr::SignedLiteral(_)
+        | Expr::Fill(_)
+        | Expr::Str(_)
+        | Expr::Ref(_)
+        | Expr::Null => {}
     }
     Ok(())
 }
 
 fn is_integral_conditional_operand(expression: &Expr) -> bool {
     match expression {
-        Expr::Literal(_) | Expr::Fill(_) | Expr::Ref(_) => true,
+        Expr::Literal(_) | Expr::SignedLiteral(_) | Expr::Fill(_) | Expr::Ref(_) => true,
         Expr::Unary { operand, .. } => is_integral_conditional_operand(operand),
         Expr::Binary { lhs, rhs, .. } => {
             is_integral_conditional_operand(lhs) && is_integral_conditional_operand(rhs)
@@ -1268,7 +1236,7 @@ fn validate_exprs(expressions: &[Expr]) -> Result<(), ElabError> {
 
 fn is_constant_expr(expr: &Expr, module_parameters: Option<&HashSet<&str>>) -> bool {
     match expr {
-        Expr::Literal(_) | Expr::Fill(_) => true,
+        Expr::Literal(_) | Expr::SignedLiteral(_) | Expr::Fill(_) => true,
         Expr::Ref(name) => {
             module_parameters.is_some_and(|parameters| parameters.contains(name.as_str()))
         }
@@ -1299,7 +1267,7 @@ fn is_constant_expr(expr: &Expr, module_parameters: Option<&HashSet<&str>>) -> b
 
 fn is_parameter_constant_expr(expr: &Expr, visible: &HashSet<&str>) -> bool {
     match expr {
-        Expr::Literal(_) | Expr::Fill(_) => true,
+        Expr::Literal(_) | Expr::SignedLiteral(_) | Expr::Fill(_) => true,
         Expr::Ref(name) => visible.contains(name.as_str()),
         Expr::Unary { operand, .. } => is_parameter_constant_expr(operand, visible),
         Expr::Binary { lhs, rhs, .. } => {

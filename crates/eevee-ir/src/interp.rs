@@ -469,6 +469,22 @@ fn run_frame(
                 let v = regs[a as usize].as_logic().uge(regs[b as usize].as_logic());
                 regs[dst as usize] = Value::Logic(v);
             }
+            Inst::SignedLt { dst, a, b } => {
+                let value = regs[a as usize].as_logic().slt(regs[b as usize].as_logic());
+                regs[dst as usize] = Value::Logic(value);
+            }
+            Inst::SignedLe { dst, a, b } => {
+                let value = regs[a as usize].as_logic().sle(regs[b as usize].as_logic());
+                regs[dst as usize] = Value::Logic(value);
+            }
+            Inst::SignedGt { dst, a, b } => {
+                let value = regs[a as usize].as_logic().sgt(regs[b as usize].as_logic());
+                regs[dst as usize] = Value::Logic(value);
+            }
+            Inst::SignedGe { dst, a, b } => {
+                let value = regs[a as usize].as_logic().sge(regs[b as usize].as_logic());
+                regs[dst as usize] = Value::Logic(value);
+            }
             Inst::Shl { dst, a, b } => {
                 let amt = regs[b as usize].as_logic().to_u64() as u32;
                 let v = regs[a as usize].as_logic().shl(amt);
@@ -478,6 +494,11 @@ fn run_frame(
                 let amt = regs[b as usize].as_logic().to_u64() as u32;
                 let v = regs[a as usize].as_logic().shr(amt);
                 regs[dst as usize] = Value::Logic(v);
+            }
+            Inst::Ashr { dst, a, b } => {
+                let amount = regs[b as usize].as_logic().to_u64() as u32;
+                let value = regs[a as usize].as_logic().ashr(amount);
+                regs[dst as usize] = Value::Logic(value);
             }
             Inst::LogAnd { dst, a, b } => {
                 let v = value_truthy(&regs[a as usize]) && value_truthy(&regs[b as usize]);

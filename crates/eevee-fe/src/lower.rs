@@ -407,7 +407,7 @@ fn param_const_pair(
 /// exact and retain four-state behavior through [`LogicVec`].
 fn eval_const_expr(expr: &Expr, constants: &HashMap<String, LogicVec>) -> Option<LogicVec> {
     match expr {
-        Expr::Literal(value) => Some(value.clone()),
+        Expr::Literal(value) | Expr::SignedLiteral(value) => Some(value.clone()),
         Expr::Fill(bit) => Some(LogicVec::filled(*bit, 32)),
         Expr::Ref(name) => constants.get(name).cloned(),
         Expr::Unary { op, operand } => {
@@ -425,6 +425,8 @@ fn eval_const_expr(expr: &Expr, constants: &HashMap<String, LogicVec>) -> Option
         Expr::Binary { op, lhs, rhs } => {
             let left = eval_const_expr(lhs, constants)?;
             let right = eval_const_expr(rhs, constants)?;
+            let signed = const_expr_signedness(lhs).unwrap_or(false)
+                && const_expr_signedness(rhs).unwrap_or(false);
             Some(match op {
                 BinOp::Add => left.add(&right),
                 BinOp::Sub => left.sub(&right),
@@ -434,12 +436,20 @@ fn eval_const_expr(expr: &Expr, constants: &HashMap<String, LogicVec>) -> Option
                 BinOp::Xor => left.bitxor(&right),
                 BinOp::Eq => left.eq_logical(&right),
                 BinOp::Neq => left.ne_logical(&right),
+                BinOp::Lt if signed => left.slt(&right),
+                BinOp::Gt if signed => left.sgt(&right),
+                BinOp::Le if signed => left.sle(&right),
+                BinOp::Ge if signed => left.sge(&right),
                 BinOp::Lt => left.ult(&right),
                 BinOp::Gt => left.ugt(&right),
                 BinOp::Le => left.ule(&right),
                 BinOp::Ge => left.uge(&right),
                 BinOp::Shl => left.shl(right.to_u64() as u32),
                 BinOp::Shr => left.shr(right.to_u64() as u32),
+                BinOp::Sar if const_expr_signedness(lhs).unwrap_or(false) => {
+                    left.ashr(right.to_u64() as u32)
+                }
+                BinOp::Sar => left.shr(right.to_u64() as u32),
                 BinOp::LogAnd => LogicVec::from_u64((left.is_true() && right.is_true()) as u64, 1),
                 BinOp::LogOr => LogicVec::from_u64((left.is_true() || right.is_true()) as u64, 1),
             })
@@ -457,6 +467,34 @@ fn eval_const_expr(expr: &Expr, constants: &HashMap<String, LogicVec>) -> Option
     }
 }
 
+fn const_expr_signedness(expression: &Expr) -> Option<bool> {
+    match expression {
+        Expr::SignedLiteral(_) => Some(true),
+        Expr::Literal(_)
+        | Expr::Fill(_)
+        | Expr::Concat(_)
+        | Expr::Index { .. }
+        | Expr::PartSelect { .. } => Some(false),
+        Expr::Unary { op, operand } => match op {
+            UnaryOp::BitNot | UnaryOp::Neg | UnaryOp::Plus => const_expr_signedness(operand),
+            _ => Some(false),
+        },
+        Expr::Binary { op, lhs, rhs } => match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor => {
+                Some(const_expr_signedness(lhs)? && const_expr_signedness(rhs)?)
+            }
+            BinOp::Shl | BinOp::Shr | BinOp::Sar => const_expr_signedness(lhs),
+            _ => Some(false),
+        },
+        Expr::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => Some(const_expr_signedness(when_true)? && const_expr_signedness(when_false)?),
+        _ => None,
+    }
+}
+
 fn eval_const_expr_at_width(
     expression: &Expr,
     constants: &HashMap<String, LogicVec>,
@@ -465,6 +503,8 @@ fn eval_const_expr_at_width(
 ) -> Option<LogicVec> {
     match expression {
         Expr::Fill(bit) => Some(LogicVec::filled(*bit, width)),
+        Expr::SignedLiteral(value) => Some(value.resize(width, true)),
+        Expr::Literal(value) => Some(value.resize(width, false)),
         Expr::Conditional {
             condition,
             when_true,
@@ -592,7 +632,7 @@ fn lower_module_ports(n: &Value) -> Vec<Port> {
                 dir,
                 width: dtype.map(packed_width).unwrap_or(1),
                 packed_range: dtype.and_then(lower_packed_range),
-                signed: find_deep(declaration, "signed").is_some(),
+                signed: dtype.is_some_and(data_type_signed),
                 net_kind: kids(declaration).find_map(lower_net_kind_token),
             }
         })
@@ -606,7 +646,7 @@ fn lower_net_decl(n: &Value) -> Vec<NetDecl> {
     let dtype = find(n, "kDataTypeImplicitIdDimensions")
         .and_then(|dimensions| find(dimensions, "kDataType"));
     let width = dtype.map(packed_width).unwrap_or(1);
-    let signed = find_deep(n, "signed").is_some();
+    let signed = dtype.is_some_and(data_type_signed);
     let delay = find_deep(n, "kDelay").map(lower_continuous_delay);
     let Some(declarations) = find(n, "kNetVariableDeclarationAssign") else {
         return Vec::new();
@@ -676,7 +716,7 @@ fn lower_data_decl(n: &Value) -> Vec<VarDecl> {
     let is_string = dtype.map(is_string_type).unwrap_or(false);
     let is_event = dtype.is_some_and(|value| find_deep(value, "event").is_some());
     let width = dtype.map(packed_width).unwrap_or(1);
-    let signed = dtype.is_some_and(|value| find_deep(value, "signed").is_some());
+    let signed = dtype.is_some_and(data_type_signed);
     // A `static` qualifier sits in a kQualifierList directly under the decl.
     let is_static = find(n, "kQualifierList")
         .map(|q| kids(q).any(|c| tag(c) == "static"))
@@ -984,6 +1024,23 @@ fn is_string_type(dtype: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn data_type_signed(dtype: &Value) -> bool {
+    if find_deep(dtype, "unsigned").is_some() {
+        return false;
+    }
+    if find_deep(dtype, "signed").is_some() {
+        return true;
+    }
+    find_deep(dtype, "kDataTypePrimitive")
+        .and_then(|primitive| kids(primitive).next())
+        .is_some_and(|keyword| {
+            matches!(
+                tag(keyword),
+                "byte" | "shortint" | "int" | "integer" | "longint"
+            )
+        })
+}
+
 /// Width from a `kDataType`'s packed dimension `[hi:lo]`, or the primitive
 /// type's natural width for an unpacked scalar (`int` = 32, `byte` = 8, ...).
 fn packed_width(dtype: &Value) -> u32 {
@@ -1093,6 +1150,8 @@ fn lower_function(n: &Value) -> FuncDecl {
     FuncDecl {
         name,
         ret_width,
+        ret_signed: ret_dtype.is_some_and(data_type_signed),
+        ret_is_string: ret_dtype.is_some_and(is_string_type),
         ret_packed_range: ret_dtype.and_then(lower_packed_range).map(Box::new),
         ret_class,
         class_scope,
@@ -1153,6 +1212,8 @@ fn lower_port_item(n: &Value) -> Param {
         name,
         dir,
         width,
+        signed: dtype.is_some_and(data_type_signed),
+        is_string: dtype.is_some_and(is_string_type),
         packed_range: dtype.and_then(lower_packed_range).map(Box::new),
         class_name,
         type_scope,
@@ -1400,7 +1461,7 @@ fn lower_struct_typedef(n: &Value) -> Option<ClassDecl> {
             width: mdtype.map(packed_width).unwrap_or(1),
             packed_range: mdtype.and_then(lower_packed_range),
             unpacked_range: lower_unpacked_range(inner).map(Box::new),
-            signed: false,
+            signed: mdtype.is_some_and(data_type_signed),
             class_name: mdtype.and_then(class_type_name),
             type_scope: mdtype.and_then(class_type_scope),
             type_args: mdtype.map(type_args_of).unwrap_or_default(),
@@ -1442,6 +1503,8 @@ fn lower_constructor(n: &Value) -> FuncDecl {
     FuncDecl {
         name: "new".to_string(),
         ret_width: 0,
+        ret_signed: false,
+        ret_is_string: false,
         ret_packed_range: None,
         ret_class: None,
         class_scope: None,
@@ -1946,7 +2009,7 @@ pub fn lower_expr(n: &Value) -> Expr {
                 _ => None,
             })
             .map(Expr::Fill)
-            .unwrap_or_else(|| Expr::Literal(lower_number(n))),
+            .unwrap_or_else(|| lower_number_expr(n)),
         "TK_StringLiteral" => Expr::Str(unquote(text(n))),
         // The `null` class-handle literal.
         "null" => Expr::Null,
@@ -2044,7 +2107,7 @@ fn ref_or_zero(n: &Value) -> Expr {
         return Expr::Ref(text(id).to_string());
     }
     if find_deep(n, "TK_DecNumber").is_some() {
-        return Expr::Literal(lower_number(n));
+        return lower_number_expr(n);
     }
     Expr::Literal(LogicVec::zero(32))
 }
@@ -2385,6 +2448,22 @@ fn lower_number(n: &Value) -> LogicVec {
     LogicVec::from_u64(v as u64, 32)
 }
 
+fn lower_number_expr(n: &Value) -> Expr {
+    let value = lower_number(n);
+    let signed = if let Some(base_digits) = find(n, "kBaseDigits") {
+        kids(base_digits)
+            .find(|token| tag(token).ends_with("Base"))
+            .is_some_and(|token| text(token).to_ascii_lowercase().contains("'s"))
+    } else {
+        true
+    };
+    if signed {
+        Expr::SignedLiteral(value)
+    } else {
+        Expr::Literal(value)
+    }
+}
+
 fn lower_binop(op: &str) -> BinOp {
     match op {
         "+" => BinOp::Add,
@@ -2401,6 +2480,7 @@ fn lower_binop(op: &str) -> BinOp {
         ">=" => BinOp::Ge,
         "<<" => BinOp::Shl,
         ">>" => BinOp::Shr,
+        ">>>" => BinOp::Sar,
         "&&" => BinOp::LogAnd,
         "||" => BinOp::LogOr,
         _ => BinOp::Add,

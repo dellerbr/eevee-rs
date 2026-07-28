@@ -369,6 +369,8 @@ pub struct ParamDecl {
 pub struct FuncDecl {
     pub name: String,
     pub ret_width: u32,
+    pub ret_signed: bool,
+    pub ret_is_string: bool,
     pub ret_packed_range: Option<Box<PackedRange>>,
     /// `Some(class)` if the function returns a class handle.
     pub ret_class: Option<String>,
@@ -388,6 +390,8 @@ pub struct Param {
     pub name: String,
     pub dir: PortDir,
     pub width: u32,
+    pub signed: bool,
+    pub is_string: bool,
     pub packed_range: Option<Box<PackedRange>>,
     /// `Some(class)` if the parameter is a class handle.
     pub class_name: Option<String>,
@@ -538,6 +542,8 @@ pub struct Lvalue {
 pub enum Expr {
     /// A sized/unsized literal, already parsed to a 4-state vector.
     Literal(LogicVec),
+    /// A signed sized literal (`N's...`) or unsized decimal integer literal.
+    SignedLiteral(LogicVec),
     /// An unbased unsized literal (`'0`, `'1`, `'x`, `'z`) that fills context width.
     Fill(Bit),
     /// A string literal (e.g. a `$display` format string).
@@ -635,6 +641,7 @@ pub enum BinOp {
     Ge,
     Shl,
     Shr,
+    Sar,
     /// `&&` logical AND.
     LogAnd,
     /// `||` logical OR.

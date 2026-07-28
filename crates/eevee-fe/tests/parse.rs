@@ -69,7 +69,9 @@ fn parses_clock_always() {
         panic!("expected timed statement");
     };
     match control {
-        TimingControl::Delay(Expr::Literal(d)) => assert_eq!(d.to_u64(), 5),
+        TimingControl::Delay(Expr::Literal(d) | Expr::SignedLiteral(d)) => {
+            assert_eq!(d.to_u64(), 5)
+        }
         other => panic!("expected #5 delay, got {other:?}"),
     }
     let Stmt::Blocking { lhs, rhs } = &**body else {
@@ -123,7 +125,7 @@ fn parses_counter_always_ff() {
             rhs,
         } => {
             assert!(matches!(&**lhs, Expr::Ref(n) if n == "c"));
-            assert!(matches!(&**rhs, Expr::Literal(v) if v.to_u64() == 1));
+            assert!(matches!(&**rhs, Expr::Literal(v) | Expr::SignedLiteral(v) if v.to_u64() == 1));
         }
         other => panic!("expected c + 1, got {other:?}"),
     }
@@ -136,7 +138,9 @@ fn init_values_present() {
     for i in &m.items {
         if let ModuleItem::Var(v) = i {
             let init = v.init.as_ref().expect("has init");
-            assert!(matches!(init, Expr::Literal(val) if val.to_u64() == 0));
+            assert!(
+                matches!(init, Expr::Literal(val) | Expr::SignedLiteral(val) if val.to_u64() == 0)
+            );
         }
     }
 }
@@ -256,7 +260,7 @@ fn parses_continuous_assignments() {
         (
             Lvalue { name, .. },
             Expr::Ref(source),
-            Some(ContinuousDelay::Single(Expr::Literal(delay)))
+            Some(ContinuousDelay::Single(Expr::Literal(delay) | Expr::SignedLiteral(delay)))
         ) if name == "z" && source == "b" && delay.to_u64() == 2
     ));
 }
@@ -430,13 +434,13 @@ fn parses_module_parameter_defaults_and_overrides() {
                 name: value,
                 width: 32,
                 signed: true,
-                default: Expr::Literal(value_default),
+                default: Expr::Literal(value_default) | Expr::SignedLiteral(value_default),
             },
             ModuleParameter {
                 name: delay,
                 width: 32,
                 signed: true,
-                default: Expr::Literal(delay_default),
+                default: Expr::Literal(delay_default) | Expr::SignedLiteral(delay_default),
             }
         ] if value == "VALUE"
             && value_default.to_u64() == 3
@@ -461,11 +465,11 @@ fn parses_module_parameter_defaults_and_overrides() {
         [
             ParameterOverride {
                 parameter: Some(value),
-                value: Expr::Literal(value_override),
+                value: Expr::Literal(value_override) | Expr::SignedLiteral(value_override),
             },
             ParameterOverride {
                 parameter: Some(delay),
-                value: Expr::Literal(delay_override),
+                value: Expr::Literal(delay_override) | Expr::SignedLiteral(delay_override),
             }
         ] if value == "VALUE"
             && value_override.to_u64() == 9
@@ -477,11 +481,11 @@ fn parses_module_parameter_defaults_and_overrides() {
         [
             ParameterOverride {
                 parameter: None,
-                value: Expr::Literal(value_override),
+                value: Expr::Literal(value_override) | Expr::SignedLiteral(value_override),
             },
             ParameterOverride {
                 parameter: None,
-                value: Expr::Literal(delay_override),
+                value: Expr::Literal(delay_override) | Expr::SignedLiteral(delay_override),
             }
         ] if value_override.to_u64() == 11 && delay_override.to_u64() == 1
     ));
@@ -590,8 +594,8 @@ fn conformance_mode_accepts_continuous_assignment_delay_tuples() {
     assert!(matches!(
         two_delay,
         ContinuousDelay::RiseFall {
-            rise: Expr::Literal(rise),
-            fall: Expr::Literal(fall),
+            rise: Expr::Literal(rise) | Expr::SignedLiteral(rise),
+            fall: Expr::Literal(fall) | Expr::SignedLiteral(fall),
         } if rise.to_u64() == 1 && fall.to_u64() == 2
     ));
 
@@ -609,9 +613,9 @@ fn conformance_mode_accepts_continuous_assignment_delay_tuples() {
     assert!(matches!(
         three_delay,
         ContinuousDelay::RiseFallTurnOff {
-            rise: Expr::Literal(rise),
-            fall: Expr::Literal(fall),
-            turn_off: Expr::Literal(turn_off),
+            rise: Expr::Literal(rise) | Expr::SignedLiteral(rise),
+            fall: Expr::Literal(fall) | Expr::SignedLiteral(fall),
+            turn_off: Expr::Literal(turn_off) | Expr::SignedLiteral(turn_off),
         } if rise.to_u64() == 1 && fall.to_u64() == 2 && turn_off.to_u64() == 3
     ));
 
@@ -746,9 +750,9 @@ fn conformance_mode_accepts_net_declaration_delay_tuples() {
     assert!(matches!(
         net.delay,
         Some(ContinuousDelay::RiseFallTurnOff {
-            rise: Expr::Literal(ref rise),
-            fall: Expr::Literal(ref fall),
-            turn_off: Expr::Literal(ref turn_off),
+            rise: Expr::Literal(ref rise) | Expr::SignedLiteral(ref rise),
+            fall: Expr::Literal(ref fall) | Expr::SignedLiteral(ref fall),
+            turn_off: Expr::Literal(ref turn_off) | Expr::SignedLiteral(ref turn_off),
         }) if rise.to_u64() == 1 && fall.to_u64() == 2 && turn_off.to_u64() == 3
     ));
 }

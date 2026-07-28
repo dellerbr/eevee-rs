@@ -456,7 +456,11 @@ impl Mono {
                     self.subst_expr(a);
                 }
             }
-            Expr::Literal(_) | Expr::Fill(_) | Expr::Str(_) | Expr::Null => {}
+            Expr::Literal(_)
+            | Expr::SignedLiteral(_)
+            | Expr::Fill(_)
+            | Expr::Str(_)
+            | Expr::Null => {}
         }
     }
 }

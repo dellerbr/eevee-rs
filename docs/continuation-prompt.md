@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 190 tests.
+- `cargo test --workspace` passes all 193 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -55,8 +55,8 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
 - `elaborate_conformant` rejects semantic preflight failures, elaboration
   panics, and every resilient callable stub. `ElabStats::callable_stubs` retains
   qualified names and reasons; permissive APIs remain UVM exploration tools.
-- Strict hierarchy preflight rejects duplicate/unknown names, cycles, and port
-  width conversion before recursive allocation.
+- Strict hierarchy preflight rejects duplicate/unknown names, cycles, and
+  unsupported inout/ref width conversion before recursive allocation.
 - ANSI scalar/packed module ports and recursively scoped child instances
   support named and positional whole-signal connections. A strict end-to-end
   test validates delayed propagation through both forms.
@@ -96,11 +96,19 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   writes for invalid indices. Dynamic packed bit reads and blocking/NBA writes
   are also validated. Multiple/signed/negative memory dimensions and nonmodule
   fixed arrays remain fail-closed.
+- Integral signedness is preserved for literals, module signals, procedural
+  locals, class/static/package fields, and callable returns. Runtime and
+  constant-folded tests cover source-signed extension, truncation, mixed/all-
+  signed arithmetic and comparisons, arithmetic `>>>`, continuous assignment,
+  and directional input/output width conversion. Explicit string metadata
+  keeps non-integral values outside numeric coercion; real UVM execution is
+  unchanged. Integral casts, callable argument copy-in/out coercion, and full
+  IEEE type propagation remain separate milestones.
 - The narrow sequential RTL core is source-to-runtime validated:
   `always #delay`, `always_ff @(posedge clk)`, nonblocking updates, and NBA old-value
   behavior execute correctly. This does not imply broad synthesizable-Verilog
-  compatibility; complete typing/sizing and full port/net semantics remain
-  major gaps.
+  compatibility; integral casts, complete callable coercion, and full port/net
+  semantics remain major gaps.
 - Strict parsing/elaboration reject type or non-`int` module parameters,
   header/body localparams, module-body parameters, parameter-dependent callable
   signatures/procedural locals, unknown/duplicate/excess overrides, and
@@ -153,43 +161,42 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   an exact strength keyword is present, preserving its normal tree-only UVM
   path. Charge strengths remain rejected; declaration-position
   `supply0`/`supply1` remains a supported internal net type.
-- Strict mode rejects net declaration assignments, procedural or signed net
-  drives, implicit width conversion, mismatched resolved port kinds, explicit
-  strengths on wired-AND/OR nets, charge strengths, explicit-unit delay literals,
+- Strict mode rejects net declaration assignments, procedural net drives,
+  mismatched resolved port kinds, unsupported inout/ref width conversion,
+  explicit strengths on wired-AND/OR nets, charge strengths, explicit-unit delay literals,
   negative/X/Z/nonconstant delay operands, dynamic part-selects, partial
   targets, unknown RHS names, and unsupported RHS calls.
 
 The module connectivity model collapses matching resolved port kinds onto one
 scheduler net and bridges mismatched ordinary input/output kinds directionally.
 Full port directionality, cross-resolution inout and implicit pull/supply
-bridges, complete net/variable port semantics, and width-converting or
+bridges, complete net/variable port semantics, inout/ref width conversion, and
 expression connections are not claimed.
 
 ## Next Priorities
 
-1. Complete expression sizing/signing and assignment/port coercion.
-2. Add hierarchical references and explicit top selection while preserving
+1. Add hierarchical references and explicit top selection while preserving
   scoped instance identity. Keep interfaces and complete port direction/type
   semantics as separate milestones.
-3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime
+2. Carry source spans/maps through preprocessing, AST, elaboration, and runtime
   so strict semantic diagnostics are source-located rather than only
   actionable by callable or signal name.
-4. Make normal named test selection work: `run_test("my_test")` and
+3. Make normal named test selection work: `run_test("my_test")` and
    `+UVM_TESTNAME=my_test`, using the real UVM registry/factory source. Add a
    focused probe that does not manually construct `uvm_test_top`.
-5. Verify all common UVM callbacks and the final report summary. Trace any
+4. Verify all common UVM callbacks and the final report summary. Trace any
    missing callback through virtual dispatch and phase traversal rather than
    adding UVM-specific runtime behavior.
-6. Implement real IEEE `process::self`, status transitions, await/kill, and
+5. Implement real IEEE `process::self`, status transitions, await/kill, and
    phase-worker teardown. Keep process support generic and scheduler-owned.
-7. Reduce the highest UVM compile-stub buckets with focused language tests:
+6. Reduce the highest UVM compile-stub buckets with focused language tests:
    callback collection typing, `uvm_typeid_base::typename`, nested indexed
    receiver typing, collection `foreach`, process status enums, and generic
    min/max methods.
-8. Expand DPI only at the generic boundary. The UVM regex, polling, and HDL
+7. Expand DPI only at the generic boundary. The UVM regex, polling, and HDL
    backdoor symbols are currently intentionally unbound; unknown imports must
    fail explicitly rather than return a plausible zero.
-9. Continue the README roadmap through hierarchy/interfaces,
+8. Continue the README roadmap through hierarchy/interfaces,
    signedness and sizing, runtime primitives, constraints/randomization,
    assertions/coverage, files/waves, and chapter-based conformance closure.
 

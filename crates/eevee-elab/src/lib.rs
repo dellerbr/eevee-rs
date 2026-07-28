@@ -92,12 +92,17 @@ struct CollInfo {
 struct Global {
     class_ids: HashMap<String, u32>,
     func_ids: HashMap<String, u32>,
+    func_integral_returns: HashMap<String, (u32, bool)>,
     class_infos: Vec<ClassInfo>,
     consts: HashMap<String, LogicVec>,
     /// Package-level global variables: name -> static-storage id.
     globals: HashMap<String, u32>,
     /// Declared widths of package-level global variables.
     global_widths: HashMap<String, u32>,
+    /// Declared signedness of package-level global variables.
+    global_signed: HashMap<String, bool>,
+    /// Package-level variables declared as SystemVerilog `string`.
+    global_strings: HashSet<String>,
     /// Collection-typed globals and their element/key class types.
     global_coll: HashMap<String, CollInfo>,
     /// Class-handle globals: name -> class id.
@@ -332,6 +337,8 @@ fn builtin_classes() -> Vec<ClassDecl> {
         FuncDecl {
             name: name.to_string(),
             ret_width: 32,
+            ret_signed: false,
+            ret_is_string: false,
             ret_packed_range: None,
             ret_class: ret_class.map(str::to_string),
             class_scope: None,
@@ -347,6 +354,8 @@ fn builtin_classes() -> Vec<ClassDecl> {
             name: name.to_string(),
             dir: PortDir::Input,
             width: 32,
+            signed: false,
+            is_string: true,
             packed_range: None,
             class_name: None,
             type_scope: None,
@@ -567,11 +576,15 @@ fn build_global(
     // topological class-layout order computed below.
     let mut jobs: Vec<(&FuncDecl, Option<u32>)> = Vec::new();
     let mut func_ids: HashMap<String, u32> = HashMap::new();
+    let mut func_integral_returns = HashMap::new();
     for f in free_funcs {
         if f.class_scope.is_some() {
             continue; // extern definitions become methods of their class
         }
         func_ids.entry(f.name.clone()).or_insert(jobs.len() as u32);
+        if !f.is_void && f.ret_class.is_none() && !f.ret_is_string {
+            func_integral_returns.insert(f.name.clone(), (f.ret_width.max(1), f.ret_signed));
+        }
         jobs.push((f, None));
     }
     let mut class_fids: Vec<ClassFids> = Vec::with_capacity(class_decls.len());
@@ -649,6 +662,8 @@ fn build_global(
     let mut statics_defaults: Vec<Value> = Vec::new();
     let mut globals: HashMap<String, u32> = HashMap::new();
     let mut global_widths: HashMap<String, u32> = HashMap::new();
+    let mut global_signed: HashMap<String, bool> = HashMap::new();
+    let mut global_strings = HashSet::new();
     let mut global_coll: HashMap<String, CollInfo> = HashMap::new();
     let mut global_class: HashMap<String, u32> = HashMap::new();
     for v in global_vars {
@@ -664,6 +679,10 @@ fn build_global(
         statics_defaults.push(default);
         globals.insert(v.name.clone(), id);
         global_widths.insert(v.name.clone(), v.width.max(1));
+        global_signed.insert(v.name.clone(), v.signed);
+        if v.is_string {
+            global_strings.insert(v.name.clone());
+        }
         let elem = v
             .class_name
             .as_deref()
@@ -801,9 +820,12 @@ fn build_global(
     // catch it and substitute a stub so the rest of the library still loads.
     let empty_scope: HashMap<String, (NetId, u32)> = HashMap::new();
     let empty_memories = HashMap::new();
+    let empty_signed = HashMap::new();
     let gv = GlobalVars {
         vars: &globals,
         widths: &global_widths,
+        signed: &global_signed,
+        strings: &global_strings,
         coll: &global_coll,
         class: &global_class,
         type_aliases: &global_type_aliases,
@@ -831,7 +853,9 @@ fn build_global(
             CodeGen::new(
                 &empty_scope,
                 &empty_memories,
+                &empty_signed,
                 &func_ids,
+                &func_integral_returns,
                 &class_ids,
                 &class_infos,
                 &consts,
@@ -937,10 +961,13 @@ fn build_global(
     Global {
         class_ids,
         func_ids,
+        func_integral_returns,
         class_infos,
         consts,
         globals,
         global_widths,
+        global_signed,
+        global_strings,
         global_coll,
         global_class,
         global_type_aliases,
@@ -965,16 +992,21 @@ fn build_class_info(
 ) -> ClassInfo {
     let (
         mut field_slot,
+        mut field_signed,
         mut field_class,
         mut field_coll,
         mut field_events,
+        mut field_strings,
         mut static_fields,
         mut static_field_widths,
+        mut static_field_signed,
+        mut static_field_strings,
         mut static_field_class,
         mut static_field_coll,
         mut type_aliases,
         mut collection_aliases,
         mut method_ret_class,
+        mut method_ret_integral,
         mut field_defaults,
         mut methods,
         mut vtable,
@@ -986,16 +1018,21 @@ fn build_class_info(
                 .expect("base laid out before derived");
             (
                 b.field_slot.clone(),
+                b.field_signed.clone(),
                 b.field_class.clone(),
                 b.field_coll.clone(),
                 b.field_events.clone(),
+                b.field_strings.clone(),
                 b.static_fields.clone(),
                 b.static_field_widths.clone(),
+                b.static_field_signed.clone(),
+                b.static_field_strings.clone(),
                 b.static_field_class.clone(),
                 b.static_field_coll.clone(),
                 b.type_aliases.clone(),
                 b.collection_aliases.clone(),
                 b.method_ret_class.clone(),
+                b.method_ret_integral.clone(),
                 b.field_defaults.clone(),
                 b.methods.clone(),
                 b.vtable.clone(),
@@ -1004,16 +1041,21 @@ fn build_class_info(
         }
         None => (
             HashMap::new(), // field_slot
+            HashMap::new(), // field_signed
             HashMap::new(), // field_class
             HashMap::new(), // field_coll
             HashSet::new(), // field_events
+            HashSet::new(), // field_strings
             HashMap::new(), // static_fields
             HashMap::new(), // static_field_widths
+            HashMap::new(), // static_field_signed
+            HashSet::new(), // static_field_strings
             HashMap::new(), // static_field_class
             HashMap::new(), // static_field_coll
             HashMap::new(), // type_aliases
             HashMap::new(), // collection_aliases
             HashMap::new(), // method_ret_class
+            HashMap::new(), // method_ret_integral
             Vec::new(),     // field_defaults
             HashMap::new(), // methods
             Vec::new(),     // vtable
@@ -1096,6 +1138,10 @@ fn build_class_info(
             statics_defaults.push(default);
             static_fields.insert(fld.name.clone(), id);
             static_field_widths.insert(fld.name.clone(), fld.width.max(1));
+            static_field_signed.insert(fld.name.clone(), fld.signed);
+            if fld.is_string {
+                static_field_strings.insert(fld.name.clone());
+            }
             if let Some(fc) = elem_class {
                 static_field_class.insert(fld.name.clone(), fc);
             }
@@ -1113,8 +1159,12 @@ fn build_class_info(
         }
         let slot = field_defaults.len() as u32;
         field_slot.insert(fld.name.clone(), (slot, fld.width));
+        field_signed.insert(fld.name.clone(), fld.signed);
         if fld.is_event {
             field_events.insert(fld.name.clone());
+        }
+        if fld.is_string {
+            field_strings.insert(fld.name.clone());
         }
         match fld.coll {
             Some(kind) => {
@@ -1140,6 +1190,14 @@ fn build_class_info(
         if let Some(rid) = ret_class {
             method_ret_class.insert(name.clone(), *rid);
         }
+        if let Some(method) = c.methods.iter().find(|method| {
+            method.name == *name
+                && !method.is_void
+                && method.ret_class.is_none()
+                && !method.ret_is_string
+        }) {
+            method_ret_integral.insert(name.clone(), (method.ret_width.max(1), method.ret_signed));
+        }
         match vslot_of.get(name).copied() {
             Some(vslot) => vtable[vslot as usize] = *fid,
             None if *is_virtual => {
@@ -1153,17 +1211,22 @@ fn build_class_info(
         name: c.name.clone(),
         base: base_id,
         field_slot,
+        field_signed,
         field_class,
         field_coll,
         field_events,
+        field_strings,
         static_fields,
         static_field_widths,
+        static_field_signed,
+        static_field_strings,
         static_field_class,
         static_field_coll,
         type_param_default,
         type_aliases,
         collection_aliases,
         method_ret_class,
+        method_ret_integral,
         field_defaults,
         methods,
         vtable,
@@ -1288,8 +1351,14 @@ enum PortConnectionMode {
 #[derive(Debug, Clone, Copy)]
 enum PortBinding {
     Alias(NetId),
-    InputBridge(NetId),
-    OutputBridge(NetId),
+    InputBridge {
+        source: NetId,
+        source_signed: bool,
+    },
+    OutputBridge {
+        destination: NetId,
+        destination_width: u32,
+    },
 }
 
 fn bridgeable_resolution(kind: NetKind) -> bool {
@@ -1337,6 +1406,7 @@ fn elaborate_module_instance(
     let consts = bind_module_parameters(m, parameter_overrides, parent_consts, &g.consts);
     let mut scope: HashMap<String, (NetId, u32)> = HashMap::new();
     let mut scope_kinds = HashMap::new();
+    let mut scope_signed = HashMap::new();
     let mut drivable = HashSet::new();
     for port in &m.ports {
         let width = resolve_declared_width(port.width, port.packed_range.as_ref(), &consts);
@@ -1346,20 +1416,35 @@ fn elaborate_module_instance(
                 // pull/supply driver installed when that net was created.
                 net
             }
-            Some(PortBinding::InputBridge(source)) => {
+            Some(PortBinding::InputBridge {
+                source,
+                source_signed,
+            }) => {
                 let net = new_port_storage(sim, path, port, width);
-                add_port_bridge(source, net, sim, backend, g);
+                add_port_bridge(source, net, source_signed, width, sim, backend, g);
                 net
             }
-            Some(PortBinding::OutputBridge(destination)) => {
+            Some(PortBinding::OutputBridge {
+                destination,
+                destination_width,
+            }) => {
                 let net = new_port_storage(sim, path, port, width);
-                add_port_bridge(net, destination, sim, backend, g);
+                add_port_bridge(
+                    net,
+                    destination,
+                    port.signed,
+                    destination_width,
+                    sim,
+                    backend,
+                    g,
+                );
                 net
             }
             None => new_port_storage(sim, path, port, width),
         };
         scope.insert(port.name.clone(), (local_net, width));
         scope_kinds.insert(port.name.clone(), port.net_kind);
+        scope_signed.insert(port.name.clone(), port.signed);
         if port.net_kind.is_some() && matches!(port.dir, PortDir::Output | PortDir::Inout) {
             drivable.insert(port.name.clone());
         }
@@ -1370,6 +1455,7 @@ fn elaborate_module_instance(
         path,
         scope,
         scope_kinds,
+        scope_signed,
         drivable,
         HashMap::new(),
         &consts,
@@ -1387,6 +1473,7 @@ fn elaborate_module_items(
     path: &str,
     mut scope: HashMap<String, (NetId, u32)>,
     mut scope_kinds: HashMap<String, Option<NetKind>>,
+    mut scope_signed: HashMap<String, bool>,
     mut drivable: HashSet<String>,
     mut memories: HashMap<String, MemoryInfo>,
     consts: &HashMap<String, LogicVec>,
@@ -1411,6 +1498,7 @@ fn elaborate_module_items(
             );
             scope.insert(net.name.clone(), (id, width));
             scope_kinds.insert(net.name.clone(), Some(net.kind));
+            scope_signed.insert(net.name.clone(), net.signed);
             drivable.insert(net.name.clone());
             add_implicit_net_driver(sim, id, net.kind, width);
         }
@@ -1456,6 +1544,7 @@ fn elaborate_module_items(
                         element_width: width,
                     },
                 );
+                scope_signed.insert(v.name.clone(), v.signed);
                 continue;
             }
             let init = match &v.init {
@@ -1474,12 +1563,15 @@ fn elaborate_module_items(
             let net = sim.kernel().new_net(scoped_name(path, &v.name), init);
             scope.insert(v.name.clone(), (net, width));
             scope_kinds.insert(v.name.clone(), None);
+            scope_signed.insert(v.name.clone(), v.signed);
         }
     }
 
     let gv = GlobalVars {
         vars: &g.globals,
         widths: &g.global_widths,
+        signed: &g.global_signed,
+        strings: &g.global_strings,
         coll: &g.global_coll,
         class: &g.global_class,
         type_aliases: &g.global_type_aliases,
@@ -1493,7 +1585,9 @@ fn elaborate_module_items(
                 let prog = CodeGen::new(
                     &scope,
                     &memories,
+                    &scope_signed,
                     &g.func_ids,
+                    &g.func_integral_returns,
                     &g.class_ids,
                     &g.class_infos,
                     consts,
@@ -1507,7 +1601,9 @@ fn elaborate_module_items(
                 let prog = CodeGen::new(
                     &scope,
                     &memories,
+                    &scope_signed,
                     &g.func_ids,
+                    &g.func_integral_returns,
                     &g.class_ids,
                     &g.class_infos,
                     consts,
@@ -1546,7 +1642,9 @@ fn elaborate_module_items(
                 let prog = CodeGen::new(
                     &scope,
                     &memories,
+                    &scope_signed,
                     &g.func_ids,
+                    &g.func_integral_returns,
                     &g.class_ids,
                     &g.class_infos,
                     consts,
@@ -1579,6 +1677,7 @@ fn elaborate_module_items(
             path,
             &scope,
             &scope_kinds,
+            &scope_signed,
             &drivable,
             &memories,
             consts,
@@ -1602,7 +1701,14 @@ fn elaborate_module_items(
                 )
             });
         let child_consts = bind_module_parameters(child, &instance.parameters, consts, &g.consts);
-        let bindings = bind_instance_ports(instance, child, &scope, &scope_kinds, &child_consts);
+        let bindings = bind_instance_ports(
+            instance,
+            child,
+            &scope,
+            &scope_kinds,
+            &scope_signed,
+            &child_consts,
+        );
         elaborate_module_instance(
             child,
             &scoped_name(path, &instance.name),
@@ -1658,6 +1764,7 @@ fn elaborate_generate_construct(
     path: &str,
     scope: &HashMap<String, (NetId, u32)>,
     scope_kinds: &HashMap<String, Option<NetKind>>,
+    scope_signed: &HashMap<String, bool>,
     drivable: &HashSet<String>,
     memories: &HashMap<String, MemoryInfo>,
     consts: &HashMap<String, LogicVec>,
@@ -1686,6 +1793,7 @@ fn elaborate_generate_construct(
                     path,
                     scope,
                     scope_kinds,
+                    scope_signed,
                     drivable,
                     memories,
                     consts,
@@ -1722,6 +1830,7 @@ fn elaborate_generate_construct(
                     path,
                     scope,
                     scope_kinds,
+                    scope_signed,
                     drivable,
                     memories,
                     consts,
@@ -1762,6 +1871,7 @@ fn elaborate_generate_construct(
                     path,
                     scope,
                     scope_kinds,
+                    scope_signed,
                     drivable,
                     memories,
                     &iteration_consts,
@@ -1789,6 +1899,7 @@ fn elaborate_generate_block(
     parent_path: &str,
     parent_scope: &HashMap<String, (NetId, u32)>,
     parent_scope_kinds: &HashMap<String, Option<NetKind>>,
+    parent_scope_signed: &HashMap<String, bool>,
     parent_drivable: &HashSet<String>,
     parent_memories: &HashMap<String, MemoryInfo>,
     consts: &HashMap<String, LogicVec>,
@@ -1811,6 +1922,7 @@ fn elaborate_generate_block(
         &scoped_name(parent_path, &segment),
         parent_scope.clone(),
         parent_scope_kinds.clone(),
+        parent_scope_signed.clone(),
         parent_drivable.clone(),
         parent_memories.clone(),
         consts,
@@ -1894,6 +2006,8 @@ fn resolve_range_bounds(
 fn add_port_bridge(
     source: NetId,
     destination: NetId,
+    source_signed: bool,
+    destination_width: u32,
     sim: &mut Sim,
     backend: &dyn ExecBackend,
     global: &Global,
@@ -1902,10 +2016,17 @@ fn add_port_bridge(
     let mut builder = ProgramBuilder::new("port bridge");
     let evaluate = builder.new_label();
     builder.bind(evaluate);
-    let value = builder.new_reg();
+    let source_value = builder.new_reg();
     builder.emit(Inst::NetRead {
-        dst: value,
+        dst: source_value,
         net: source,
+    });
+    let value = builder.new_reg();
+    builder.emit(Inst::Resize {
+        dst: value,
+        src: source_value,
+        width: destination_width,
+        signed: source_signed,
     });
     builder.emit(Inst::DriveNet { driver, src: value });
     let nets = builder.netlist(&[source]);
@@ -2013,6 +2134,7 @@ fn bind_instance_ports(
     child: &Module,
     parent_scope: &HashMap<String, (NetId, u32)>,
     parent_scope_kinds: &HashMap<String, Option<NetKind>>,
+    parent_scope_signed: &HashMap<String, bool>,
     child_consts: &HashMap<String, LogicVec>,
 ) -> HashMap<String, PortBinding> {
     let mut bindings = HashMap::new();
@@ -2049,22 +2171,35 @@ fn bind_instance_ports(
         });
         let port_width =
             resolve_declared_width(port.width, port.packed_range.as_ref(), child_consts);
-        assert_eq!(
-            actual_width, port_width,
-            "port width conversion is unsupported for '{}.{}': actual '{}' is {} bits, port is {} bits",
-            instance.name, port.name, actual, actual_width, port_width
-        );
         let actual_kind = parent_scope_kinds.get(actual).copied().flatten();
-        let mode = port_connection_mode(port, actual_kind).unwrap_or_else(|| {
+        let resolution_mode = port_connection_mode(port, actual_kind).unwrap_or_else(|| {
             panic!(
                 "unsupported port resolution bridge for '{}.{}'",
                 instance.name, port.name
             )
         });
+        let mode = if actual_width == port_width {
+            resolution_mode
+        } else {
+            match port.dir {
+                PortDir::Input => PortConnectionMode::InputBridge,
+                PortDir::Output => PortConnectionMode::OutputBridge,
+                PortDir::Inout | PortDir::Ref => panic!(
+                    "port width conversion is unsupported for '{}.{}': actual '{}' is {} bits, port is {} bits",
+                    instance.name, port.name, actual, actual_width, port_width
+                ),
+            }
+        };
         let binding = match mode {
             PortConnectionMode::Alias => PortBinding::Alias(net),
-            PortConnectionMode::InputBridge => PortBinding::InputBridge(net),
-            PortConnectionMode::OutputBridge => PortBinding::OutputBridge(net),
+            PortConnectionMode::InputBridge => PortBinding::InputBridge {
+                source: net,
+                source_signed: parent_scope_signed.get(actual).copied().unwrap_or(false),
+            },
+            PortConnectionMode::OutputBridge => PortBinding::OutputBridge {
+                destination: net,
+                destination_width: actual_width,
+            },
         };
         bindings.insert(port.name.clone(), binding);
     }
@@ -2086,6 +2221,8 @@ struct ClassInfo {
     name: String,
     base: Option<u32>,
     field_slot: HashMap<String, (u32, u32)>,
+    /// Integral instance-field signedness.
+    field_signed: HashMap<String, bool>,
     /// Fields whose declared type is a class: name -> class id (for resolving
     /// `obj.field.method(...)` receiver chains).
     field_class: HashMap<String, u32>,
@@ -2093,10 +2230,16 @@ struct ClassInfo {
     field_coll: HashMap<String, CollInfo>,
     /// Event-typed field names, initialized to a fresh identity per instance.
     field_events: HashSet<String>,
+    /// String-typed instance field names.
+    field_strings: HashSet<String>,
     /// Static fields: name -> global static id (shared storage).
     static_fields: HashMap<String, u32>,
     /// Declared widths of static fields.
     static_field_widths: HashMap<String, u32>,
+    /// Integral static-field signedness.
+    static_field_signed: HashMap<String, bool>,
+    /// String-typed static field names.
+    static_field_strings: HashSet<String>,
     /// Static fields whose type is a class: name -> class id.
     static_field_class: HashMap<String, u32>,
     /// Static collection fields and their element/key class types.
@@ -2111,6 +2254,8 @@ struct ClassInfo {
     /// Methods that return a class handle: method name -> return class id
     /// (for resolving chained `a.method().next()` receivers).
     method_ret_class: HashMap<String, u32>,
+    /// Integral method return type: method name -> (width, signed).
+    method_ret_integral: HashMap<String, (u32, bool)>,
     field_defaults: Vec<Value>,
     methods: HashMap<String, u32>,
     vtable: Vec<u32>,
@@ -2217,7 +2362,9 @@ struct MemoryInfo {
 struct CodeGen<'a> {
     nets: &'a HashMap<String, (NetId, u32)>,
     memories: &'a HashMap<String, MemoryInfo>,
+    net_signed: &'a HashMap<String, bool>,
     funcs: &'a HashMap<String, u32>,
+    func_integral_returns: &'a HashMap<String, (u32, bool)>,
     class_ids: &'a HashMap<String, u32>,
     classes: &'a [ClassInfo],
     /// Named compile-time constants (enum members, params).
@@ -2235,7 +2382,11 @@ struct CodeGen<'a> {
     local_enums: HashMap<String, u32>,
     /// Local variables whose declared type is the IEEE named-event type.
     local_events: HashSet<String>,
+    /// Local variables and formals declared as SystemVerilog `string`.
+    local_strings: HashSet<String>,
     locals: HashMap<String, (Reg, u32)>,
+    local_signed: HashMap<String, bool>,
+    return_type: Option<(u32, bool)>,
     /// `(break target, continue target)` for nested procedural loops.
     loop_targets: Vec<(Label, Label)>,
     ts: Timescale,
@@ -2245,6 +2396,8 @@ struct CodeGen<'a> {
 struct GlobalVars<'a> {
     vars: &'a HashMap<String, u32>,
     widths: &'a HashMap<String, u32>,
+    signed: &'a HashMap<String, bool>,
+    strings: &'a HashSet<String>,
     coll: &'a HashMap<String, CollInfo>,
     class: &'a HashMap<String, u32>,
     /// Package/module-scope type aliases: alias name -> class id.
@@ -2264,7 +2417,9 @@ impl<'a> CodeGen<'a> {
     fn new(
         nets: &'a HashMap<String, (NetId, u32)>,
         memories: &'a HashMap<String, MemoryInfo>,
+        net_signed: &'a HashMap<String, bool>,
         funcs: &'a HashMap<String, u32>,
+        func_integral_returns: &'a HashMap<String, (u32, bool)>,
         class_ids: &'a HashMap<String, u32>,
         classes: &'a [ClassInfo],
         consts: &'a HashMap<String, LogicVec>,
@@ -2274,7 +2429,9 @@ impl<'a> CodeGen<'a> {
         CodeGen {
             nets,
             memories,
+            net_signed,
             funcs,
+            func_integral_returns,
             class_ids,
             classes,
             consts,
@@ -2285,7 +2442,10 @@ impl<'a> CodeGen<'a> {
             local_colls: HashMap::new(),
             local_enums: HashMap::new(),
             local_events: HashSet::new(),
+            local_strings: HashSet::new(),
             locals: HashMap::new(),
+            local_signed: HashMap::new(),
+            return_type: None,
             loop_targets: Vec::new(),
             ts,
         }
@@ -2412,6 +2572,7 @@ impl<'a> CodeGen<'a> {
                 self.collect_net_reads(right, read_set);
             }
             Expr::Literal(_)
+            | Expr::SignedLiteral(_)
             | Expr::Fill(_)
             | Expr::Str(_)
             | Expr::StaticRef { .. }
@@ -2421,17 +2582,36 @@ impl<'a> CodeGen<'a> {
 
     fn integral_expr_width(&self, expr: &Expr) -> Option<u32> {
         match expr {
-            Expr::Literal(value) => Some(value.width()),
+            Expr::Literal(value) | Expr::SignedLiteral(value) => Some(value.width()),
             Expr::Fill(_) => None,
             Expr::Ref(name) => self
                 .locals
                 .get(name)
+                .filter(|_| !self.local_strings.contains(name))
                 .map(|(_, width)| *width)
                 .or_else(|| self.nets.get(name).map(|(_, width)| *width))
                 .or_else(|| self.consts.get(name).map(LogicVec::width))
-                .or_else(|| self.class_field(name).map(|(_, width)| width))
-                .or_else(|| self.static_field_width(name))
-                .or_else(|| self.globals.widths.get(name).copied()),
+                .or_else(|| {
+                    self.class_ctx.and_then(|class| {
+                        (!self.classes[class as usize].field_strings.contains(name))
+                            .then(|| self.class_field(name).map(|(_, width)| width))
+                            .flatten()
+                    })
+                })
+                .or_else(|| {
+                    self.class_ctx.and_then(|class| {
+                        (!self.classes[class as usize]
+                            .static_field_strings
+                            .contains(name))
+                        .then(|| self.static_field_width(name))
+                        .flatten()
+                    })
+                })
+                .or_else(|| {
+                    (!self.globals.strings.contains(name))
+                        .then(|| self.globals.widths.get(name).copied())
+                        .flatten()
+                }),
             Expr::Unary { op, operand } => match op {
                 UnaryOp::LogNot | UnaryOp::ReduceAnd | UnaryOp::ReduceOr | UnaryOp::ReduceXor => {
                     Some(1)
@@ -2450,7 +2630,7 @@ impl<'a> CodeGen<'a> {
                     | BinOp::Ge
                     | BinOp::LogAnd
                     | BinOp::LogOr => 1,
-                    BinOp::Shl | BinOp::Shr => left,
+                    BinOp::Shl | BinOp::Shr | BinOp::Sar => left,
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor => {
                         left.max(right)
                     }
@@ -2477,19 +2657,52 @@ impl<'a> CodeGen<'a> {
                 _ => Some(1),
             },
             Expr::PartSelect { left, right, .. } => {
-                let Expr::Literal(left) = left.as_ref() else {
-                    return None;
+                let left = match left.as_ref() {
+                    Expr::Literal(value) | Expr::SignedLiteral(value) => value,
+                    _ => return None,
                 };
-                let Expr::Literal(right) = right.as_ref() else {
-                    return None;
+                let right = match right.as_ref() {
+                    Expr::Literal(value) | Expr::SignedLiteral(value) => value,
+                    _ => return None,
                 };
                 Some(left.to_u64().abs_diff(right.to_u64()) as u32 + 1)
             }
             Expr::Concat(parts) => parts.iter().try_fold(0u32, |width, part| {
                 width.checked_add(self.integral_expr_width(part)?)
             }),
+            Expr::MethodCall { obj, method, .. } => {
+                let class = self.try_class_of(obj)?;
+                self.classes[class as usize]
+                    .method_ret_integral
+                    .get(method)
+                    .map(|(width, _)| *width)
+            }
+            Expr::StaticCall {
+                class_name, method, ..
+            } => {
+                let class = self.resolve_class(class_name)?;
+                self.classes[class as usize]
+                    .method_ret_integral
+                    .get(method)
+                    .map(|(width, _)| *width)
+            }
+            Expr::Call { name, .. } if self.method_of_ctx(name) => {
+                self.class_ctx.and_then(|class| {
+                    self.classes[class as usize]
+                        .method_ret_integral
+                        .get(name)
+                        .map(|(width, _)| *width)
+                })
+            }
+            Expr::Call { name, .. } => self
+                .func_integral_returns
+                .get(name)
+                .map(|(width, _)| *width),
             Expr::Field { obj, field } => {
                 let class = self.try_class_of(obj)?;
+                if self.classes[class as usize].field_strings.contains(field) {
+                    return None;
+                }
                 self.classes[class as usize]
                     .field_slot
                     .get(field)
@@ -2497,6 +2710,12 @@ impl<'a> CodeGen<'a> {
             }
             Expr::StaticRef { class_name, field } => {
                 let class = self.resolve_class(class_name)?;
+                if self.classes[class as usize]
+                    .static_field_strings
+                    .contains(field)
+                {
+                    return None;
+                }
                 self.classes[class as usize]
                     .static_field_widths
                     .get(field)
@@ -2506,7 +2725,125 @@ impl<'a> CodeGen<'a> {
         }
     }
 
+    fn integral_expr_signed(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::SignedLiteral(_) => true,
+            Expr::Literal(_) | Expr::Fill(_) => false,
+            Expr::Ref(name) => self
+                .local_signed
+                .get(name)
+                .copied()
+                .or_else(|| self.net_signed.get(name).copied())
+                .or_else(|| {
+                    self.class_ctx.and_then(|class| {
+                        self.classes[class as usize].field_signed.get(name).copied()
+                    })
+                })
+                .or_else(|| {
+                    self.class_ctx.and_then(|class| {
+                        self.classes[class as usize]
+                            .static_field_signed
+                            .get(name)
+                            .copied()
+                    })
+                })
+                .or_else(|| self.globals.signed.get(name).copied())
+                .unwrap_or(false),
+            Expr::Unary { op, operand } => match op {
+                UnaryOp::BitNot | UnaryOp::Neg | UnaryOp::Plus => {
+                    self.integral_expr_signed(operand)
+                }
+                UnaryOp::LogNot | UnaryOp::ReduceAnd | UnaryOp::ReduceOr | UnaryOp::ReduceXor => {
+                    false
+                }
+            },
+            Expr::Binary { op, lhs, rhs } => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor => {
+                    self.integral_expr_signed(lhs) && self.integral_expr_signed(rhs)
+                }
+                BinOp::Shl | BinOp::Shr | BinOp::Sar => self.integral_expr_signed(lhs),
+                BinOp::Eq
+                | BinOp::Neq
+                | BinOp::Lt
+                | BinOp::Gt
+                | BinOp::Le
+                | BinOp::Ge
+                | BinOp::LogAnd
+                | BinOp::LogOr => false,
+            },
+            Expr::Conditional {
+                when_true,
+                when_false,
+                ..
+            } => self.integral_expr_signed(when_true) && self.integral_expr_signed(when_false),
+            Expr::Index { .. } | Expr::PartSelect { .. } | Expr::Concat(_) => false,
+            Expr::Field { obj, field } => self
+                .try_class_of(obj)
+                .and_then(|class| {
+                    self.classes[class as usize]
+                        .field_signed
+                        .get(field)
+                        .copied()
+                })
+                .unwrap_or(false),
+            Expr::MethodCall { obj, method, .. } => self
+                .try_class_of(obj)
+                .and_then(|class| {
+                    self.classes[class as usize]
+                        .method_ret_integral
+                        .get(method)
+                        .map(|(_, signed)| *signed)
+                })
+                .unwrap_or(false),
+            Expr::StaticCall {
+                class_name, method, ..
+            } => self
+                .resolve_class(class_name)
+                .and_then(|class| {
+                    self.classes[class as usize]
+                        .method_ret_integral
+                        .get(method)
+                        .map(|(_, signed)| *signed)
+                })
+                .unwrap_or(false),
+            Expr::Call { name, .. } if self.method_of_ctx(name) => self
+                .class_ctx
+                .and_then(|class| {
+                    self.classes[class as usize]
+                        .method_ret_integral
+                        .get(name)
+                        .map(|(_, signed)| *signed)
+                })
+                .unwrap_or(false),
+            Expr::Call { name, .. } => self
+                .func_integral_returns
+                .get(name)
+                .map(|(_, signed)| *signed)
+                .unwrap_or(false),
+            Expr::StaticRef { class_name, field } => self
+                .resolve_class(class_name)
+                .and_then(|class| {
+                    self.classes[class as usize]
+                        .static_field_signed
+                        .get(field)
+                        .copied()
+                })
+                .unwrap_or(false),
+            Expr::SysCall { .. } | Expr::Str(_) | Expr::New { .. } | Expr::Null => false,
+        }
+    }
+
     fn gen_expr_at_width(&mut self, expr: &Expr, width: u32, pb: &mut ProgramBuilder) -> Reg {
+        self.gen_expr_at_width_with_sign(expr, width, self.integral_expr_signed(expr), pb)
+    }
+
+    fn gen_expr_at_width_with_sign(
+        &mut self,
+        expr: &Expr,
+        width: u32,
+        signed: bool,
+        pb: &mut ProgramBuilder,
+    ) -> Reg {
         match expr {
             Expr::Fill(bit) => {
                 let dst = pb.new_reg();
@@ -2518,11 +2855,11 @@ impl<'a> CodeGen<'a> {
                 condition,
                 when_true,
                 when_false,
-            } => self.gen_conditional(condition, when_true, when_false, width, pb),
+            } => self.gen_conditional(condition, when_true, when_false, width, signed, pb),
             Expr::Unary { op, operand }
                 if matches!(op, UnaryOp::BitNot | UnaryOp::Neg | UnaryOp::Plus) =>
             {
-                let operand = self.gen_expr_at_width(operand, width, pb);
+                let operand = self.gen_expr_at_width_with_sign(operand, width, signed, pb);
                 let dst = pb.new_reg();
                 match op {
                     UnaryOp::BitNot => pb.emit(Inst::Not { dst, a: operand }),
@@ -2538,8 +2875,8 @@ impl<'a> CodeGen<'a> {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor
                 ) =>
             {
-                let lhs = self.gen_expr_at_width(lhs, width, pb);
-                let rhs = self.gen_expr_at_width(rhs, width, pb);
+                let lhs = self.gen_expr_at_width_with_sign(lhs, width, signed, pb);
+                let rhs = self.gen_expr_at_width_with_sign(rhs, width, signed, pb);
                 let dst = pb.new_reg();
                 pb.emit(match op {
                     BinOp::Add => Inst::Add {
@@ -2576,8 +2913,8 @@ impl<'a> CodeGen<'a> {
                 });
                 dst
             }
-            Expr::Binary { op, lhs, rhs } if matches!(op, BinOp::Shl | BinOp::Shr) => {
-                let lhs = self.gen_expr_at_width(lhs, width, pb);
+            Expr::Binary { op, lhs, rhs } if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Sar) => {
+                let lhs = self.gen_expr_at_width_with_sign(lhs, width, signed, pb);
                 let rhs = self.gen_expr(rhs, pb);
                 let dst = pb.new_reg();
                 pb.emit(match op {
@@ -2587,6 +2924,16 @@ impl<'a> CodeGen<'a> {
                         b: rhs,
                     },
                     BinOp::Shr => Inst::Shr {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Sar if signed => Inst::Ashr {
+                        dst,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Sar => Inst::Shr {
                         dst,
                         a: lhs,
                         b: rhs,
@@ -2607,8 +2954,12 @@ impl<'a> CodeGen<'a> {
                         (Some(width), None) | (None, Some(width)) => width,
                         (None, None) => 1,
                     };
-                let lhs = self.gen_expr_at_width(lhs, operand_width, pb);
-                let rhs = self.gen_expr_at_width(rhs, operand_width, pb);
+                let comparison_signed =
+                    self.integral_expr_signed(lhs) && self.integral_expr_signed(rhs);
+                let lhs =
+                    self.gen_expr_at_width_with_sign(lhs, operand_width, comparison_signed, pb);
+                let rhs =
+                    self.gen_expr_at_width_with_sign(rhs, operand_width, comparison_signed, pb);
                 let result = pb.new_reg();
                 pb.emit(match op {
                     BinOp::Eq => Inst::Eq {
@@ -2617,6 +2968,26 @@ impl<'a> CodeGen<'a> {
                         b: rhs,
                     },
                     BinOp::Neq => Inst::Neq {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Lt if comparison_signed => Inst::SignedLt {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Gt if comparison_signed => Inst::SignedGt {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Le if comparison_signed => Inst::SignedLe {
+                        dst: result,
+                        a: lhs,
+                        b: rhs,
+                    },
+                    BinOp::Ge if comparison_signed => Inst::SignedGe {
                         dst: result,
                         a: lhs,
                         b: rhs,
@@ -2666,7 +3037,7 @@ impl<'a> CodeGen<'a> {
                         dst,
                         src,
                         width,
-                        signed: false,
+                        signed,
                     });
                     dst
                 }
@@ -2680,6 +3051,7 @@ impl<'a> CodeGen<'a> {
         when_true: &Expr,
         when_false: &Expr,
         width: u32,
+        signed: bool,
         pb: &mut ProgramBuilder,
     ) -> Reg {
         let condition = self.gen_expr(condition, pb);
@@ -2696,8 +3068,8 @@ impl<'a> CodeGen<'a> {
         });
         pb.branch_true(known, when_false_label);
 
-        let true_value = self.gen_expr_at_width(when_true, width, pb);
-        let false_value = self.gen_expr_at_width(when_false, width, pb);
+        let true_value = self.gen_expr_at_width_with_sign(when_true, width, signed, pb);
+        let false_value = self.gen_expr_at_width_with_sign(when_false, width, signed, pb);
         pb.emit(Inst::Select {
             dst,
             condition,
@@ -2707,12 +3079,12 @@ impl<'a> CodeGen<'a> {
         pb.jump(done);
 
         pb.bind(when_true_label);
-        let value = self.gen_expr_at_width(when_true, width, pb);
+        let value = self.gen_expr_at_width_with_sign(when_true, width, signed, pb);
         pb.emit(Inst::Mov { dst, src: value });
         pb.jump(done);
 
         pb.bind(when_false_label);
-        let value = self.gen_expr_at_width(when_false, width, pb);
+        let value = self.gen_expr_at_width_with_sign(when_false, width, signed, pb);
         pb.emit(Inst::Mov { dst, src: value });
         pb.bind(done);
         dst
@@ -2761,42 +3133,9 @@ impl<'a> CodeGen<'a> {
         dst
     }
 
-    fn expression_needs_context(expression: &Expr) -> bool {
-        match expression {
-            Expr::Fill(_) | Expr::Conditional { .. } => true,
-            Expr::Unary { operand, .. } => Self::expression_needs_context(operand),
-            Expr::Binary { lhs, rhs, .. } => {
-                Self::expression_needs_context(lhs) || Self::expression_needs_context(rhs)
-            }
-            Expr::Index { base, index } => {
-                Self::expression_needs_context(base) || Self::expression_needs_context(index)
-            }
-            Expr::PartSelect { base, left, right } => {
-                Self::expression_needs_context(base)
-                    || Self::expression_needs_context(left)
-                    || Self::expression_needs_context(right)
-            }
-            Expr::Concat(parts) => parts.iter().any(Self::expression_needs_context),
-            Expr::Call { args, .. }
-            | Expr::StaticCall { args, .. }
-            | Expr::New { args }
-            | Expr::SysCall { args, .. } => args.iter().any(Self::expression_needs_context),
-            Expr::Field { obj, .. } => Self::expression_needs_context(obj),
-            Expr::MethodCall { obj, args, .. } => {
-                Self::expression_needs_context(obj)
-                    || args.iter().any(Self::expression_needs_context)
-            }
-            Expr::Literal(_)
-            | Expr::Str(_)
-            | Expr::Ref(_)
-            | Expr::StaticRef { .. }
-            | Expr::Null => false,
-        }
-    }
-
     fn is_integral_context_expression(expression: &Expr) -> bool {
         match expression {
-            Expr::Literal(_) | Expr::Fill(_) | Expr::Ref(_) => true,
+            Expr::Literal(_) | Expr::SignedLiteral(_) | Expr::Fill(_) | Expr::Ref(_) => true,
             Expr::Unary { operand, .. } => Self::is_integral_context_expression(operand),
             Expr::Binary { lhs, rhs, .. } => {
                 Self::is_integral_context_expression(lhs)
@@ -2851,7 +3190,11 @@ impl<'a> CodeGen<'a> {
         self.local_colls.clear();
         self.local_enums.clear();
         self.local_events.clear();
+        self.local_signed.clear();
+        self.local_strings.clear();
         self.class_ctx = class_ctx;
+        self.return_type = (!f.is_void && f.ret_class.is_none() && !f.ret_is_string)
+            .then_some((f.ret_width.max(1), f.ret_signed));
         let mut arg_modes = Vec::with_capacity(f.params.len() + usize::from(class_ctx.is_some()));
         if class_ctx.is_some() {
             self.this_reg = pb.new_reg(); // register 0 = this
@@ -2861,6 +3204,10 @@ impl<'a> CodeGen<'a> {
             let reg = pb.new_reg();
             arg_modes.push(arg_mode(p.dir));
             self.locals.insert(p.name.clone(), (reg, p.width));
+            self.local_signed.insert(p.name.clone(), p.signed);
+            if p.is_string {
+                self.local_strings.insert(p.name.clone());
+            }
             let collection = p.coll.map(|kind| CollInfo {
                 kind,
                 elem_class: p
@@ -2898,7 +3245,11 @@ impl<'a> CodeGen<'a> {
             let formal = first_formal + offset as u32;
             let supplied = pb.new_label();
             pb.branch_arg_provided(formal, supplied);
-            let value = self.gen_expr(default, &mut pb);
+            let value = if Self::is_integral_context_expression(default) {
+                self.gen_expr_at_width(default, param.width.max(1), &mut pb)
+            } else {
+                self.gen_expr(default, &mut pb)
+            };
             pb.emit(Inst::Assign {
                 dst: formal,
                 src: value,
@@ -2908,6 +3259,10 @@ impl<'a> CodeGen<'a> {
         let ret_width = f.ret_width.max(1);
         let ret_reg = pb.new_reg();
         self.locals.insert(f.name.clone(), (ret_reg, ret_width));
+        self.local_signed.insert(f.name.clone(), f.ret_signed);
+        if f.ret_is_string {
+            self.local_strings.insert(f.name.clone());
+        }
         // A class-returning function may assign its result via the function-name
         // variable (`funcname = new(...)`); register its return class so the
         // `new` / member accesses resolve.
@@ -2946,6 +3301,8 @@ impl<'a> CodeGen<'a> {
         let saved_colls = std::mem::take(&mut self.local_colls);
         let saved_enums = std::mem::take(&mut self.local_enums);
         let saved_events = std::mem::take(&mut self.local_events);
+        let saved_signed = std::mem::take(&mut self.local_signed);
+        let saved_strings = std::mem::take(&mut self.local_strings);
         let saved_loop_targets = std::mem::take(&mut self.loop_targets);
         let saved_this_reg = self.this_reg;
         let mut captures = Vec::with_capacity(saved_locals.len() + 1);
@@ -2958,12 +3315,18 @@ impl<'a> CodeGen<'a> {
         for (name, &(parent_reg, width)) in locals {
             let child_reg = pb.new_reg();
             self.locals.insert(name.clone(), (child_reg, width));
+            self.local_signed.insert(
+                name.clone(),
+                saved_signed.get(name).copied().unwrap_or(false),
+            );
             captures.push((child_reg, parent_reg));
         }
         self.local_classes = saved_classes.clone();
         self.local_colls = saved_colls.clone();
         self.local_enums = saved_enums.clone();
         self.local_events = saved_events.clone();
+        self.local_signed = saved_signed.clone();
+        self.local_strings = saved_strings.clone();
         self.gen_stmt(body, &mut pb);
         pb.emit(Inst::Finish);
         let prog = pb.build();
@@ -2972,6 +3335,8 @@ impl<'a> CodeGen<'a> {
         self.local_colls = saved_colls;
         self.local_enums = saved_enums;
         self.local_events = saved_events;
+        self.local_signed = saved_signed;
+        self.local_strings = saved_strings;
         self.loop_targets = saved_loop_targets;
         self.this_reg = saved_this_reg;
         (Rc::new(prog), captures)
@@ -2987,6 +3352,10 @@ impl<'a> CodeGen<'a> {
             Stmt::VarDecl(v) => {
                 let reg = pb.new_reg();
                 self.locals.insert(v.name.clone(), (reg, v.width));
+                self.local_signed.insert(v.name.clone(), v.signed);
+                if v.is_string {
+                    self.local_strings.insert(v.name.clone());
+                }
                 if v.is_event {
                     self.local_events.insert(v.name.clone());
                     match &v.init {
@@ -3062,7 +3431,7 @@ impl<'a> CodeGen<'a> {
                     });
                 } else {
                     let init = match &v.init {
-                        Some(e) if Self::expression_needs_context(e) => {
+                        Some(e) if Self::is_integral_context_expression(e) => {
                             self.gen_expr_at_width(e, v.width.max(1), pb)
                         }
                         Some(e) => self.gen_expr(e, pb),
@@ -3221,6 +3590,7 @@ impl<'a> CodeGen<'a> {
                 let base = self.gen_expr(collection, pb);
                 let index_reg = pb.new_reg();
                 let previous_local = self.locals.insert(index.clone(), (index_reg, 32));
+                let previous_signed = self.local_signed.insert(index.clone(), true);
                 let previous_class = match info.key_class {
                     Some(class) => self.local_classes.insert(index.clone(), class),
                     None => self.local_classes.remove(index),
@@ -3260,6 +3630,14 @@ impl<'a> CodeGen<'a> {
                         self.locals.remove(index);
                     }
                 }
+                match previous_signed {
+                    Some(signed) => {
+                        self.local_signed.insert(index.clone(), signed);
+                    }
+                    None => {
+                        self.local_signed.remove(index);
+                    }
+                }
                 match previous_class {
                     Some(class) => {
                         self.local_classes.insert(index.clone(), class);
@@ -3272,7 +3650,12 @@ impl<'a> CodeGen<'a> {
             Stmt::SysCall { name, args } => self.gen_sys_call(name, args, pb),
             Stmt::Return(val) => match val {
                 Some(e) => {
-                    let r = self.gen_expr(e, pb);
+                    let r = match self.return_type {
+                        Some((width, _)) if Self::is_integral_context_expression(e) => {
+                            self.gen_expr_at_width(e, width, pb)
+                        }
+                        _ => self.gen_expr(e, pb),
+                    };
                     pb.emit(Inst::Return { value: r });
                 }
                 None => pb.emit(Inst::ReturnVoid),
@@ -3415,7 +3798,7 @@ impl<'a> CodeGen<'a> {
     /// Generate code for `e`, returning the register holding its value.
     fn gen_expr(&mut self, e: &Expr, pb: &mut ProgramBuilder) -> Reg {
         match e {
-            Expr::Literal(lv) => {
+            Expr::Literal(lv) | Expr::SignedLiteral(lv) => {
                 let dst = pb.new_reg();
                 let k = pb.konst_logic(lv.clone());
                 pb.emit(Inst::LoadConst { dst, k });
@@ -3492,6 +3875,7 @@ impl<'a> CodeGen<'a> {
                 dst
             }
             Expr::Binary { op, lhs, rhs } => {
+                let signed = self.integral_expr_signed(lhs) && self.integral_expr_signed(rhs);
                 let a = self.gen_expr(lhs, pb);
                 let b = self.gen_expr(rhs, pb);
                 let dst = pb.new_reg();
@@ -3504,12 +3888,18 @@ impl<'a> CodeGen<'a> {
                     BinOp::Xor => Inst::Xor { dst, a, b },
                     BinOp::Eq => Inst::Eq { dst, a, b },
                     BinOp::Neq => Inst::Neq { dst, a, b },
+                    BinOp::Lt if signed => Inst::SignedLt { dst, a, b },
+                    BinOp::Gt if signed => Inst::SignedGt { dst, a, b },
+                    BinOp::Le if signed => Inst::SignedLe { dst, a, b },
+                    BinOp::Ge if signed => Inst::SignedGe { dst, a, b },
                     BinOp::Lt => Inst::Lt { dst, a, b },
                     BinOp::Gt => Inst::Gt { dst, a, b },
                     BinOp::Le => Inst::Le { dst, a, b },
                     BinOp::Ge => Inst::Ge { dst, a, b },
                     BinOp::Shl => Inst::Shl { dst, a, b },
                     BinOp::Shr => Inst::Shr { dst, a, b },
+                    BinOp::Sar if signed => Inst::Ashr { dst, a, b },
+                    BinOp::Sar => Inst::Shr { dst, a, b },
                     BinOp::LogAnd => Inst::LogAnd { dst, a, b },
                     BinOp::LogOr => Inst::LogOr { dst, a, b },
                 };
@@ -4281,11 +4671,11 @@ impl<'a> CodeGen<'a> {
             if self.is_string_local(name) {
                 return Some(self.gen_expr(obj, pb));
             }
-            // Class field of string type (not a class-handle field and not a coll).
+            // String-typed class field.
             if let Some((slot, _)) = self.class_field(name) {
                 let cid = self.class_ctx?;
                 let ci = &self.classes[cid as usize];
-                if !ci.field_class.contains_key(name) && !ci.field_coll.contains_key(name) {
+                if ci.field_strings.contains(name) {
                     let this = self.this_reg;
                     let dst = pb.new_reg();
                     pb.emit(Inst::GetField {
@@ -4296,21 +4686,13 @@ impl<'a> CodeGen<'a> {
                     return Some(dst);
                 }
             }
-            // String-typed parameter (non-class, non-enum local).
-            if self.locals.contains_key(name) {
-                return Some(self.gen_expr(obj, pb));
-            }
         }
         None
     }
 
-    /// Whether `name` is a string-typed local (best-effort: a local that is not
-    /// a class handle, enum, or collection).
+    /// Whether `name` is a string-typed local or formal.
     fn is_string_local(&self, name: &str) -> bool {
-        self.locals.contains_key(name)
-            && !self.local_classes.contains_key(name)
-            && !self.local_enums.contains_key(name)
-            && !self.local_colls.contains_key(name)
+        self.local_strings.contains(name)
     }
 
     fn resolve_class(&self, name: &str) -> Option<u32> {
@@ -4485,7 +4867,7 @@ impl<'a> CodeGen<'a> {
     }
 
     fn gen_assignment_rhs(&mut self, lhs: &Lvalue, rhs: &Expr, pb: &mut ProgramBuilder) -> Reg {
-        if Self::expression_needs_context(rhs) && Self::is_integral_context_expression(rhs) {
+        if self.integral_expr_width(rhs).is_some() || Self::is_integral_context_expression(rhs) {
             if let Some(width) = self.lvalue_width(lhs) {
                 return self.gen_expr_at_width(rhs, width, pb);
             }
@@ -4513,6 +4895,9 @@ impl<'a> CodeGen<'a> {
                 || self.classes[class as usize]
                     .static_field_coll
                     .contains_key(&lhs.name)
+                || self.classes[class as usize]
+                    .static_field_strings
+                    .contains(&lhs.name)
             {
                 return None;
             }
@@ -4532,6 +4917,9 @@ impl<'a> CodeGen<'a> {
                 || self.classes[class as usize]
                     .field_events
                     .contains(&lhs.name)
+                || self.classes[class as usize]
+                    .field_strings
+                    .contains(&lhs.name)
             {
                 return None;
             }
@@ -4542,8 +4930,15 @@ impl<'a> CodeGen<'a> {
         }
         if self.local_classes.contains_key(&lhs.name)
             || self.local_colls.contains_key(&lhs.name)
+            || self.local_enums.contains_key(&lhs.name)
             || self.local_events.contains(&lhs.name)
+            || self.local_strings.contains(&lhs.name)
             || self.field_class(&lhs.name).is_some()
+            || self.class_ctx.is_some_and(|class| {
+                self.classes[class as usize]
+                    .field_strings
+                    .contains(&lhs.name)
+            })
             || self.class_ctx.is_some_and(|class| {
                 self.classes[class as usize]
                     .field_coll
@@ -4555,8 +4950,14 @@ impl<'a> CodeGen<'a> {
                     .static_field_coll
                     .contains_key(&lhs.name)
             })
+            || self.class_ctx.is_some_and(|class| {
+                self.classes[class as usize]
+                    .static_field_strings
+                    .contains(&lhs.name)
+            })
             || self.globals.class.contains_key(&lhs.name)
             || self.globals.coll.contains_key(&lhs.name)
+            || self.globals.strings.contains(&lhs.name)
         {
             return None;
         }
@@ -4667,6 +5068,8 @@ fn try_const_eval_at_width(
 ) -> Option<LogicVec> {
     match expression {
         Expr::Fill(bit) => Some(LogicVec::filled(*bit, width)),
+        Expr::SignedLiteral(value) => Some(value.resize(width, true)),
+        Expr::Literal(value) => Some(value.resize(width, false)),
         Expr::Conditional {
             condition,
             when_true,
@@ -4676,13 +5079,55 @@ fn try_const_eval_at_width(
             &try_const_eval_at_width(when_true, consts, width, signed)?,
             &try_const_eval_at_width(when_false, consts, width, signed)?,
         )),
-        _ => Some(try_const_eval_with(expression, consts)?.resize(width, signed)),
+        _ => Some(
+            try_const_eval_with(expression, consts)?
+                .resize(width, const_expr_signedness(expression).unwrap_or(signed)),
+        ),
+    }
+}
+
+fn const_expr_signedness(expression: &Expr) -> Option<bool> {
+    match expression {
+        Expr::SignedLiteral(_) => Some(true),
+        Expr::Literal(_)
+        | Expr::Fill(_)
+        | Expr::Concat(_)
+        | Expr::Index { .. }
+        | Expr::PartSelect { .. } => Some(false),
+        Expr::Unary { op, operand } => match op {
+            UnaryOp::BitNot | UnaryOp::Neg | UnaryOp::Plus => const_expr_signedness(operand),
+            UnaryOp::LogNot | UnaryOp::ReduceAnd | UnaryOp::ReduceOr | UnaryOp::ReduceXor => {
+                Some(false)
+            }
+        },
+        Expr::Binary { op, lhs, rhs } => match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor => {
+                Some(const_expr_signedness(lhs)? && const_expr_signedness(rhs)?)
+            }
+            BinOp::Shl | BinOp::Shr | BinOp::Sar => const_expr_signedness(lhs),
+            _ => Some(false),
+        },
+        Expr::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => Some(const_expr_signedness(when_true)? && const_expr_signedness(when_false)?),
+        Expr::Ref(_)
+        | Expr::Call { .. }
+        | Expr::Field { .. }
+        | Expr::MethodCall { .. }
+        | Expr::StaticCall { .. }
+        | Expr::StaticRef { .. }
+        | Expr::Str(_)
+        | Expr::New { .. }
+        | Expr::Null
+        | Expr::SysCall { .. } => None,
     }
 }
 
 fn try_const_eval_with(e: &Expr, consts: &HashMap<String, LogicVec>) -> Option<LogicVec> {
     match e {
-        Expr::Literal(lv) => Some(lv.clone()),
+        Expr::Literal(lv) | Expr::SignedLiteral(lv) => Some(lv.clone()),
         Expr::Fill(bit) => Some(LogicVec::filled(*bit, 1)),
         Expr::Ref(name) => consts.get(name).cloned(),
         Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Field { .. } | Expr::New { .. } => None,
@@ -4733,6 +5178,8 @@ fn try_const_eval_with(e: &Expr, consts: &HashMap<String, LogicVec>) -> Option<L
         Expr::Binary { op, lhs, rhs } => {
             let l = try_const_eval_with(lhs, consts)?;
             let r = try_const_eval_with(rhs, consts)?;
+            let signed = const_expr_signedness(lhs).unwrap_or(false)
+                && const_expr_signedness(rhs).unwrap_or(false);
             Some(match op {
                 BinOp::Add => l.add(&r),
                 BinOp::Sub => l.sub(&r),
@@ -4742,12 +5189,20 @@ fn try_const_eval_with(e: &Expr, consts: &HashMap<String, LogicVec>) -> Option<L
                 BinOp::Xor => l.bitxor(&r),
                 BinOp::Eq => l.eq_logical(&r),
                 BinOp::Neq => l.ne_logical(&r),
+                BinOp::Lt if signed => l.slt(&r),
+                BinOp::Gt if signed => l.sgt(&r),
+                BinOp::Le if signed => l.sle(&r),
+                BinOp::Ge if signed => l.sge(&r),
                 BinOp::Lt => l.ult(&r),
                 BinOp::Gt => l.ugt(&r),
                 BinOp::Le => l.ule(&r),
                 BinOp::Ge => l.uge(&r),
                 BinOp::Shl => l.shl(r.to_u64() as u32),
                 BinOp::Shr => l.shr(r.to_u64() as u32),
+                BinOp::Sar if const_expr_signedness(lhs).unwrap_or(false) => {
+                    l.ashr(r.to_u64() as u32)
+                }
+                BinOp::Sar => l.shr(r.to_u64() as u32),
                 BinOp::LogAnd => LogicVec::from_u64((l.is_true() && r.is_true()) as u64, 1),
                 BinOp::LogOr => LogicVec::from_u64((l.is_true() || r.is_true()) as u64, 1),
             })

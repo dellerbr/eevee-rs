@@ -597,6 +597,58 @@ impl LogicVec {
         self.rel(other, |c| c != core::cmp::Ordering::Less)
     }
 
+    /// Signed two's-complement comparison. `None` if either operand has X/Z.
+    fn scmp(&self, other: &LogicVec) -> Option<core::cmp::Ordering> {
+        use core::cmp::Ordering;
+        if self.has_unknown() || other.has_unknown() {
+            return None;
+        }
+        let width = self.width.max(other.width);
+        let left = self.resize(width, true);
+        let right = other.resize(width, true);
+        let left_negative = left.get_bit(width - 1) == Bit::One;
+        let right_negative = right.get_bit(width - 1) == Bit::One;
+        if left_negative != right_negative {
+            return Some(if left_negative {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            });
+        }
+        left.ucmp(&right)
+    }
+
+    fn signed_rel(
+        &self,
+        other: &LogicVec,
+        predicate: impl Fn(core::cmp::Ordering) -> bool,
+    ) -> LogicVec {
+        match self.scmp(other) {
+            Some(ordering) => LogicVec::from_u64(predicate(ordering) as u64, 1),
+            None => LogicVec::x(1),
+        }
+    }
+
+    /// Signed `<` (1-bit, X if either operand contains X/Z).
+    pub fn slt(&self, other: &LogicVec) -> LogicVec {
+        self.signed_rel(other, |ordering| ordering == core::cmp::Ordering::Less)
+    }
+
+    /// Signed `<=`.
+    pub fn sle(&self, other: &LogicVec) -> LogicVec {
+        self.signed_rel(other, |ordering| ordering != core::cmp::Ordering::Greater)
+    }
+
+    /// Signed `>`.
+    pub fn sgt(&self, other: &LogicVec) -> LogicVec {
+        self.signed_rel(other, |ordering| ordering == core::cmp::Ordering::Greater)
+    }
+
+    /// Signed `>=`.
+    pub fn sge(&self, other: &LogicVec) -> LogicVec {
+        self.signed_rel(other, |ordering| ordering != core::cmp::Ordering::Less)
+    }
+
     /// Logical negation (`!`): 1-bit, `x` if the operand is unknown with no
     /// known-1 bit.
     pub fn lognot(&self) -> LogicVec {
@@ -860,6 +912,21 @@ impl LogicVec {
         for i in 0..self.width {
             if i + amt < self.width {
                 out.set_bit(i, self.get_bit(i + amt));
+            }
+        }
+        out
+    }
+
+    /// Arithmetic right shift by `amt` bits, filling from the sign bit.
+    pub fn ashr(&self, amt: u32) -> LogicVec {
+        let sign = match self.get_bit(self.width - 1) {
+            Bit::Z => Bit::X,
+            bit => bit,
+        };
+        let mut out = LogicVec::filled(sign, self.width);
+        for index in 0..self.width {
+            if index + amt < self.width {
+                out.set_bit(index, self.get_bit(index + amt));
             }
         }
         out
@@ -1284,6 +1351,18 @@ mod tests {
         assert_eq!(v.to_i64(), -1);
         let p = LogicVec::from_i64(5, 8);
         assert_eq!(p.to_i64(), 5);
+    }
+
+    #[test]
+    fn signed_relations_use_twos_complement_and_propagate_unknowns() {
+        let minus_one = LogicVec::from_i64(-1, 4);
+        let minus_two = LogicVec::from_i64(-2, 8);
+        let plus_one = LogicVec::from_i64(1, 4);
+        assert_eq!(minus_one.slt(&plus_one).to_u64(), 1);
+        assert_eq!(minus_two.sle(&minus_one).to_u64(), 1);
+        assert_eq!(plus_one.sgt(&minus_one).to_u64(), 1);
+        assert_eq!(plus_one.sge(&plus_one).to_u64(), 1);
+        assert!(!LogicVec::x(4).slt(&plus_one).is_known());
     }
 
     // ----- Wide (> 64 bit) coverage -----

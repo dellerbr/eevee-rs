@@ -360,6 +360,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                         | ">="
                         | "<<"
                         | ">>"
+                        | ">>>"
                         | "&&"
                         | "||"
                 ) {
