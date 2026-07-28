@@ -79,6 +79,26 @@ fn lower_module_item(
                 out.push(ModuleItem::Net(net));
             }
         }
+        "kGenvarDeclaration" => {
+            if let Some(identifiers) = find(item, "kIdentifierList") {
+                for identifier in kids(identifiers).filter(|child| tag(child) == "SymbolIdentifier")
+                {
+                    out.push(ModuleItem::Genvar(text(identifier).to_string()));
+                }
+            }
+        }
+        "kConditionalGenerateConstruct" | "kCaseGenerateConstruct" | "kLoopGenerateConstruct" => {
+            if let Some(generate) = lower_generate_construct(item, strengths, constants) {
+                out.push(ModuleItem::Generate(Box::new(generate)));
+            }
+        }
+        "kGenerateRegion" | "kGenerateItemList" => {
+            for generated in kids(item) {
+                if !matches!(tag(generated), "generate" | "endgenerate") {
+                    lower_module_item(generated, out, strengths, constants);
+                }
+            }
+        }
         "kAlwaysStatement" => out.push(ModuleItem::Always(lower_always(item))),
         "kInitialStatement" => out.push(ModuleItem::Initial(lower_initial(item))),
         "kContinuousAssignmentStatement" => lower_continuous_assignments(item, out, strengths),
@@ -120,6 +140,155 @@ fn lower_module_item(
         }
         _ => {} // unsupported item — skipped for this subset
     }
+}
+
+fn lower_generate_construct(
+    node: &Value,
+    strengths: &HashMap<u64, DriveStrengthSpec>,
+    constants: &HashMap<String, LogicVec>,
+) -> Option<GenerateConstruct> {
+    match tag(node) {
+        "kConditionalGenerateConstruct" => {
+            let if_clause = find(node, "kGenerateIfClause")?;
+            let condition = find(if_clause, "kGenerateIfHeader")
+                .and_then(|header| find_deep(header, "kExpression"))
+                .map(lower_expr)?;
+            let then_node =
+                find(if_clause, "kGenerateIfBody").and_then(|body| kids(body).next())?;
+            let then_block = lower_generate_block(then_node, strengths, constants);
+            let else_block = find(node, "kGenerateElseClause")
+                .and_then(|clause| find(clause, "kGenerateElseBody"))
+                .and_then(|body| kids(body).next())
+                .map(|body| lower_generate_block(body, strengths, constants));
+            Some(GenerateConstruct::If {
+                condition,
+                then_block,
+                else_block,
+            })
+        }
+        "kCaseGenerateConstruct" => {
+            let selector = find(node, "kParenGroup")
+                .and_then(|group| find(group, "kExpression"))
+                .map(lower_expr)?;
+            let mut items = Vec::new();
+            let mut default = None;
+            if let Some(list) = find(node, "kGenerateCaseItemList") {
+                for item in kids(list) {
+                    match tag(item) {
+                        "kGenerateCaseItem" => {
+                            let labels = find(item, "kExpressionList")
+                                .map(|list| {
+                                    kids(list)
+                                        .filter(|child| tag(child) == "kExpression")
+                                        .map(lower_expr)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if let Some(body) = kids(item).last() {
+                                items.push(GenerateCaseItem {
+                                    labels,
+                                    block: lower_generate_block(body, strengths, constants),
+                                });
+                            }
+                        }
+                        "kGenerateDefaultItem" => {
+                            if let Some(body) = kids(item).last() {
+                                default = Some(lower_generate_block(body, strengths, constants));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(GenerateConstruct::Case {
+                selector,
+                items,
+                default,
+            })
+        }
+        "kLoopGenerateConstruct" => {
+            let spec =
+                find(node, "kLoopHeader").and_then(|header| find_deep(header, "kForSpec"))?;
+            let initialization = find(spec, "kForInitialization")?;
+            let genvar = find(initialization, "SymbolIdentifier")
+                .or_else(|| find_deep(initialization, "SymbolIdentifier"))
+                .map(text)?
+                .to_string();
+            let inline_genvar = find(initialization, "genvar").is_some();
+            let initial = find(initialization, "kExpression").map(lower_expr)?;
+            let condition = find(spec, "kForCondition")
+                .and_then(|condition| find(condition, "kExpression"))
+                .map(lower_expr)?;
+            let step_list = find(spec, "kForStepList")?;
+            let (step_var, step) = lower_generate_step(step_list)?;
+            let body = kids(node).find(|child| tag(child) != "kLoopHeader")?;
+            Some(GenerateConstruct::For {
+                genvar,
+                inline_genvar,
+                initial,
+                condition,
+                step_var,
+                step,
+                block: lower_generate_block(body, strengths, constants),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn lower_generate_block(
+    node: &Value,
+    strengths: &HashMap<u64, DriveStrengthSpec>,
+    constants: &HashMap<String, LogicVec>,
+) -> GenerateBlock {
+    let name = (tag(node) == "kGenerateBlock")
+        .then(|| find_deep(node, "kLabel"))
+        .flatten()
+        .and_then(|label| find(label, "SymbolIdentifier"))
+        .map(text)
+        .map(str::to_string);
+    let mut items = Vec::new();
+    let mut block_constants = constants.clone();
+    if tag(node) == "kGenerateBlock" {
+        if let Some(list) = find(node, "kGenerateItemList") {
+            for item in kids(list) {
+                lower_module_item(item, &mut items, strengths, &mut block_constants);
+            }
+        }
+    } else {
+        lower_module_item(node, &mut items, strengths, &mut block_constants);
+    }
+    GenerateBlock { name, items }
+}
+
+fn lower_generate_step(node: &Value) -> Option<(String, Expr)> {
+    if let Some(assignment) = find_deep(node, "kNetVariableAssignment") {
+        let step_var = find(assignment, "kLPValue")
+            .and_then(|lhs| find_deep(lhs, "SymbolIdentifier"))
+            .map(text)?
+            .to_string();
+        return Some((step_var, lower_rhs(assignment)));
+    }
+    let increment = find_deep(node, "kIncrementDecrementExpression")?;
+    let step_var = find(increment, "kLPValue")
+        .and_then(|lhs| find_deep(lhs, "SymbolIdentifier"))
+        .map(text)?
+        .to_string();
+    let op = if find(increment, "++").is_some() {
+        BinOp::Add
+    } else if find(increment, "--").is_some() {
+        BinOp::Sub
+    } else {
+        return None;
+    };
+    Some((
+        step_var.clone(),
+        Expr::Binary {
+            op,
+            lhs: Box::new(Expr::Ref(step_var)),
+            rhs: Box::new(Expr::Literal(LogicVec::from_u64(1, 32))),
+        },
+    ))
 }
 
 fn lower_continuous_assignments(

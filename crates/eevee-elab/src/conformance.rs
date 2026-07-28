@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use eevee_ast::{
-    BinOp, ClassDecl, ContinuousDelay, Expr, FuncDecl, Item, Lvalue, Module, ModuleItem, NetKind,
-    PackedRange, PortDir, SourceFile, Stmt, TimingControl, UnaryOp, VarDecl,
+    BinOp, ClassDecl, ContinuousDelay, Expr, FuncDecl, GenerateBlock, GenerateConstruct, Item,
+    Lvalue, Module, ModuleItem, NetKind, PackedRange, PortDir, SourceFile, Stmt, TimingControl,
+    UnaryOp, VarDecl,
 };
 
 use crate::{port_connection_mode, ElabError, PortConnectionMode};
@@ -661,6 +662,7 @@ fn validate_module_scope(module: &Module) -> Result<(), ElabError> {
             ModuleItem::Var(var) => Some(var.name.as_str()),
             ModuleItem::Net(net) => Some(net.name.as_str()),
             ModuleItem::Instance(instance) => Some(instance.name.as_str()),
+            ModuleItem::Genvar(name) => Some(name.as_str()),
             _ => None,
         };
         if let Some(name) = name {
@@ -694,10 +696,15 @@ fn visit_module<'a>(
     marks.insert(name, 1);
     stack.push(name);
     let module = modules[name];
-    for child in module.items.iter().filter_map(|item| match item {
-        ModuleItem::Instance(instance) => Some(instance.module_name.as_str()),
-        _ => None,
-    }) {
+    let mut children = Vec::new();
+    collect_instantiated_modules(&module.items, &mut children);
+    for child in children {
+        if !modules.contains_key(child) {
+            return unsupported(format!(
+                "unknown module '{}' instantiated within module '{}'",
+                child, module.name
+            ));
+        }
         visit_module(child, modules, marks, stack)?;
     }
     stack.pop();
@@ -705,10 +712,49 @@ fn visit_module<'a>(
     Ok(())
 }
 
+fn collect_instantiated_modules<'a>(items: &'a [ModuleItem], modules: &mut Vec<&'a str>) {
+    for item in items {
+        match item {
+            ModuleItem::Instance(instance) => modules.push(instance.module_name.as_str()),
+            ModuleItem::Generate(generate) => match generate.as_ref() {
+                GenerateConstruct::If {
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    collect_instantiated_modules(&then_block.items, modules);
+                    if let Some(else_block) = else_block {
+                        collect_instantiated_modules(&else_block.items, modules);
+                    }
+                }
+                GenerateConstruct::Case { items, default, .. } => {
+                    for item in items {
+                        collect_instantiated_modules(&item.block.items, modules);
+                    }
+                    if let Some(default) = default {
+                        collect_instantiated_modules(&default.items, modules);
+                    }
+                }
+                GenerateConstruct::For { block, .. } => {
+                    collect_instantiated_modules(&block.items, modules);
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
 fn validate_items(
     items: &[ModuleItem],
     module_parameters: Option<&HashSet<&str>>,
 ) -> Result<(), ElabError> {
+    let declared_genvars: HashSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            ModuleItem::Genvar(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
     for item in items {
         match item {
             ModuleItem::Var(var) => validate_static_var(var, module_parameters)?,
@@ -733,6 +779,16 @@ fn validate_items(
                     }
                 }
             }
+            ModuleItem::Genvar(_) if module_parameters.is_none() => {
+                return unsupported("genvar declaration outside a module".to_string());
+            }
+            ModuleItem::Genvar(_) => {}
+            ModuleItem::Generate(generate) => {
+                let Some(module_parameters) = module_parameters else {
+                    return unsupported("generate construct outside a module".to_string());
+                };
+                validate_generate_construct(generate, module_parameters, &declared_genvars)?;
+            }
             ModuleItem::ContinuousAssign {
                 lhs, rhs, delay, ..
             } => {
@@ -754,6 +810,97 @@ fn validate_items(
         }
     }
     Ok(())
+}
+
+fn validate_generate_construct(
+    generate: &GenerateConstruct,
+    visible: &HashSet<&str>,
+    declared_genvars: &HashSet<&str>,
+) -> Result<(), ElabError> {
+    match generate {
+        GenerateConstruct::If {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            validate_generate_expression(condition, visible, "if condition")?;
+            validate_generate_block(then_block, visible)?;
+            if let Some(else_block) = else_block {
+                validate_generate_block(else_block, visible)?;
+            }
+        }
+        GenerateConstruct::Case {
+            selector,
+            items,
+            default,
+        } => {
+            validate_generate_expression(selector, visible, "case selector")?;
+            for item in items {
+                if item.labels.is_empty() {
+                    return unsupported("generate-case item has no labels".to_string());
+                }
+                for label in &item.labels {
+                    validate_generate_expression(label, visible, "case label")?;
+                }
+                validate_generate_block(&item.block, visible)?;
+            }
+            if let Some(default) = default {
+                validate_generate_block(default, visible)?;
+            }
+        }
+        GenerateConstruct::For {
+            genvar,
+            inline_genvar,
+            initial,
+            condition,
+            step_var,
+            step,
+            block,
+        } => {
+            if !inline_genvar && !declared_genvars.contains(genvar.as_str()) {
+                return unsupported(format!(
+                    "generate-for variable '{}' is not a declared genvar",
+                    genvar
+                ));
+            }
+            if step_var != genvar {
+                return unsupported(format!(
+                    "generate-for step updates '{}' instead of '{}'",
+                    step_var, genvar
+                ));
+            }
+            validate_generate_expression(initial, visible, "for initializer")?;
+            let mut loop_visible = visible.clone();
+            loop_visible.insert(genvar.as_str());
+            validate_generate_expression(condition, &loop_visible, "for condition")?;
+            validate_generate_expression(step, &loop_visible, "for step")?;
+            validate_generate_block(block, &loop_visible)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_generate_block(
+    block: &GenerateBlock,
+    visible: &HashSet<&str>,
+) -> Result<(), ElabError> {
+    if block.name.is_none() {
+        return unsupported("unnamed generate blocks are unsupported".to_string());
+    }
+    validate_items(&block.items, Some(visible))
+}
+
+fn validate_generate_expression(
+    expression: &Expr,
+    visible: &HashSet<&str>,
+    context: &str,
+) -> Result<(), ElabError> {
+    if !is_parameter_constant_expr(expression, visible) {
+        return unsupported(format!(
+            "generate {context} is not a constant parameter expression"
+        ));
+    }
+    validate_expr(expression)
 }
 
 fn continuous_delay_expressions(delay: &ContinuousDelay) -> impl Iterator<Item = &Expr> {

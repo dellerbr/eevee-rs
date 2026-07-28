@@ -488,6 +488,57 @@ fn parses_module_parameter_defaults_and_overrides() {
 }
 
 #[test]
+fn parses_generate_if_case_and_for() {
+    let source = "module top #(parameter int WIDTH = 2);\n\
+            genvar index;\n\
+            generate\n\
+                if (WIDTH == 2) begin : selected wire a; end\n\
+                else begin : rejected wire b; end\n\
+                case (WIDTH)\n\
+                    1: begin : one wire c; end\n\
+                    2, 3: begin : two_or_three wire d; end\n\
+                    default: begin : fallback wire e; end\n\
+                endcase\n\
+                for (index = 0; index < WIDTH; index = index + 1) begin : lane\n\
+                    wire q;\n\
+                end\n\
+            endgenerate\n\
+        endmodule\n";
+    let file = parse_source_conformant(source).expect("generate syntax parses");
+    let items = &module(&file).items;
+    assert!(matches!(&items[0], ModuleItem::Genvar(name) if name == "index"));
+    assert!(matches!(
+            &items[1],
+            ModuleItem::Generate(generate)
+                    if matches!(generate.as_ref(), GenerateConstruct::If {
+                            then_block: GenerateBlock { name: Some(name), .. },
+                            else_block: Some(GenerateBlock { name: Some(else_name), .. }),
+                            ..
+                    } if name == "selected" && else_name == "rejected")
+    ));
+    assert!(matches!(
+            &items[2],
+            ModuleItem::Generate(generate)
+                    if matches!(generate.as_ref(), GenerateConstruct::Case {
+                            items,
+                            default: Some(GenerateBlock { name: Some(name), .. }),
+                            ..
+                    } if items.len() == 2 && items[1].labels.len() == 2 && name == "fallback")
+    ));
+    assert!(matches!(
+            &items[3],
+            ModuleItem::Generate(generate)
+                    if matches!(generate.as_ref(), GenerateConstruct::For {
+                            genvar,
+                            inline_genvar: false,
+                            step_var,
+                            block: GenerateBlock { name: Some(name), .. },
+                            ..
+                    } if genvar == "index" && step_var == "index" && name == "lane")
+    ));
+}
+
+#[test]
 fn conformance_mode_accepts_continuous_assignment_delay_tuples() {
     let simple =
         "module top;\n  logic source; wire result;\n  assign result = source;\nendmodule\n";

@@ -293,14 +293,10 @@ pub fn elaborate_with_stats_and_dpi(
             _ => None,
         })
         .collect();
-    let instantiated: HashSet<&str> = modules
-        .values()
-        .flat_map(|module| module.items.iter())
-        .filter_map(|item| match item {
-            ModuleItem::Instance(instance) => Some(instance.module_name.as_str()),
-            _ => None,
-        })
-        .collect();
+    let mut instantiated = HashSet::new();
+    for module in modules.values() {
+        collect_instantiated_module_names(&module.items, &mut instantiated);
+    }
     for module in modules
         .values()
         .filter(|module| !instantiated.contains(module.name.as_str()))
@@ -1337,8 +1333,8 @@ fn elaborate_module_instance(
     backend: &dyn ExecBackend,
 ) {
     let consts = bind_module_parameters(m, parameter_overrides, parent_consts, &g.consts);
-    let ts = sim.kernel().timescale();
     let mut scope: HashMap<String, (NetId, u32)> = HashMap::new();
+    let mut scope_kinds = HashMap::new();
     let mut drivable = HashSet::new();
     for port in &m.ports {
         let width = resolve_declared_width(port.width, port.packed_range.as_ref(), &consts);
@@ -1361,17 +1357,48 @@ fn elaborate_module_instance(
             None => new_port_storage(sim, path, port, width),
         };
         scope.insert(port.name.clone(), (local_net, width));
+        scope_kinds.insert(port.name.clone(), port.net_kind);
         if port.net_kind.is_some() && matches!(port.dir, PortDir::Output | PortDir::Inout) {
             drivable.insert(port.name.clone());
         }
     }
-    for item in &m.items {
+    elaborate_module_items(
+        m,
+        &m.items,
+        path,
+        scope,
+        scope_kinds,
+        drivable,
+        &consts,
+        modules,
+        g,
+        sim,
+        backend,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn elaborate_module_items(
+    module: &Module,
+    items: &[ModuleItem],
+    path: &str,
+    mut scope: HashMap<String, (NetId, u32)>,
+    mut scope_kinds: HashMap<String, Option<NetKind>>,
+    mut drivable: HashSet<String>,
+    consts: &HashMap<String, LogicVec>,
+    modules: &HashMap<&str, &Module>,
+    g: &Global,
+    sim: &mut Sim,
+    backend: &dyn ExecBackend,
+) {
+    let ts = sim.kernel().timescale();
+    for item in items {
         if let ModuleItem::Net(net) = item {
-            let width = resolve_declared_width(net.width, net.packed_range.as_ref(), &consts);
+            let width = resolve_declared_width(net.width, net.packed_range.as_ref(), consts);
             let delay = net
                 .delay
                 .as_ref()
-                .map(|delay| compile_continuous_delay(delay, &consts, ts).as_net_delay());
+                .map(|delay| compile_continuous_delay(delay, consts, ts).as_net_delay());
             let id = sim.kernel().new_net_with_resolution_and_delay(
                 scoped_name(path, &net.name),
                 LogicVec::z(width),
@@ -1379,16 +1406,17 @@ fn elaborate_module_instance(
                 delay,
             );
             scope.insert(net.name.clone(), (id, width));
+            scope_kinds.insert(net.name.clone(), Some(net.kind));
             drivable.insert(net.name.clone());
             add_implicit_net_driver(sim, id, net.kind, width);
         }
     }
-    for it in &m.items {
+    for it in items {
         if let ModuleItem::Var(v) = it {
-            let width = resolve_declared_width(v.width, v.packed_range.as_ref(), &consts);
+            let width = resolve_declared_width(v.width, v.packed_range.as_ref(), consts);
             let init = match &v.init {
                 Some(e) => {
-                    try_const_eval_at_width(e, &consts, width, v.signed).unwrap_or_else(|| {
+                    try_const_eval_at_width(e, consts, width, v.signed).unwrap_or_else(|| {
                         panic!(
                             "module variable '{}{}{}' initializer is not a constant expression",
                             path,
@@ -1401,6 +1429,7 @@ fn elaborate_module_instance(
             };
             let net = sim.kernel().new_net(scoped_name(path, &v.name), init);
             scope.insert(v.name.clone(), (net, width));
+            scope_kinds.insert(v.name.clone(), None);
         }
     }
 
@@ -1414,7 +1443,7 @@ fn elaborate_module_instance(
         class_typedefs: &g.class_typedefs,
         class_collection_typedefs: &g.class_collection_typedefs,
     };
-    for it in &m.items {
+    for it in items {
         match it {
             ModuleItem::Always(a) => {
                 let prog = CodeGen::new(
@@ -1422,7 +1451,7 @@ fn elaborate_module_instance(
                     &g.func_ids,
                     &g.class_ids,
                     &g.class_infos,
-                    &consts,
+                    consts,
                     &gv,
                     ts,
                 )
@@ -1435,7 +1464,7 @@ fn elaborate_module_instance(
                     &g.func_ids,
                     &g.class_ids,
                     &g.class_infos,
-                    &consts,
+                    consts,
                     &gv,
                     ts,
                 )
@@ -1467,13 +1496,13 @@ fn elaborate_module_instance(
                 };
                 let delay = delay
                     .as_ref()
-                    .map(|delay| compile_continuous_delay(delay, &consts, ts));
+                    .map(|delay| compile_continuous_delay(delay, consts, ts));
                 let prog = CodeGen::new(
                     &scope,
                     &g.func_ids,
                     &g.class_ids,
                     &g.class_infos,
-                    &consts,
+                    consts,
                     &gv,
                     ts,
                 )
@@ -1483,6 +1512,8 @@ fn elaborate_module_instance(
             ModuleItem::Var(_)
             | ModuleItem::Net(_)
             | ModuleItem::Instance(_)
+            | ModuleItem::Genvar(_)
+            | ModuleItem::Generate(_)
             | ModuleItem::Func(_)
             | ModuleItem::Class(_)
             | ModuleItem::TypeAlias(_)
@@ -1491,7 +1522,26 @@ fn elaborate_module_instance(
         }
     }
 
-    for item in &m.items {
+    for item in items {
+        let ModuleItem::Generate(generate) = item else {
+            continue;
+        };
+        elaborate_generate_construct(
+            module,
+            generate,
+            path,
+            &scope,
+            &scope_kinds,
+            &drivable,
+            consts,
+            modules,
+            g,
+            sim,
+            backend,
+        );
+    }
+
+    for item in items {
         let ModuleItem::Instance(instance) = item else {
             continue;
         };
@@ -1503,20 +1553,229 @@ fn elaborate_module_instance(
                     instance.module_name, instance.name
                 )
             });
-        let child_consts = bind_module_parameters(child, &instance.parameters, &consts, &g.consts);
-        let bindings = bind_instance_ports(instance, child, m, &scope, &child_consts);
+        let child_consts = bind_module_parameters(child, &instance.parameters, consts, &g.consts);
+        let bindings = bind_instance_ports(instance, child, &scope, &scope_kinds, &child_consts);
         elaborate_module_instance(
             child,
             &scoped_name(path, &instance.name),
             &bindings,
             &instance.parameters,
-            &consts,
+            consts,
             modules,
             g,
             sim,
             backend,
         );
     }
+}
+
+fn collect_instantiated_module_names<'a>(items: &'a [ModuleItem], names: &mut HashSet<&'a str>) {
+    for item in items {
+        match item {
+            ModuleItem::Instance(instance) => {
+                names.insert(instance.module_name.as_str());
+            }
+            ModuleItem::Generate(generate) => match generate.as_ref() {
+                GenerateConstruct::If {
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    collect_instantiated_module_names(&then_block.items, names);
+                    if let Some(else_block) = else_block {
+                        collect_instantiated_module_names(&else_block.items, names);
+                    }
+                }
+                GenerateConstruct::Case { items, default, .. } => {
+                    for item in items {
+                        collect_instantiated_module_names(&item.block.items, names);
+                    }
+                    if let Some(default) = default {
+                        collect_instantiated_module_names(&default.items, names);
+                    }
+                }
+                GenerateConstruct::For { block, .. } => {
+                    collect_instantiated_module_names(&block.items, names);
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn elaborate_generate_construct(
+    module: &Module,
+    generate: &GenerateConstruct,
+    path: &str,
+    scope: &HashMap<String, (NetId, u32)>,
+    scope_kinds: &HashMap<String, Option<NetKind>>,
+    drivable: &HashSet<String>,
+    consts: &HashMap<String, LogicVec>,
+    modules: &HashMap<&str, &Module>,
+    global: &Global,
+    sim: &mut Sim,
+    backend: &dyn ExecBackend,
+) {
+    match generate {
+        GenerateConstruct::If {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            let condition = evaluate_generate_constant(condition, consts, "if condition");
+            let selected = if condition.is_true() {
+                Some(then_block)
+            } else {
+                else_block.as_ref()
+            };
+            if let Some(block) = selected {
+                elaborate_generate_block(
+                    module,
+                    block,
+                    None,
+                    path,
+                    scope,
+                    scope_kinds,
+                    drivable,
+                    consts,
+                    modules,
+                    global,
+                    sim,
+                    backend,
+                );
+            }
+        }
+        GenerateConstruct::Case {
+            selector,
+            items,
+            default,
+        } => {
+            let selector = evaluate_generate_constant(selector, consts, "case selector");
+            let selected = items.iter().find_map(|item| {
+                item.labels
+                    .iter()
+                    .any(|label| {
+                        let label = evaluate_generate_constant(label, consts, "case label");
+                        let width = selector.width().max(label.width());
+                        selector
+                            .resize(width, false)
+                            .eq_case(&label.resize(width, false))
+                    })
+                    .then_some(&item.block)
+            });
+            if let Some(block) = selected.or(default.as_ref()) {
+                elaborate_generate_block(
+                    module,
+                    block,
+                    None,
+                    path,
+                    scope,
+                    scope_kinds,
+                    drivable,
+                    consts,
+                    modules,
+                    global,
+                    sim,
+                    backend,
+                );
+            }
+        }
+        GenerateConstruct::For {
+            genvar,
+            initial,
+            condition,
+            step_var,
+            step,
+            block,
+            ..
+        } => {
+            assert_eq!(
+                genvar, step_var,
+                "generate-for step updates another variable"
+            );
+            let mut iteration_consts = consts.clone();
+            let mut value = evaluate_generate_constant(initial, consts, "for initializer");
+            for iteration_count in 0..1_000_000usize {
+                iteration_consts.insert(genvar.clone(), value.clone());
+                let keep_going =
+                    evaluate_generate_constant(condition, &iteration_consts, "for condition");
+                if !keep_going.is_true() {
+                    return;
+                }
+                let index = value.to_i64();
+                elaborate_generate_block(
+                    module,
+                    block,
+                    Some(index),
+                    path,
+                    scope,
+                    scope_kinds,
+                    drivable,
+                    &iteration_consts,
+                    modules,
+                    global,
+                    sim,
+                    backend,
+                );
+                let next = evaluate_generate_constant(step, &iteration_consts, "for step");
+                assert_ne!(next.to_i64(), index, "generate-for step makes no progress");
+                value = next;
+                if iteration_count == 999_999 {
+                    panic!("generate-for exceeds one million iterations");
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn elaborate_generate_block(
+    module: &Module,
+    block: &GenerateBlock,
+    index: Option<i64>,
+    parent_path: &str,
+    parent_scope: &HashMap<String, (NetId, u32)>,
+    parent_scope_kinds: &HashMap<String, Option<NetKind>>,
+    parent_drivable: &HashSet<String>,
+    consts: &HashMap<String, LogicVec>,
+    modules: &HashMap<&str, &Module>,
+    global: &Global,
+    sim: &mut Sim,
+    backend: &dyn ExecBackend,
+) {
+    let name = block
+        .name
+        .as_deref()
+        .unwrap_or_else(|| panic!("unnamed generate blocks are unsupported"));
+    let segment = match index {
+        Some(index) => format!("{name}[{index}]"),
+        None => name.to_string(),
+    };
+    elaborate_module_items(
+        module,
+        &block.items,
+        &scoped_name(parent_path, &segment),
+        parent_scope.clone(),
+        parent_scope_kinds.clone(),
+        parent_drivable.clone(),
+        consts,
+        modules,
+        global,
+        sim,
+        backend,
+    );
+}
+
+fn evaluate_generate_constant(
+    expression: &Expr,
+    consts: &HashMap<String, LogicVec>,
+    context: &str,
+) -> LogicVec {
+    let value = try_const_eval_with(expression, consts)
+        .unwrap_or_else(|| panic!("generate {context} is not a constant expression"));
+    assert!(value.is_known(), "generate {context} contains X or Z");
+    value
 }
 
 fn scheduler_resolution(kind: NetKind) -> NetResolution {
@@ -1691,8 +1950,8 @@ fn bind_module_parameters(
 fn bind_instance_ports(
     instance: &ModuleInstance,
     child: &Module,
-    parent: &Module,
     parent_scope: &HashMap<String, (NetId, u32)>,
+    parent_scope_kinds: &HashMap<String, Option<NetKind>>,
     child_consts: &HashMap<String, LogicVec>,
 ) -> HashMap<String, PortBinding> {
     let mut bindings = HashMap::new();
@@ -1734,7 +1993,7 @@ fn bind_instance_ports(
             "port width conversion is unsupported for '{}.{}': actual '{}' is {} bits, port is {} bits",
             instance.name, port.name, actual, actual_width, port_width
         );
-        let actual_kind = module_signal_net_kind(parent, actual);
+        let actual_kind = parent_scope_kinds.get(actual).copied().flatten();
         let mode = port_connection_mode(port, actual_kind).unwrap_or_else(|| {
             panic!(
                 "unsupported port resolution bridge for '{}.{}'",
@@ -1749,20 +2008,6 @@ fn bind_instance_ports(
         bindings.insert(port.name.clone(), binding);
     }
     bindings
-}
-
-fn module_signal_net_kind(module: &Module, name: &str) -> Option<NetKind> {
-    module
-        .ports
-        .iter()
-        .find(|port| port.name == name)
-        .and_then(|port| port.net_kind)
-        .or_else(|| {
-            module.items.iter().find_map(|item| match item {
-                ModuleItem::Net(net) if net.name == name => Some(net.kind),
-                _ => None,
-            })
-        })
 }
 
 fn scoped_name(path: &str, name: &str) -> String {

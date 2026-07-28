@@ -23,7 +23,7 @@ documentation, commit, and HTTPS push.
 - Toolchain: stable `x86_64-pc-windows-gnu`; prepend
   `$env:USERPROFILE\.cargo\bin` to `PATH`.
 - `cargo fmt --all -- --check` passes.
-- `cargo test --workspace` passes all 184 tests.
+- `cargo test --workspace` passes all 187 tests.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   passes.
 - `uvm_elab`: 680 classes, 7,284/7,535 callables compiled (96.7%).
@@ -82,11 +82,18 @@ The passing probe deliberately creates `new("uvm_test_top", null)` and calls
   exercise resolved storage and propagation, and reject override-induced width
   conversion or undeclared bound constants. Parameter-dependent callable
   signatures and procedural locals remain fail-closed.
+- Generate `if`, `case`, and `for` retain integral constant expressions in the
+  AST and elaborate after each instance's parameters are bound. Declared and
+  inline genvars, named/indexed scopes, nested generate blocks, generated
+  declarations/processes, and generated parameterized child instances are
+  source-to-runtime validated. Nonconstant controls, invalid genvars, unnamed
+  blocks, unknown generated modules, and generated hierarchy cycles fail
+  closed.
 - The narrow sequential RTL core is source-to-runtime validated:
   `always #delay`, `always_ff @(posedge clk)`, nonblocking updates, and NBA old-value
   behavior execute correctly. This does not imply broad synthesizable-Verilog
-  compatibility; generate, complete typing/sizing, memories, and full port/net
-  semantics remain major gaps.
+  compatibility; complete typing/sizing, memories, and full port/net semantics
+  remain major gaps.
 - Strict parsing/elaboration reject type or non-`int` module parameters,
   header/body localparams, module-body parameters, parameter-dependent callable
   signatures/procedural locals, unknown/duplicate/excess overrides, and
@@ -153,30 +160,31 @@ expression connections are not claimed.
 
 ## Next Priorities
 
-1. Add generate `if`/`case`/`for` over module parameter constants while
-  preserving generated-scope identity. Follow with fixed unpacked memories.
-2. Add hierarchical references and explicit top selection while preserving
+1. Add fixed unpacked memories with dynamic reads, blocking writes, and NBA
+  writes. Extend packed dynamic selects in the same milestone.
+2. Complete expression sizing/signing and assignment/port coercion.
+3. Add hierarchical references and explicit top selection while preserving
   scoped instance identity. Keep complete value typing/coercion as a separate
   milestone.
-3. Carry source spans/maps through preprocessing, AST, elaboration, and runtime
+4. Carry source spans/maps through preprocessing, AST, elaboration, and runtime
   so strict semantic diagnostics are source-located rather than only
   actionable by callable or signal name.
-4. Make normal named test selection work: `run_test("my_test")` and
+5. Make normal named test selection work: `run_test("my_test")` and
    `+UVM_TESTNAME=my_test`, using the real UVM registry/factory source. Add a
    focused probe that does not manually construct `uvm_test_top`.
-5. Verify all common UVM callbacks and the final report summary. Trace any
+6. Verify all common UVM callbacks and the final report summary. Trace any
    missing callback through virtual dispatch and phase traversal rather than
    adding UVM-specific runtime behavior.
-6. Implement real IEEE `process::self`, status transitions, await/kill, and
+7. Implement real IEEE `process::self`, status transitions, await/kill, and
    phase-worker teardown. Keep process support generic and scheduler-owned.
-7. Reduce the highest UVM compile-stub buckets with focused language tests:
+8. Reduce the highest UVM compile-stub buckets with focused language tests:
    callback collection typing, `uvm_typeid_base::typename`, nested indexed
    receiver typing, collection `foreach`, process status enums, and generic
    min/max methods.
-8. Expand DPI only at the generic boundary. The UVM regex, polling, and HDL
+9. Expand DPI only at the generic boundary. The UVM regex, polling, and HDL
    backdoor symbols are currently intentionally unbound; unknown imports must
    fail explicitly rather than return a plausible zero.
-9. Continue the README roadmap through hierarchy/generate/interfaces,
+10. Continue the README roadmap through hierarchy/interfaces,
    signedness and sizing, runtime primitives, constraints/randomization,
    assertions/coverage, files/waves, and chapter-based conformance closure.
 

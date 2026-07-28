@@ -1004,6 +1004,106 @@ fn module_parameters_control_per_instance_packed_widths() {
 }
 
 #[test]
+fn generate_if_case_and_for_elaborate_selected_scopes() {
+    let source = "module leaf #(parameter int VALUE = 0)\n\
+           (output logic [3:0] result);\n\
+      initial result = VALUE[3:0];\n\
+  endmodule\n\
+  module top #(parameter int COUNT = 2,\n\
+                               parameter int MODE = 2);\n\
+      generate\n\
+        if (MODE == 2) begin : selected\n\
+          logic [3:0] value = 4'ha;\n\
+        end else begin : rejected\n\
+          logic [3:0] value = 4'hf;\n\
+        end\n\
+        case (MODE)\n\
+          1: begin : case_one logic [3:0] value = 4'h1; end\n\
+          2, 3: begin : case_two logic [3:0] value = 4'h2; end\n\
+          default: begin : case_default logic [3:0] value = 4'hf; end\n\
+        endcase\n\
+        for (genvar index = 0; index < COUNT; index++) begin : lane\n\
+          logic [3:0] value = index;\n\
+          logic [3:0] child_value;\n\
+          wire [3:0] driven;\n\
+          leaf #(.VALUE(index + 4)) child(.result(child_value));\n\
+          assign driven = child_value;\n\
+          if (index == 1) begin : special logic marker = 1; end\n\
+          else begin : ordinary logic marker = 0; end\n\
+        end\n\
+      endgenerate\n\
+    endmodule\n";
+    let file = parse_source_conformant(source).expect("conformant generate parse");
+    let mut sim = elaborate_conformant(&file, &Interp).expect("generate elaboration");
+    sim.kernel().set_echo(false);
+    sim.run();
+
+    for (name, width, value) in [
+        ("selected.value", 4, 0xa),
+        ("case_two.value", 4, 0x2),
+        ("lane[0].value", 4, 0x0),
+        ("lane[0].child_value", 4, 0x4),
+        ("lane[0].driven", 4, 0x4),
+        ("lane[0].ordinary.marker", 1, 0x0),
+        ("lane[1].value", 4, 0x1),
+        ("lane[1].child_value", 4, 0x5),
+        ("lane[1].driven", 4, 0x5),
+        ("lane[1].special.marker", 1, 0x1),
+    ] {
+        let net = sim.kernel().find_net(name).expect("generated net");
+        let result = sim.kernel().net_value(net);
+        assert_eq!(result.width(), width, "width of {name}");
+        assert_eq!(result.to_u64(), value, "value of {name}");
+    }
+    for absent in [
+        "rejected.value",
+        "case_one.value",
+        "case_default.value",
+        "lane[0].special.marker",
+        "lane[1].ordinary.marker",
+        "lane[2].value",
+    ] {
+        assert!(
+            sim.kernel().find_net(absent).is_none(),
+            "unexpected {absent}"
+        );
+    }
+}
+
+#[test]
+fn conformance_mode_rejects_invalid_generate_semantics() {
+    let cases = [
+      (
+        "module top; logic select; if (select) begin : chosen logic value; end endmodule\n",
+        "generate if condition is not a constant parameter expression",
+      ),
+      (
+        "module top; if (1) logic value; endmodule\n",
+        "unnamed generate blocks are unsupported",
+      ),
+      (
+        "module top; for (index = 0; index < 2; index++) begin : lane logic value; end endmodule\n",
+        "generate-for variable 'index' is not a declared genvar",
+      ),
+      (
+        "module top; genvar index, other; for (index = 0; index < 2; other++) begin : lane logic value; end endmodule\n",
+        "generate-for step updates 'other' instead of 'index'",
+      ),
+    ];
+    for (source, expected) in cases {
+        let file = parse_source_conformant(source).expect("generate syntax parses");
+        let error = match elaborate_conformant(&file, &Interp) {
+            Ok(_) => panic!("invalid generate semantics must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+          error,
+          ElabError::UnsupportedSemantic { ref message } if message.contains(expected)
+        ));
+    }
+}
+
+#[test]
 fn module_parameter_values_control_instance_delays() {
     let src = "module child #(parameter int VALUE = 3,\n\
                   parameter int DELAY = 5)\n\

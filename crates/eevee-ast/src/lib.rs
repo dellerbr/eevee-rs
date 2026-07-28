@@ -124,6 +124,8 @@ pub enum ModuleItem {
     Var(VarDecl),
     Net(NetDecl),
     Instance(ModuleInstance),
+    Genvar(String),
+    Generate(Box<GenerateConstruct>),
     ContinuousAssign {
         lhs: Lvalue,
         rhs: Expr,
@@ -148,7 +150,44 @@ pub enum ModuleItem {
     },
     /// A package/module-scope `typedef <Type>[#(...)] <alias>;`.
     TypeAlias(TypeAlias),
-    // Generate, ... (later)
+}
+
+/// One elaboration-time generate construct.
+#[derive(Debug, Clone)]
+pub enum GenerateConstruct {
+    If {
+        condition: Expr,
+        then_block: GenerateBlock,
+        else_block: Option<GenerateBlock>,
+    },
+    Case {
+        selector: Expr,
+        items: Vec<GenerateCaseItem>,
+        default: Option<GenerateBlock>,
+    },
+    For {
+        genvar: String,
+        inline_genvar: bool,
+        initial: Expr,
+        condition: Expr,
+        step_var: String,
+        step: Expr,
+        block: GenerateBlock,
+    },
+}
+
+/// A named or single-item generate body.
+#[derive(Debug, Clone)]
+pub struct GenerateBlock {
+    pub name: Option<String>,
+    pub items: Vec<ModuleItem>,
+}
+
+/// One set of labels and its body in a generate-case construct.
+#[derive(Debug, Clone)]
+pub struct GenerateCaseItem {
+    pub labels: Vec<Expr>,
+    pub block: GenerateBlock,
 }
 
 /// A module net declaration (`wire [W-1:0] name;`).

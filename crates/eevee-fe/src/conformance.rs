@@ -191,7 +191,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                 }
             }
         }
-        "kModuleItemList" | "kPackageItemList" => {
+        "kModuleItemList" | "kPackageItemList" | "kGenerateItemList" => {
             for child in kids(node) {
                 if tag(node) == "kModuleItemList" && tag(child) == "kParamDeclaration" {
                     return unsupported(child, source);
@@ -209,6 +209,11 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                         | "kClassDeclaration"
                         | "kParamDeclaration"
                         | "kTypeDeclaration"
+                        | "kGenvarDeclaration"
+                        | "kGenerateRegion"
+                        | "kConditionalGenerateConstruct"
+                        | "kCaseGenerateConstruct"
+                        | "kLoopGenerateConstruct"
                         | "kModuleItemList"
                         | "kPackageItemList"
                 ) {
@@ -335,7 +340,7 @@ fn validate_node(node: &Value, source: &str) -> Result<(), FeError> {
                 return unsupported(expression, source);
             }
         }
-        "kCast" | "kIncrementDecrementExpression" => return unsupported(node, source),
+        "kCast" => return unsupported(node, source),
         "TK_TimeLiteral" => return unsupported(node, source),
         "kBinaryExpression" => {
             let children: Vec<_> = kids(node).collect();

@@ -40,7 +40,7 @@ interpreter, or scheduler.
 
 Validated on July 28, 2026:
 
-- 184 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
+- 187 Rust tests pass across core logic, scheduling, parsing, elaboration, IR,
   classes, parameterization, collections, statics, and concurrency.
 - `cargo fmt --all -- --check` passes.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -86,6 +86,10 @@ Validated on July 28, 2026:
   module variables, and module nets per instance. Strict tests specialize the
   same child to independent 4-bit and 8-bit storage and reject resolved-width
   conversion or undeclared bound constants.
+- Generate `if`, `case`, and `for` select and replicate named elaboration
+  scopes from integral parameter/genvar expressions. Generated declarations,
+  nested generate blocks, child instances, parameter overrides, and continuous
+  assignments execute with indexed hierarchy names such as `lane[1].value`.
 - A source-level synchronous counter validates `always #delay`,
   `always_ff @(posedge clk)`, nonblocking assignment, and NBA settling. Focused
   swap tests confirm simultaneous NBAs read old values. This is a usable narrow
@@ -157,6 +161,8 @@ The current implementation includes:
 - Explicit/inherited bare `int` module parameter defaults and named/positional
   value overrides with per-instance constant scopes and parameter-dependent
   packed widths on module ports, variables, and nets.
+- Generate `if`/`case`/`for`, declared or inline genvars, named generated
+  scopes, and generated module instances/processes.
 - Plain `wire`/`tri`, implicit `tri0`/`tri1` and `supply0`/`supply1`,
   `wand`/`triand`, and `wor`/`trior` nets; reactive continuous assignment
   processes; and symmetric or explicit/asymmetric strength-aware ordinary-net
@@ -282,9 +288,9 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
      machine-readable evidence without publishing a whole-standard percentage.
 
 2. **Core elaboration and hierarchy**
-   - Build on the ANSI-port/child-instance/integral-parameter slice with
-     generate `if`/`case`/`for`, hierarchical references, and fixed unpacked
-     memories.
+   - Build on the ANSI-port/child-instance/integral-parameter/generate slice
+     with fixed unpacked memories, dynamic selects, and hierarchical
+     references.
    - Add explicit top selection, port direction/type semantics, width
      conversion, nets versus variables, and instance arrays.
 
@@ -343,7 +349,11 @@ Statuses apply only to the narrow feature in each row, never to a whole clause.
   kinds collapse onto one scheduler net; mismatched ordinary input/output kinds
   use directional bridges. Complete directionality, net/variable distinctions,
   cross-resolution inout and implicit pull/supply bridges, width conversion,
-  expression actuals, hierarchy references, and generate remain unsupported.
+  expression actuals, and hierarchy references remain unsupported. Generate
+  support currently requires named blocks and integral constant expressions;
+  implicit `genblk` naming, generate-local parameters, arrays of instances,
+  interfaces, and hierarchical references into generated scopes remain
+  unsupported.
 - Continuous assignment support is limited to internal unsigned `wire`/`tri`,
   `tri0`/`tri1`, `supply0`/`supply1`, `wand`/`triand`, and `wor`/`trior` nets;
   whole-net LHS targets; exact-width represented unsigned signal/literal RHS
